@@ -4,28 +4,42 @@
 [![Release](https://img.shields.io/github/v/release/trefeon/freebuff-proxy)](https://github.com/trefeon/freebuff-proxy/releases)
 [![License](https://img.shields.io/github/license/trefeon/freebuff-proxy)](https://github.com/trefeon/freebuff-proxy/blob/main/LICENSE)
 
-An OpenAI-compatible high-performance gateway and bridge for AI coding assistants. Connect any OpenAI-compatible client or router (OpenCode, 9router, Continue, Cursor, aider, OmniRouter, LiteLLM) to upstream AI agent models with built-in token pooling, session lifecycle management, and TLS stealth.
+`freebuff-proxy` is a local gateway that makes the AI coding models behind Codebuff/FreeBuff available to **any** tool that speaks the OpenAI API — OpenCode, Continue, Cursor, aider, 9router, LiteLLM, or your own scripts.
 
-> **Reverse-Engineered Protocol Bridge.**
-> `freebuff-proxy` is built by reverse-engineering the wire protocol and session lifecycle of official AI coding CLI tools (Codebuff / FreeBuff). It transparently translates standard OpenAI REST requests into the upstream session-admission protocol, injecting required CLI request envelopes, metadata context, model-bound agent runs, tool schema normalizations, and browser JA3 TLS stealth handshakes. Direct OpenAI chat completions and SSE streaming are supported end-to-end.
+Your coding tools expect an OpenAI-style endpoint (`/v1/chat/completions`). The upstream service is not OpenAI-shaped: it is a CLI coding agent with a proprietary session protocol, and its free-tier access is tied to per-account tokens that carry individual daily quotas and can be rate-limited or banned. `freebuff-proxy` sits between the two and absorbs that friction:
+
+- **Translates** — rewrites standard OpenAI requests into the upstream session protocol (CLI request envelope, model-bound agent runs, tool-schema normalization) and streams the SSE response back as OpenAI `chat.completion.chunk` events.
+- **Pools** — spreads requests across multiple tokens with round-robin and failover, so a busy client or router rides out per-account quotas instead of failing.
+- **Stealths** — makes egress look like a real browser (TLS fingerprints, header sanitization, request jitter) so upstream abuse detection is less likely to flag your account (see the ToS warning below).
+
+> **⚠️ Terms-of-service risk.** Using your FreeBuff token through this proxy conflicts with FreeBuff/Codebuff terms of service; upstream abuse detection can suspend or permanently ban accounts. Use `SAFE_MODE=true`, keep usage modest, and do not run unattended 24/7. See [Getting Started](docs/guides/getting-started.md).
 
 ---
 
 ## Features
 
-- **OpenAI-Compatible API**: Serves `/v1/chat/completions`, `/v1/models`, `/healthz`, and Prometheus `/metrics` on `127.0.0.1:3457`.
-- **Dynamic Reasoning Effort**: Full support for OpenAI `reasoning_effort` (`low`, `medium`, `high`, `max`) mapped directly to upstream reasoning engines.
-- **Session & Run Lifecycle**: Manages upstream session handshakes, model locking recovery (`DELETE` → re-`POST`), and grace draining automatically.
-- **Token Pooling & Bridge Mode**:
-  - **Pooled Mode**: Comma-separate tokens in `AUTH_TOKENS=tok1,tok2` with automatic round-robin and error failover.
-  - **Bridge Mode**: Zero-storage relay when `AUTH_TOKENS` is empty — each client or router sends its own token via `Authorization: Bearer <token>`.
-- **TLS Stealth & Egress Proxies**: Supports `HTTP_PROXY`, `SOCKS5_PROXY`, per-token SOCKS5 routing, and browser TLS fingerprinting (Chrome, Firefox, Safari).
+- **OpenAI-Compatible API**: `POST /v1/chat/completions` (stream + non-stream), `GET /v1/models`, `GET /healthz`, Prometheus `GET /metrics`, and hot config reload via `POST /admin/reload`.
+- **Dynamic Reasoning Effort**: OpenAI `reasoning_effort` (`low`/`medium`/`high`/`max`) and Codex/Anthropic `reasoning.effort` are normalized and mapped to upstream reasoning engines.
+- **Session & Run Lifecycle**: Upstream session handshakes, model-lock recovery (`DELETE` → re-`POST`), grace draining, and idle-run finishing, all automatic.
+- **Token Pooling & Bridge Mode**: Round-robin with failover across `AUTH_TOKENS`, or zero-storage relay when clients bring their own token — see [Key Concepts](#key-concepts).
+- **Token Auto-Discovery**: With empty `AUTH_TOKENS`, credentials are read from the official CLI login files (`~/.config/manicode/credentials.json`, `~/.config/codebuff/credentials.json`). Disable with `AUTO_DISCOVER_TOKEN=false`.
+- **TLS Stealth & Egress Proxies**: `HTTP_PROXY` / `SOCKS5_PROXY`, per-token SOCKS5 routing (`SOCKS5_PROXIES` + `PROXY_ROTATION`), and browser TLS fingerprinting via uTLS (Chrome, Firefox, Safari, Edge).
 - **Subagent-Ready Concurrency**: Single-flight session refresh prevents race conditions during high-volume tool-calling loops.
-- **Safe Mode**: Built-in rate limiting and jitter presets to protect upstream account standing.
+- **Safe Mode**: On by default — anti-ban presets (TLS stealth, header sanitization, jitter, idle rotation, daily cap).
+- **Operational Tooling**: `-doctor` diagnostics, `-setup` interactive client configuration, and a SHA-256-verified `-update` self-updater.
 
----
+## How It Works
 
-## Architecture Overview
+One chat request, end to end:
+
+1. **Your tool calls the proxy.** It POSTs a standard OpenAI request to `http://127.0.0.1:3457/v1/chat/completions` — same shape it would send to any OpenAI-compatible endpoint.
+2. **A token is chosen.** The proxy picks the next healthy token from the pool (round-robin, skipping tokens in cooldown or locked by a rate limit), or — in bridge mode — uses the token your client sent in its `Authorization` header.
+3. **The request is translated.** The model id is resolved through the catalog to the upstream agent that runs it, the message list is sanitized and re-wrapped in the CLI request envelope, and OpenAI extras (`reasoning_effort`, tool schemas, etc.) are mapped to what upstream expects.
+4. **It goes out stealthily.** The upstream call uses a browser-like TLS handshake and sanitized headers, through `HTTP_PROXY` / `SOCKS5_PROXY` if configured.
+5. **The stream comes back translated.** The upstream SSE stream is converted into OpenAI `chat.completion.chunk` events and relayed to your client in real time.
+6. **State is cleaned up.** When the request finishes, the run is drained; once a run or token ages out (rotation interval, idle timeout), it is rotated or finished so the next request starts clean. A token that hit a quota limit (`429`) is locked locally until its reset time — the proxy answers `429` + `Retry-After` itself, with no traffic sent upstream.
+
+The upstream protocol is not public: the translation layer is built by reverse-engineering the official CLI's wire protocol and session lifecycle. It changes when the upstream changes — the translation lives in `internal/convert`, `internal/upstream`, `internal/stealth`, and `internal/registry`.
 
 ```mermaid
 graph TD
@@ -34,99 +48,197 @@ graph TD
     Proxy -->|2. Inject Envelope + Stealth| Upstream[Upstream Backend API]
     Upstream -->|3. SSE Stream| Proxy
     Proxy -->|4. OpenAI SSE Chunks| Client
+    Client -.->|GET /metrics · GET /healthz · POST /admin/reload| Proxy
 ```
+
+## Key Concepts
+
+| Concept | What it means |
+|---|---|
+| **Token** | One FreeBuff/Codebuff account credential (`cb_...`). Each token has its own daily quota and can be rate-limited or banned independently. |
+| **Session** | Per-token upstream admission state (handshake, model locks). The proxy maintains and reuses it so every request does not pay the handshake cost. |
+| **Run** | One upstream agent execution for a model, shared across many requests. Runs start on first use, live for `ROTATION_INTERVAL` (default `6h`), then are rotated (fresh start, old one drained/finished) so no run accumulates suspiciously long-lived activity. Idle tokens get their runs finished too. |
+| **Model** | A catalog entry addressed as `provider/model` (e.g. `deepseek/deepseek-v4-flash`, `z-ai/glm-5.2`). The registry serves `/v1/models` and maps each model to the upstream agent that runs it. |
+| **Pooled mode** | You configure several tokens in `AUTH_TOKENS`. Requests round-robin across them with automatic failover. Best for one user with several accounts who wants maximum uptime and quota headroom. |
+| **Bridge mode** | You configure no tokens. Each client sends its own token as `Authorization: Bearer <token>`, and the proxy relays with it, caching per-client state (LRU, max 32). Best for a shared router (e.g. 9router) serving many users who each bring their own account. |
+| **Safe mode** | Default-on anti-ban presets: TLS stealth, proxy-header sanitization, request jitter, idle rotation, and a per-token daily cap. See [Safe Mode](#safe-mode--zero-spam-quota-handling). |
+| **Quota lock** | When a token hits its daily limit, the proxy parses the upstream `429` reset timestamp and refuses local requests for that token until reset — fast (`<1ms`), silent, and spam-free. |
 
 ---
 
 ## Quick Start
 
-### 1. Configure
+### 1. Install
 
-Copy the example configuration:
+**One-command installer (Linux/macOS):**
 
 ```bash
-cp .env.example .env
+curl -sSL https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/install-freebuff-proxy.sh | bash
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/install-freebuff-proxy.ps1 | iex
+```
+
+The installer prompts for an install method (easy, manual binary, Docker Compose, bridge mode), mints/reads your token, and writes `.env`.
+
+**Alternatively**, run with Docker Compose:
+
+```bash
+cp .env.example .env   # then set AUTH_TOKENS
+docker compose up -d --build
+```
+
+**Or** download a release binary from [Releases](https://github.com/trefeon/freebuff-proxy/releases) (Linux/macOS/Windows × amd64/arm64) and run `./freebuff-proxy`.
 
 ### 2. Obtain an Auth Token
 
-Generate an authentication token using the headless helper (opens a browser OAuth login, prints the token to terminal without saving):
+Generate one headlessly (opens a browser OAuth login, prints the token to the terminal without saving):
 
 **Windows (PowerShell):**
+
 ```powershell
 .\scripts\gen-token.ps1 -ToClipboard
 ```
 
 **Linux / macOS (bash):**
+
 ```bash
 ./scripts/gen-token.sh --clipboard
 ```
 
-Paste the token into `.env` under `AUTH_TOKENS=...` (or add it directly to your router as a bearer key).
+`gen-token.*` are aliases for `gen-freebuff-token.*`, which also supports `--save` (store in the CLI credentials file), `--append` (add to `.env` `AUTH_TOKENS`), and `--env <path>`.
 
-### 3. Run with Docker Compose
+Alternatively, log in with the official CLI (`npm i -g freebuff && freebuff`): the proxy auto-discovers the token from its credentials file on startup.
+
+### 3. Configure
+
+Copy the example and set your token:
 
 ```bash
-docker compose up -d
+cp .env.example .env
+# AUTH_TOKENS=cb_xxx        ← paste your token (comma-separate for pooling)
+# SAFE_MODE=true            ← default (set false to disable)
 ```
 
-Check health:
+Leave `AUTH_TOKENS=` empty for **bridge mode** (clients bring their own tokens). Not sure which to pick? One user with a few accounts → pooled mode; a shared router serving many users → bridge mode. See [Key Concepts](#key-concepts). `config.example.json` shows the equivalent JSON config file, loaded with `-config`; see the [Configuration Reference](#configuration-reference) for every key.
+
+### 4. Run & Verify
+
+```bash
+./freebuff-proxy            # or: docker compose up -d
+```
+
+Check health and run diagnostics:
+
 ```bash
 curl http://127.0.0.1:3457/healthz
+./freebuff-proxy -doctor    # config, port, DNS/TLS, model registry checks
 ```
+
+---
+
+## Command-Line Interface
+
+| Flag | Description |
+|---|---|
+| *(none)* | Run the proxy |
+| `-config <path>` | Load an optional JSON config file (keys mirror env names) |
+| `-v` | Verbose (debug) logging |
+| `-version` | Print version and exit |
+| `-doctor` | Run configuration and environment diagnostics |
+| `-update` | Self-update from the latest GitHub release (SHA-256 verified against `checksums.txt`) |
+| `-setup` | Interactive client setup (Continue, opencode, aider) |
+| `-yes` | Auto-confirm `-setup` prompts |
 
 ---
 
 ## Configuration Reference
 
-Full option list (all keys can be set via environment variables or a `.env` file; precedence: built-in defaults < JSON `-config` < `./.env` < environment):
+All keys can be set via environment variables or a `.env` file (which behaves like the environment), or via the JSON config file passed to `-config`. Precedence, lowest to highest: **built-in defaults < JSON `-config` < `./.env` < environment**. List values (`AUTH_TOKENS`, `API_KEYS`, `SOCKS5_PROXIES`) are comma-separated in env and arrays in JSON.
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `LISTEN_ADDR` | `127.0.0.1:3457` | Host and port to bind (loopback; set `:3457` in containers) |
-| `UPSTREAM_BASE_URL` | `https://codebuff.com` | Upstream API endpoint |
+| `LISTEN_ADDR` | `127.0.0.1:3457` | Host and port to bind (loopback; containers set `:3457`) |
+| `UPSTREAM_BASE_URL` | `https://codebuff.com` | Upstream API endpoint (normalized to `www.codebuff.com`) |
 | `AUTH_TOKENS` | `""` | Comma-separated upstream tokens (empty = bridge mode) |
-| `API_KEYS` | `""` | Comma-separated client keys required for `/v1/*` (empty = open) |
+| `AUTO_DISCOVER_TOKEN` | `true` | When `AUTH_TOKENS` is empty, read credentials from the official CLI login files (`false` disables) |
+| `API_KEYS` | `""` | Comma-separated client keys required for `/v1/*` (empty = open; ignored in bridge mode) |
 | `ROTATION_INTERVAL` | `6h` | Agent-run rotation interval |
 | `REQUEST_TIMEOUT` | `15m` | Upstream request timeout |
 | `SESSION_CALL_TIMEOUT` | `30s` | Session call timeout |
-| `HTTP_PROXY` / `SOCKS5_PROXY` | `""` | Outbound proxy for upstream requests |
+| `REGISTRY_REFRESH` | `6h` | Model catalog refresh interval |
+| `COST_MODE` | `free` | `free` (free-tier) or paid billing mode |
+| `TLS_FINGERPRINT` | `auto` | `auto`, `chrome120`, `chrome126`, `safari17`, `safari18`, `firefox120`, `firefox128`, `edge126`, `random` |
+| `HTTP_PROXY` | `""` | Outbound HTTP proxy for upstream requests |
+| `SOCKS5_PROXY` | `""` | Outbound SOCKS5 proxy for upstream requests |
 | `SOCKS5_PROXIES` | `""` | Per-token SOCKS5 proxies (comma-separated) |
 | `PROXY_ROTATION` | `per-token` | `per-token`, `round-robin`, or `random` |
-| `COST_MODE` | `free` | `free` (free-tier) or paid billing mode |
-| `TLS_FINGERPRINT` | `auto` | TLS profile: `auto`, `chrome126`, `firefox128`, `safari18`, `edge126` |
-| `REGISTRY_REFRESH` | `6h` | Model catalog refresh interval |
-| `DEBUG_DUMP` | `false` | Persist redacted traffic dumps to `./dump/` |
-| `LOG_FILE` | `""` | Persist JSON logs to a file (e.g. `./logs/proxy.log`) |
+| `DEBUG_DUMP` | `false` | Persist redacted traffic dumps to `./dump/` (mode 0600) |
+| `LOG_FILE` | `""` | Append log lines to a file (e.g. `./logs/proxy.log`) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
-| `MAX_MESSAGES_PER_DAY` | `0` | Daily request ceiling per token (`0` = unlimited, recommended). Safe to set `0` because the proxy respects upstream `429` reset timestamps and locks tokens locally |
-| `IDLE_ROTATION_TIMEOUT` | `0` | Finish runs after this idle period (`0` = disabled; `SAFE_MODE` sets 30m) |
-| `SAFE_MODE` | `false` | Enables anti-ban protections (JA3 TLS stealth, header sanitization, request jitter) |
-| `REQUEST_JITTER` | `0s` | Random request delay jitter (`SAFE_MODE` sets 2s) |
+| `MAX_MESSAGES_PER_DAY` | `0` | Per-token daily cap on successful chats (`0` = unlimited; `SAFE_MODE` presets 150 when unset) |
+| `IDLE_ROTATION_TIMEOUT` | `0` | Finish runs after this idle period (`0` = disabled; `SAFE_MODE` sets 30m when unset) |
+| `SAFE_MODE` | `true` | Apply anti-ban presets (see below; set `false` to disable) |
+| `REQUEST_JITTER` | `0s` | Random delay range `[0, REQUEST_JITTER)` before upstream calls (`SAFE_MODE` sets 2s when unset) |
+| `CLI_VERSION` | `0.10.7` | Upstream CLI version string used in the request envelope |
 | `MODEL_ALIASES` | `""` | Map aliases to real model IDs, e.g. `gpt-4o:deepseek/deepseek-v4-flash,glm:z-ai/glm-5.2` |
-| `CLI_VERSION` | `0.10.7` | Upstream CLI version string for the envelope |
 
 ### Safe Mode & Zero-Spam Quota Handling
 
-`SAFE_MODE=true` is strongly recommended for all setups. It enables essential anti-ban protections:
-- **JA3 TLS Stealth**: Mimics real browser handshakes (Chrome 120, Safari 17) via `uTLS` to prevent WAF / CDN bot detection.
-- **Proxy Header Sanitization**: Strips 26 proxy-identifying headers (`X-Forwarded-For`, `Via`, `CF-Connecting-IP`, etc.).
+`SAFE_MODE=true` is the **default** for all setups (set `SAFE_MODE=false` to
+opt out). It enables essential anti-ban protections and presets:
+
+- **JA3 TLS Stealth**: Mimics real browser handshakes (Chrome 120/126, Safari 17/18, Firefox 120/128, Edge 126) via `uTLS` to prevent WAF / CDN bot detection.
+- **Proxy Header Sanitization**: Strips 25 proxy-identifying headers (`X-Forwarded-For`, `Via`, `CF-Connecting-IP`, etc.).
 - **Request Jitter**: Injects randomized 0–2s delay jitter to break robotic, machine-like cadence.
+- **Idle Rotation**: Finishes runs after 30 minutes of inactivity.
+- **Daily Cap**: Presets `MAX_MESSAGES_PER_DAY=150` when the key is unset.
 
 **Why `MAX_MESSAGES_PER_DAY=0` (Unlimited) is Recommended:**
-- You can safely leave `MAX_MESSAGES_PER_DAY=0` to utilize 100% of your FreeBuff/Codebuff free-tier allowance.
-- **Zero-Spam Guarantee**: When an account reaches its daily quota or upstream capacity limit, Codebuff returns a `429` with a Pacific midnight reset timestamp (`resetAt: 07:00:00Z`).
+
+- Since `SAFE_MODE` now defaults on and presets an **unset** cap to 150, set
+  `MAX_MESSAGES_PER_DAY=0` explicitly (as `.env.example` does) to utilize
+  100% of your FreeBuff/Codebuff free-tier allowance. Explicit values always
+  win over the preset.
+- **Zero-Spam Guarantee**: When an account reaches its daily quota or upstream capacity limit, the upstream returns a `429` with a Pacific midnight reset timestamp (`resetAt: 07:00:00Z`).
 - The proxy parses this timestamp and **locks the token locally in memory**.
-- Any subsequent requests for that token return `429` locally in `<1ms` without sending any network traffic to Codebuff.
+- Any subsequent request for that token returns `429` locally in `<1ms` without sending any network traffic upstream.
 - Upstream routers (e.g. 9router) receive standard `429` + `Retry-After` headers and automatically rotate to your next available account without failing user prompts.
 
-### Guides
+### HTTP Endpoints
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `POST /v1/chat/completions` | `API_KEYS` (when set) | OpenAI-compatible chat, streaming and non-streaming |
+| `GET /v1/models` | `API_KEYS` (when set) | Model catalog from the registry (fallback at boot + live refresh) |
+| `GET /healthz` | none | JSON: `status`, `uptime_seconds`, `models`, per-token snapshot, `bridge_tokens` |
+| `GET /metrics` | none | Prometheus text format: uptime, model count, per-token 24h messages / requests / active runs / cooldown |
+| `POST /admin/reload` | `API_KEYS` (when set) | Hot-reload configuration from disk without restart |
+
+---
+
+## Deployment
+
+- **Docker**: `docker-compose.yml` + `Dockerfile` — runs as an unprivileged user, healthchecked on `/healthz`, `LISTEN_ADDR=:3457` inside the container.
+- **Systemd**: `scripts/freebuff-proxy.service` (Linux).
+- **macOS launchd**: `scripts/com.freebuff-proxy.plist` (macOS).
+- **Docker + 9router helper**: `scripts/setup-proxy-docker.sh`.
+
+## Guides
 
 - [Getting Started](docs/guides/getting-started.md) — 5-minute setup walkthrough
 - [Client Integration](docs/guides/client-integration.md) — OpenCode, 9router, Continue, Cursor, aider, OpenAI SDKs
 - [9router Integration](docs/guides/9router-integration.md) — router dashboard setup in bridge mode
 
 ---
+
+## Contributing & Security
+
+- [Contributing](CONTRIBUTING.md) — filing issues, opening PRs, what to expect
+- [Security](.github/SECURITY.md) — supported versions and how to report a vulnerability
 
 ## License
 

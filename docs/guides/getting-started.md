@@ -64,7 +64,7 @@ Run the diagnostic tool or curl:
 # Diagnostic doctor check:
 ./freebuff-proxy -doctor
 
-# Quick health check (JSON snapshot with session ID, risk level, models):
+# Quick health check (JSON: status, uptime, model count, per-token snapshot):
 curl http://localhost:3457/healthz
 
 # Prometheus metrics scrape endpoint:
