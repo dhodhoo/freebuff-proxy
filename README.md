@@ -4,9 +4,11 @@
 [![Release](https://img.shields.io/github/v/release/trefeon/freebuff-proxy)](https://github.com/trefeon/freebuff-proxy/releases)
 [![License](https://img.shields.io/github/license/trefeon/freebuff-proxy)](https://github.com/trefeon/freebuff-proxy/blob/main/LICENSE)
 
-An OpenAI-compatible high-performance gateway and bridge for coding assistant backends. Connect any OpenAI-compatible client or router (OpenCode, 9router, Continue, Cursor, aider, OmniRouter, LiteLLM) to upstream AI agent models with built-in token pooling, session lifecycle management, and TLS stealth.
-> **Coding Gateway Architecture.**
-> The proxy replicates official CLI request envelopes (including system identity headers, metadata context, model-bound sessions, tool schema normalization, and browser JA3 TLS stealth). Direct OpenAI chat completions and SSE streaming are supported end-to-end.
+An OpenAI-compatible high-performance gateway and bridge for AI coding assistants. Connect any OpenAI-compatible client or router (OpenCode, 9router, Continue, Cursor, aider, OmniRouter, LiteLLM) to upstream AI agent models with built-in token pooling, session lifecycle management, and TLS stealth.
+
+> **Reverse-Engineered Protocol Bridge.**
+> `freebuff-proxy` is built by reverse-engineering the wire protocol and session lifecycle of official AI coding CLI tools (Codebuff / FreeBuff). It transparently translates standard OpenAI REST requests into the upstream session-admission protocol, injecting required CLI request envelopes, metadata context, model-bound agent runs, tool schema normalizations, and browser JA3 TLS stealth handshakes. Direct OpenAI chat completions and SSE streaming are supported end-to-end.
+
 ---
 
 ## Features
