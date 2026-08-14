@@ -1,4 +1,4 @@
-# fr33bu77-pr0xy (AI Gateway & Token Pool)
+# freebuff-proxy — OpenAI-Compatible Coding Gateway
 
 [![CI](https://img.shields.io/github/actions/workflow/status/trefeon/freebuff-proxy/ci.yml)](https://github.com/trefeon/freebuff-proxy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/trefeon/freebuff-proxy)](https://github.com/trefeon/freebuff-proxy/releases)
@@ -29,7 +29,7 @@ An OpenAI-compatible high-performance gateway and bridge for AI coding assistant
 
 ```mermaid
 graph TD
-    Client[AI Client / Router<br/>OpenCode · 9router · Continue · Cursor · aider] -->|POST /v1/chat/completions| Proxy[fr33bu77-pr0xy<br/>localhost:3457]
+    Client[AI Client / Router<br/>OpenCode · 9router · Continue · Cursor · aider] -->|POST /v1/chat/completions| Proxy[freebuff-proxy<br/>localhost:3457]
     Proxy -->|1. Session & Run Lifecycle| Pool[Token Pool & Session Cache]
     Proxy -->|2. Inject Envelope + Stealth| Upstream[Upstream Backend API]
     Upstream -->|3. SSE Stream| Proxy
