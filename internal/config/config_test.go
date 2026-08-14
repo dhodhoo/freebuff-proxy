@@ -62,6 +62,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.DebugDump {
 		t.Error("DebugDump = true, want false")
 	}
+	if !cfg.SafeMode {
+		t.Error("SafeMode = false, want true (default)")
+	}
 	if cfg.LogFile != "" {
 		t.Errorf("LogFile = %q, want empty", cfg.LogFile)
 	}
@@ -114,6 +117,57 @@ func TestSafeMode(t *testing.T) {
 		}
 		if cfg.RequestJitter != 2*time.Second {
 			t.Errorf("RequestJitter = %v, want 2s under SafeMode", cfg.RequestJitter)
+		}
+	})
+
+	t.Run("explicit zero knobs under SafeMode stay disabled", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		t.Setenv("SAFE_MODE", "true")
+		t.Setenv("IDLE_ROTATION_TIMEOUT", "0")
+		t.Setenv("REQUEST_JITTER", "0s")
+
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if cfg.IdleRotationTimeout != 0 {
+			t.Errorf("IdleRotationTimeout = %v, want 0 (explicit 0 beats the preset)", cfg.IdleRotationTimeout)
+		}
+		if cfg.RequestJitter != 0 {
+			t.Errorf("RequestJitter = %v, want 0 (explicit 0 beats the preset)", cfg.RequestJitter)
+		}
+		// Unset knobs still get the presets.
+		if cfg.MaxMessagesPerDay != 150 {
+			t.Errorf("MaxMessagesPerDay = %d, want 150 under SafeMode", cfg.MaxMessagesPerDay)
+		}
+		if cfg.TLSFingerprint != "auto" {
+			t.Errorf("TLSFingerprint = %q, want auto under SafeMode", cfg.TLSFingerprint)
+		}
+	})
+
+	t.Run("SAFE_MODE=false restores non-safe defaults", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		t.Setenv("SAFE_MODE", "false")
+
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if cfg.MaxMessagesPerDay != 0 {
+			t.Errorf("MaxMessagesPerDay = %d, want 0 (unlimited)", cfg.MaxMessagesPerDay)
+		}
+		if cfg.IdleRotationTimeout != 0 {
+			t.Errorf("IdleRotationTimeout = %v, want 0 (disabled)", cfg.IdleRotationTimeout)
+		}
+		if cfg.RequestJitter != 0 {
+			t.Errorf("RequestJitter = %v, want 0 (disabled)", cfg.RequestJitter)
+		}
+		if cfg.TLSFingerprint != "" {
+			t.Errorf("TLSFingerprint = %q, want empty", cfg.TLSFingerprint)
 		}
 	})
 }
@@ -540,12 +594,22 @@ func TestTLSFingerprint(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("AUTH_TOKENS", "tok")
 
-	// default: empty when unset
+	// default: SAFE_MODE preset (auto) when unset
 	if cfg, err := Load(""); err != nil {
 		t.Fatalf("Load (default): %v", err)
-	} else if cfg.TLSFingerprint != "" {
-		t.Errorf("TLSFingerprint = %q, want empty by default", cfg.TLSFingerprint)
+	} else if cfg.TLSFingerprint != "auto" {
+		t.Errorf("TLSFingerprint = %q, want auto (SAFE_MODE default preset)", cfg.TLSFingerprint)
 	}
+
+	// SAFE_MODE=false leaves it empty
+	t.Setenv("SAFE_MODE", "false")
+	t.Setenv("TLS_FINGERPRINT", "")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (SAFE_MODE=false): %v", err)
+	} else if cfg.TLSFingerprint != "" {
+		t.Errorf("TLSFingerprint = %q, want empty with SAFE_MODE=false", cfg.TLSFingerprint)
+	}
+	t.Setenv("SAFE_MODE", "")
 
 	// valid values load OK
 	for _, v := range []string{"chrome120", "safari17", "firefox120", "random"} {
@@ -568,12 +632,21 @@ func TestMaxMessagesPerDay(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("AUTH_TOKENS", "tok")
 
-	// default: 0 = unlimited
+	// default: 150 via the SAFE_MODE preset (unset)
 	if cfg, err := Load(""); err != nil {
 		t.Fatalf("Load: %v", err)
-	} else if cfg.MaxMessagesPerDay != 0 {
-		t.Errorf("MaxMessagesPerDay = %d, want 0 (default)", cfg.MaxMessagesPerDay)
+	} else if cfg.MaxMessagesPerDay != 150 {
+		t.Errorf("MaxMessagesPerDay = %d, want 150 (SAFE_MODE default preset)", cfg.MaxMessagesPerDay)
 	}
+
+	// SAFE_MODE=false restores unlimited
+	t.Setenv("SAFE_MODE", "false")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (SAFE_MODE=false): %v", err)
+	} else if cfg.MaxMessagesPerDay != 0 {
+		t.Errorf("MaxMessagesPerDay = %d, want 0 (unlimited with SAFE_MODE=false)", cfg.MaxMessagesPerDay)
+	}
+	t.Setenv("SAFE_MODE", "")
 
 	// env override
 	t.Setenv("MAX_MESSAGES_PER_DAY", "25")
@@ -608,11 +681,11 @@ func TestIdleRotationTimeout(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("AUTH_TOKENS", "tok")
 
-	// default: 0 = disabled
+	// default: 30m via the SAFE_MODE preset (unset)
 	if cfg, err := Load(""); err != nil {
 		t.Fatalf("Load: %v", err)
-	} else if cfg.IdleRotationTimeout != 0 {
-		t.Errorf("IdleRotationTimeout = %v, want 0 (default)", cfg.IdleRotationTimeout)
+	} else if cfg.IdleRotationTimeout != 30*time.Minute {
+		t.Errorf("IdleRotationTimeout = %v, want 30m (SAFE_MODE default preset)", cfg.IdleRotationTimeout)
 	}
 
 	// env override
@@ -631,17 +704,20 @@ func TestIdleRotationTimeout(t *testing.T) {
 		t.Errorf("IdleRotationTimeout = %v, want 0 (explicit 0)", cfg.IdleRotationTimeout)
 	}
 
-	// empty string in JSON is tolerated as disabled
+	// empty string in JSON is tolerated as disabled (under SAFE_MODE=false;
+	// with the default SAFE_MODE=true an empty value is "unset" → preset)
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"IDLE_ROTATION_TIMEOUT": ""}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("IDLE_ROTATION_TIMEOUT", "")
+	t.Setenv("SAFE_MODE", "false")
 	if cfg, err := Load(path); err != nil {
 		t.Fatalf("Load (empty file): %v", err)
 	} else if cfg.IdleRotationTimeout != 0 {
 		t.Errorf("IdleRotationTimeout = %v, want 0 (empty tolerated)", cfg.IdleRotationTimeout)
 	}
+	t.Setenv("SAFE_MODE", "")
 
 	// JSON file value
 	if err := os.WriteFile(path, []byte(`{"IDLE_ROTATION_TIMEOUT": "2h"}`), 0o644); err != nil {

@@ -91,9 +91,9 @@ func defaultRawConfig() rawConfig {
 		RegistryRefresh:     "6h",
 		CostMode:            "free", // free-tier mode; omission routes requests as PAID and fresh free accounts get 402 "Out of credits" (upstream check: cost_mode !== 'free' → billing)
 		MaxMessagesPerDay:   nil,
-		IdleRotationTimeout: "0", // 0 = disabled
-		SafeMode:            false,
-		RequestJitter:       "0s",
+		IdleRotationTimeout: "",   // "" = disabled (unset → SAFE_MODE preset may fill)
+		SafeMode:            true, // anti-ban presets on by default; set SAFE_MODE=false to disable
+		RequestJitter:       "",   // "" = disabled (unset → SAFE_MODE preset may fill)
 		CLIVersion:          "0.10.7",
 	}
 }
@@ -160,15 +160,19 @@ func Load(configPath string) (Config, error) {
 		return Config{}, err
 	}
 	// IDLE_ROTATION_TIMEOUT is zero-tolerant: "" or "0" both mean disabled.
+	// idleRotationSet distinguishes "explicitly disabled" from "not
+	// configured" so the SafeMode preset only fills truly unset knobs.
+	idleRotationSet := strings.TrimSpace(raw.IdleRotationTimeout) != ""
 	idleRotationTimeout := time.Duration(0)
-	if strings.TrimSpace(raw.IdleRotationTimeout) != "" && strings.TrimSpace(raw.IdleRotationTimeout) != "0" {
+	if idleRotationSet && strings.TrimSpace(raw.IdleRotationTimeout) != "0" {
 		idleRotationTimeout, err = parseDuration(raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
 		if err != nil {
 			return Config{}, err
 		}
 	}
+	requestJitterSet := strings.TrimSpace(raw.RequestJitter) != ""
 	requestJitter := time.Duration(0)
-	if strings.TrimSpace(raw.RequestJitter) != "" {
+	if requestJitterSet {
 		requestJitter, err = parseDuration(raw.RequestJitter, "REQUEST_JITTER")
 		if err != nil {
 			return Config{}, err
@@ -226,13 +230,15 @@ func Load(configPath string) (Config, error) {
 		}
 	}
 
-	// SafeMode presets: when SAFE_MODE=true, apply recommended defaults
-	// for any zero-valued account-safety knob.
+	// SafeMode presets: when SAFE_MODE=true, apply recommended defaults for
+	// account-safety knobs that were NOT explicitly configured. Explicit
+	// "0"/disabled values always win (IDLE_ROTATION_TIMEOUT=0 or
+	// REQUEST_JITTER=0 stay disabled; MAX_MESSAGES_PER_DAY=0 stays unlimited).
 	if cfg.SafeMode {
-		if cfg.IdleRotationTimeout == 0 {
+		if !idleRotationSet && cfg.IdleRotationTimeout == 0 {
 			cfg.IdleRotationTimeout = 30 * time.Minute
 		}
-		if cfg.RequestJitter == 0 {
+		if !requestJitterSet && cfg.RequestJitter == 0 {
 			cfg.RequestJitter = 2 * time.Second
 		}
 		if cfg.TLSFingerprint == "" {
