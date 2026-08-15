@@ -810,6 +810,13 @@ func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
 // handleModeSwitch flips between bridge and pooled mode at runtime
 // (dashboard mode control). Pooled→bridge removes all tokens; bridge→pooled
 // requires at least one token to add (use the Add-token form first).
+//
+// Order matters: the .env is persisted and the config reloaded BEFORE the
+// live pool is drained, and the reload result is verified to actually be in
+// bridge mode. Otherwise a failed persist (or a higher-precedence AUTH_TOKENS
+// source such as a -config JSON file or real environment variable) would
+// empty the pool while cfg still claims pooled — leaving the proxy broken and
+// the dashboard pill showing the old mode.
 func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Mode string `json:"mode"`
@@ -833,11 +840,30 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 			s.dash.RenderConfigResult(w, r, false, "Already in bridge mode.")
 			return
 		}
-		s.pool.RemoveAllTokens(r.Context())
-		if err := s.syncTokensAfterMutation(nil); err != nil {
-			s.dash.RenderConfigResult(w, r, false, err.Error())
+		// Persist AUTH_TOKENS= (explicit empty) and reload, verifying the
+		// effective config actually lands in bridge mode before touching the
+		// live pool. Roll the .env back on any failure.
+		old, oldErr := os.ReadFile(".env")
+		if _, err := updateAuthTokensEnv(nil); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to persist .env: "+err.Error())
 			return
 		}
+		newCfg, err := config.Load(s.configPath)
+		if err != nil {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Reload rejected: "+err.Error())
+			return
+		}
+		if !newCfg.BridgeMode() {
+			// A higher-precedence source (e.g. AUTH_TOKENS in a -config JSON
+			// file or the real environment) still supplies tokens — .env alone
+			// cannot clear it, so the switch cannot succeed.
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Could not switch to bridge mode: AUTH_TOKENS is still set by a -config JSON file or the environment, which overrides .env. Clear it there, or run without -config, then retry.")
+			return
+		}
+		s.cfg.Store(&newCfg)
+		s.pool.RemoveAllTokens(r.Context())
 		s.logger.Info("dashboard switched to bridge mode")
 		s.dash.RenderConfigResult(w, r, true, "Switched to bridge mode — AUTH_TOKENS cleared; clients now send their own token.")
 	case "pooled":
@@ -849,6 +875,16 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.dash.RenderConfigResult(w, r, false, "Mode must be 'bridge' or 'pooled'.")
 	}
+}
+
+// restoreEnvFile writes old content back to .env, or removes the file when it
+// did not exist before. Best-effort rollback for failed mode switches.
+func restoreEnvFile(old []byte, oldErr error) {
+	if oldErr != nil {
+		_ = os.Remove(".env")
+		return
+	}
+	_ = writeFileAtomic(".env", old)
 }
 
 // handleDiag runs the dashboard diagnostics: config state, upstream

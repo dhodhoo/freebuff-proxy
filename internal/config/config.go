@@ -450,14 +450,16 @@ func applyDotenv(raw *rawConfig) error {
 	}
 	get := func(name string) string { return vals[name] }
 	// An empty AUTH_TOKENS= line in .env is an explicit bridge-mode choice
-	// (the dashboard mode switch persists exactly this), so record presence
-	// even when the value is empty — auto-discovery must not refill it.
-	if _, ok := vals["AUTH_TOKENS"]; ok {
+	// (the dashboard mode switch persists exactly this): record presence so
+	// auto-discovery cannot refill it, AND clear whatever the JSON config
+	// provided (the empty value must beat the JSON list). Unlike other keys,
+	// AUTH_TOKENS must NOT skip empty overrides.
+	if v, ok := vals["AUTH_TOKENS"]; ok {
+		raw.AuthTokens = splitList(v)
 		raw.AuthTokensSet = true
 	}
 	overrideStringFrom(&raw.ListenAddr, get, "LISTEN_ADDR")
 	overrideStringFrom(&raw.UpstreamBaseURL, get, "UPSTREAM_BASE_URL")
-	overrideCSVFrom(&raw.AuthTokens, get, "AUTH_TOKENS")
 	overrideStringFrom(&raw.RotationInterval, get, "ROTATION_INTERVAL")
 	overrideStringFrom(&raw.RequestTimeout, get, "REQUEST_TIMEOUT")
 	overrideStringFrom(&raw.SessionCallTimeout, get, "SESSION_CALL_TIMEOUT")

@@ -590,10 +590,40 @@ func TestDotenvJSONWins(t *testing.T) {
 	// the README rule "environment overrides the JSON config file".
 	cfg, err := Load("cfg.json")
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatal(err)
 	}
 	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "from-dotenv" {
 		t.Errorf("AuthTokens = %v, want [from-dotenv] (.env beats JSON)", got)
+	}
+}
+
+// TestDotenvEmptyAuthTokensClearsJSON is the regression for the dashboard
+// mode switch: it persists exactly "AUTH_TOKENS=" into .env, which must
+// clear tokens that came from a -config JSON file — otherwise the reload
+// keeps the old tokens, BridgeMode() stays false, and the dashboard pill
+// still shows the old mode after "Switch to bridge mode".
+func TestDotenvEmptyAuthTokensClearsJSON(t *testing.T) {
+	clearEnv(t)
+
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("cfg.json", []byte(`{"AUTH_TOKENS":["from-json"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("cfg.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AuthTokens) != 0 {
+		t.Errorf("AuthTokens = %v, want empty (empty .env AUTH_TOKENS clears JSON tokens)", cfg.AuthTokens)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode() = false, want true after explicit empty AUTH_TOKENS")
+	}
+	if cfg.DiscoveredSource != "" {
+		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must stay suppressed)", cfg.DiscoveredSource)
 	}
 }
 
