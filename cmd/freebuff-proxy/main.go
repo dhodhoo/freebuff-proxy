@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/server"
@@ -82,6 +83,10 @@ func main() {
 		}
 	}
 	logger := telemetry.New(level, cfg.LogFile)
+	// The dashboard log viewer reads from an in-memory ring that mirrors
+	// every record the process logger emits (no log file or docker needed).
+	logringHandler := logring.NewHandler(logger.Handler(), 500)
+	logger = slog.New(logringHandler)
 	// The pool/upstream/session/runs log through slog.Default(); route it
 	// through our logger so the configured level and log file cover them too.
 	slog.SetDefault(logger)
@@ -121,7 +126,7 @@ func main() {
 	// Prewarm + the 60s maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)
 
-	srv := server.New(&cfg, p, reg, logger)
+	srv := server.New(&cfg, p, reg, logger, logringHandler)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),

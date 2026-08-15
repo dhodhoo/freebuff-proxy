@@ -2,6 +2,8 @@ package dashboard_test
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/dashboard"
+	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/session"
@@ -49,7 +52,7 @@ func newTestDashboard(t *testing.T, tokens int) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil)
+	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil, nil)
 	ts := httptest.NewServer(d.Page("overview"))
 	t.Cleanup(ts.Close)
 	return ts
@@ -111,7 +114,7 @@ func TestLoginPageRendersError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil)
+	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil, nil)
 	rec := httptest.NewRecorder()
 	d.RenderLogin(rec, httptest.NewRequest(http.MethodGet, "/admin/login", nil), "Invalid admin token.")
 	if rec.Code != http.StatusOK {
@@ -122,4 +125,97 @@ func TestLoginPageRendersError(t *testing.T) {
 			t.Errorf("login page missing %q", want)
 		}
 	}
+}
+
+// newDashboardForPages builds a dashboard with a wired log ring for page tests.
+func newDashboardForPages(t *testing.T, withRing bool) *httptest.Server {
+	t.Helper()
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    "https://www.codebuff.com",
+	}
+	mock := testutil.NewMock()
+	clientCfg := *cfg
+	clientCfg.UpstreamBaseURL = mock.URL()
+	client, err := upstream.New("tok-0", &clientCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, []*session.Manager{session.NewManager(client)}, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ring *logring.Handler
+	if withRing {
+		ring = logring.NewHandler(slog.NewTextHandler(io.Discard, nil), 100)
+		slog.New(ring).Info("hello ring", "k", "v")
+	}
+	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil, ring)
+	ts := httptest.NewServer(d.Page("logs"))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func TestLogsPageWithRing(t *testing.T) {
+	ts := newDashboardForPages(t, true)
+	resp, err := http.Get(ts.URL + "/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	page := string(mustReadAll(t, resp))
+	for _, want := range []string{"hello ring", "ring enabled", "INFO", "k=v"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("logs page missing %q", want)
+		}
+	}
+}
+
+func TestLogsPageWithoutRing(t *testing.T) {
+	ts := newDashboardForPages(t, false)
+	resp, err := http.Get(ts.URL + "/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if !strings.Contains(string(mustReadAll(t, resp)), "ring disabled") {
+		t.Error("logs page should report the ring as disabled")
+	}
+}
+
+func TestMetricsPageRendersSparklines(t *testing.T) {
+	cfg := &config.Config{
+		UpstreamBaseURL: "https://www.codebuff.com",
+		AuthTokens:      []string{},
+	}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, nil, nil, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil, nil)
+	rec := httptest.NewRecorder()
+	d.Page("metrics")(rec, httptest.NewRequest(http.MethodGet, "/admin/metrics", nil))
+	page := rec.Body.String()
+	for _, want := range []string{"Requests served", "Transient retries", "Fingerprint rotations", "<svg"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("metrics page missing %q", want)
+		}
+	}
+}
+
+func mustReadAll(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

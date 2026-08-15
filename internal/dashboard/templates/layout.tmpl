@@ -17,14 +17,19 @@
     </ul>
     <ul>
       <li><a href="/admin" class="nav-link">Overview</a></li>
+      <li><a href="/admin/tokens" class="nav-link">Tokens</a></li>
       <li><a href="/admin/config" class="nav-link">Config</a></li>
+      <li><a href="/admin/logs" class="nav-link">Logs</a></li>
+      <li><a href="/admin/metrics" class="nav-link">Metrics</a></li>
     </ul>
   </nav>
 </header>
 <main class="container">
-  <div id="overview-root">{{.Body}}</div>
+  <div id="{{.Page}}-root">{{.Body}}</div>
 </main>
-<div hx-get="/admin" hx-trigger="every 5s" hx-target="#overview-root" hx-swap="innerHTML" hidden></div>
+{{if eq .Page "overview"}}<div hx-get="/admin" hx-trigger="every 5s" hx-target="#overview-root" hx-swap="innerHTML" hidden></div>{{end}}
+{{if eq .Page "logs"}}<div hx-get="/admin/logs" hx-trigger="every 3s" hx-target="#logs-root" hx-swap="innerHTML" hidden></div>{{end}}
+{{if eq .Page "metrics"}}<div hx-get="/admin/metrics" hx-trigger="every 5s" hx-target="#metrics-root" hx-swap="innerHTML" hidden></div>{{end}}
 <footer class="container muted">
   <p>single binary · htmx driven · <a href="/healthz">healthz</a> · <a href="/metrics">metrics</a></p>
 </footer>

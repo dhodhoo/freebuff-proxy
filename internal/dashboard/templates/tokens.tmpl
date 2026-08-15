@@ -1,0 +1,72 @@
+{{define "tokens"}}
+<section class="page-head">
+  <div>
+    <h1>Tokens</h1>
+    <p class="muted">live per-token session state and per-model quota</p>
+  </div>
+  <div class="pills">
+    <span class="pill pill-{{if .InBridge}}bridge{{else}}pool{{end}}">{{if .InBridge}}bridge{{else}}pooled{{end}}</span>
+    {{if .InBridge}}<span class="pill">{{.BridgeTokens}} bridge client{{if ne .BridgeTokens 1}}s{{end}}</span>{{end}}
+  </div>
+</section>
+
+{{if .InBridge}}
+<article class="card bridge-card">
+  <h2>Bridge mode</h2>
+  <p>Upstream tokens are relayed per client request ({{.BridgeTokens}} active bridge client{{if ne .BridgeTokens 1}}s{{end}}); session state and quota are per-client and are not tracked here.</p>
+  <p class="muted">Add <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a> to switch to the pooled relay with per-token tracking.</p>
+</article>
+{{else if not .HasTokens}}
+<article class="card empty-card">
+  <h2>No tokens configured</h2>
+  <p>Add <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a>, then restart the proxy — the token pool is built at startup.</p>
+</article>
+{{else}}
+<p class="muted manage-note">Tokens are configured via <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a>; the pool is built at startup, so add/remove requires a restart.</p>
+{{range .Tokens}}
+<article class="card token-detail">
+  <header class="token-head">
+    <span class="state-dot dot-{{.RiskLevel}}"></span>
+    <strong class="token-name">Token {{.Index}}</strong>
+    <span class="pill risk-{{.RiskLevel}}">{{.RiskLevel}}</span>
+    <span class="pill">{{.SessionStatus}}</span>
+  </header>
+  <dl class="kv kv-4">
+    <div><dt>session id</dt><dd class="mono">{{.SessionInstance}}</dd></div>
+    <div><dt>active runs</dt><dd class="mono">{{.ActiveRuns}}</dd></div>
+    <div><dt>requests</dt><dd class="mono">{{.Requests}}</dd></div>
+    <div><dt>messages 24h</dt><dd class="mono">{{.Messages24h}}{{if gt .DailyLimit 0}} / {{.DailyLimit}}{{end}}</dd></div>
+    {{if gt .QueueDepth 0}}<div><dt>queue</dt><dd class="mono">{{.QueuePosition}}/{{.QueueDepth}}</dd></div>{{end}}
+    {{if .CooldownActive}}<div><dt>cooldown until</dt><dd class="mono">{{.CooldownUntil}}</dd></div>{{end}}
+    {{if gt .TransientRetries 0}}<div><dt>transient retries</dt><dd class="mono">{{.TransientRetries}}</dd></div>{{end}}
+  </dl>
+  {{if gt .DailyLimit 0}}
+  <div class="usage"><div class="usage-bar" style="width: {{.UsagePct}}%"></div></div>
+  <p class="muted usage-label">{{.UsagePct}}% of daily limit</p>
+  {{end}}
+  {{if .HasQuota}}
+  <h3 class="quota-heading">Session quota by model</h3>
+  <div class="table-wrap">
+    <table class="quota-table">
+      <thead>
+        <tr><th scope="col">model</th><th scope="col">recent</th><th scope="col">limit</th><th scope="col">period</th><th scope="col">reset</th><th scope="col">entitlement</th></tr>
+      </thead>
+      <tbody>
+      {{range .Quota}}
+        <tr>
+          <td class="mono">{{.Model}}</td>
+          <td class="mono">{{.Recent}}</td>
+          <td class="mono">{{.Limit}}</td>
+          <td class="mono">{{.Period}}</td>
+          <td class="mono">{{.ResetAt}}</td>
+          {{if .HasEntitlement}}<td class="mono">{{.Entitled}}</td>{{end}}
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{end}}
+</article>
+{{end}}
+{{end}}
+{{end}}

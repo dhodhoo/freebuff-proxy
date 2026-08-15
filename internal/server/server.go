@@ -39,6 +39,7 @@ import (
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/convert"
 	"freebuff-proxy/internal/dashboard"
+	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
@@ -72,14 +73,15 @@ type Server struct {
 
 // New builds the server over the configured pool and registry. A nil logger
 // falls back to slog.Default(). The started timestamp pins /v1/models
-// "created" and /healthz uptime.
-func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger) *Server {
+// "created" and /healthz uptime. logs is the optional dashboard log viewer
+// ring (nil disables the /admin/logs page data).
+func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now()}
 	s.cfg.Store(cfg)
-	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger)
+	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger, logs)
 	s.adminAuth = newAdminAuth()
 	return s
 }
@@ -99,7 +101,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/login", s.handleAdminLogin)
 	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
+	mux.Handle("GET /admin/tokens", s.dashboardAuth(s.dash.Page("tokens")))
 	mux.Handle("GET /admin/config", s.dashboardAuth(s.dash.Page("config")))
+	mux.Handle("GET /admin/logs", s.dashboardAuth(s.dash.Page("logs")))
+	mux.Handle("GET /admin/metrics", s.dashboardAuth(s.dash.Page("metrics")))
 	mux.Handle("POST /admin/config", s.dashboardAuth(http.HandlerFunc(s.handleConfigSave)))
 	mux.Handle("GET /admin/assets/", s.dashboardAuth(http.StripPrefix("/admin/", http.FileServerFS(dashboard.AssetsFS()))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
