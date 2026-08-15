@@ -15,10 +15,13 @@ dist/
 out/
 bin/
 tmp/
+.playwright-mcp/
+.ruff_cache/
 
 # ── build outputs (Go binaries) ──
 /freebuff-proxy
 /freebuff-proxy.exe
+/freebuff-proxy-dash.exe
 *.test
 *.out
 coverage.out
