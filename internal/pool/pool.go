@@ -786,16 +786,17 @@ func (p *Pool) usageResetIn(token int) time.Duration {
 // client yields an error and is never cached.
 func (p *Pool) bridgeEntryFor(clientToken string) (*bridgeEntry, error) {
 	p.bridgeMu.Lock()
-	defer p.bridgeMu.Unlock()
 
 	if entry, ok := p.bridge[clientToken]; ok {
 		entry.lastUsed = time.Now()
 		p.bridgeTouch(clientToken)
+		p.bridgeMu.Unlock()
 		return entry, nil
 	}
 
 	client, err := upstream.New(clientToken, p.cfg)
 	if err != nil {
+		p.bridgeMu.Unlock()
 		return nil, fmt.Errorf("bridge: %w", err)
 	}
 	entry := &bridgeEntry{token: clientToken, client: client}
@@ -805,7 +806,17 @@ func (p *Pool) bridgeEntryFor(clientToken string) (*bridgeEntry, error) {
 
 	p.bridge[clientToken] = entry
 	p.bridgeOrder = append(p.bridgeOrder, clientToken)
-	p.bridgeEvictLocked()
+	// Drop the LRU victims under the lock, then FINISH their runs after
+	// releasing it: FinishAllRuns is a sequential upstream call bounded by
+	// the session-call timeout, so running it under bridgeMu would stall
+	// every other bridge operation (AcquireBridge, bridgeRecordChat,
+	// BridgeCount, bridgeMaintain) for the full eviction duration.
+	victims := p.bridgeEvictLocked()
+	p.bridgeMu.Unlock()
+
+	for _, victim := range victims {
+		victim.runs.FinishAllRuns(context.Background())
+	}
 	return entry, nil
 }
 
@@ -824,19 +835,24 @@ func (p *Pool) bridgeTouch(clientToken string) {
 }
 
 // bridgeEvictLocked evicts the oldest bridge entries while the cache is
-// over maxBridgeEntries (LRU): the evicted entry's runs are FINISHed
-// best-effort (bounded by the client's session-call timeout), then the
-// entry is dropped. Caller holds bridgeMu.
-func (p *Pool) bridgeEvictLocked() {
+// over maxBridgeEntries (LRU): the victims are removed from the cache and
+// LRU order and returned so the caller can FINISH their runs best-effort
+// (bounded by the client's session-call timeout) AFTER releasing bridgeMu —
+// the upstream FINISH calls must not run under the lock, or a full cache
+// would stall every other bridge operation for the whole eviction. Caller
+// holds bridgeMu.
+func (p *Pool) bridgeEvictLocked() []*bridgeEntry {
+	var victims []*bridgeEntry
 	for len(p.bridgeOrder) > maxBridgeEntries {
 		oldest := p.bridgeOrder[0]
 		if entry, ok := p.bridge[oldest]; ok {
-			entry.runs.FinishAllRuns(context.Background())
+			victims = append(victims, entry)
 		}
 		delete(p.bridge, oldest)
 		p.bridgeOrder = p.bridgeOrder[1:]
 		p.logger.Debug("pool: bridge entry evicted (cache full)", "bridge_entries", len(p.bridge))
 	}
+	return victims
 }
 
 // bridgeRecordChat appends one successful upstream chat for the bridge

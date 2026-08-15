@@ -50,14 +50,21 @@ type MockUpstream struct {
 	RunIDs []string
 	runIdx int
 
-	ChatStatus     int    // 200 by default
-	ChatBody       string // SSE body served on 200
-	ChatErrorBody  string // body served on ChatStatus >= 400
-	ChatDelay      time.Duration
-	ChatBlocks     bool // block until the request context is canceled
-	AbortDetected  atomic.Bool
-	ChatHandler    func(w http.ResponseWriter, r *http.Request) // optional full override
-	SessionHandler func(w http.ResponseWriter, r *http.Request) // optional full override
+	ChatStatus    int    // 200 by default
+	ChatBody      string // SSE body served on 200
+	ChatErrorBody string // body served on ChatStatus >= 400
+	ChatDelay     time.Duration
+	ChatBlocks    bool // block until the request context is canceled
+	// FinishDelay delays each FINISH response by this duration. Eviction
+	// tests use it to hold a FINISH in flight while asserting bridge
+	// operations do not block on it.
+	FinishDelay time.Duration
+	// FinishesStarted counts FINISH requests received, incremented before
+	// FinishDelay elapses (tests poll it to detect an in-flight FINISH).
+	FinishesStarted int
+	AbortDetected   atomic.Bool
+	ChatHandler     func(w http.ResponseWriter, r *http.Request) // optional full override
+	SessionHandler  func(w http.ResponseWriter, r *http.Request) // optional full override
 
 	SessionCreateDelay time.Duration // delay/create-block on session create+get
 
@@ -268,6 +275,17 @@ func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"runId": runID})
 	case "FINISH":
 		m.mu.Lock()
+		m.FinishesStarted++
+		delay := m.FinishDelay
+		m.mu.Unlock()
+		if delay > 0 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(delay):
+			}
+		}
+		m.mu.Lock()
 		m.FinishedRuns = append(m.FinishedRuns, FinishedRun{
 			RunID:      payload.RunID,
 			Status:     payload.Status,
@@ -372,4 +390,13 @@ func (m *MockUpstream) FinishedRunsSnapshot() []FinishedRun {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]FinishedRun(nil), m.FinishedRuns...)
+}
+
+// FinishesStartedSnapshot returns a locked copy of the FINISH-received
+// counter (see StartedRunsSnapshot). Tests poll it to detect an in-flight
+// FINISH before FinishDelay has elapsed.
+func (m *MockUpstream) FinishesStartedSnapshot() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.FinishesStarted
 }

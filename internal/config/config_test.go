@@ -389,6 +389,44 @@ func TestEnvOnly(t *testing.T) {
 	}
 }
 
+// TestSOCKS5ProxiesEnv verifies the comma-separated SOCKS5_PROXIES env var
+// lands in cfg.SOCKS5Proxies. Regression: only the JSON config file
+// populated the field, so per-token proxy binding silently fell back to
+// SOCKS5Proxy despite the README documenting SOCKS5_PROXIES as env-settable.
+func TestSOCKS5ProxiesEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("SOCKS5_PROXIES", "host1:9050,host2:9050")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"host1:9050", "host2:9050"}
+	if !equalStrings(cfg.SOCKS5Proxies, want) {
+		t.Errorf("SOCKS5Proxies = %v, want %v (from env)", cfg.SOCKS5Proxies, want)
+	}
+}
+
+// TestDotenvSOCKS5Proxies verifies SOCKS5_PROXIES in ./.env lands in
+// cfg.SOCKS5Proxies, mirroring the env override.
+func TestDotenvSOCKS5Proxies(t *testing.T) {
+	clearEnv(t)
+
+	if err := os.WriteFile(".env", []byte("SOCKS5_PROXIES=host1:9050,host2:9050\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"host1:9050", "host2:9050"}
+	if !equalStrings(cfg.SOCKS5Proxies, want) {
+		t.Errorf("SOCKS5Proxies = %v, want %v (from .env)", cfg.SOCKS5Proxies, want)
+	}
+}
+
 func TestSplitList(t *testing.T) {
 	got := splitList(" a, b ,,c , d\n e\r f ")
 	want := []string{"a", "b", "c", "d", "e", "f"}

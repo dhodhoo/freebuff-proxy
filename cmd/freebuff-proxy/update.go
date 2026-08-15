@@ -183,19 +183,40 @@ func runUpdate() {
 		os.Exit(1)
 	}
 
-	oldPath := execPath + ".old"
-	_ = os.Remove(oldPath)
-	if err := os.Rename(execPath, oldPath); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: rename current binary: %v\n", err)
+	// Write the new binary to a temp file in the SAME directory as the
+	// executable so the final swap is an atomic rename on the same volume.
+	tmp, err := os.CreateTemp(filepath.Dir(execPath), filepath.Base(execPath)+".tmp-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: create temp file for updated binary: %v\n", err)
 		os.Exit(1)
 	}
-
-	if err := os.WriteFile(execPath, binaryBytes, 0755); err != nil {
-		_ = os.Rename(oldPath, execPath) // rollback
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(binaryBytes); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 		fmt.Fprintf(os.Stderr, "ERROR: write updated binary: %v\n", err)
 		os.Exit(1)
 	}
-	_ = os.Remove(oldPath)
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "ERROR: close temp file: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Chmod(tmpPath, 0755); err != nil {
+		_ = os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "ERROR: set permissions on updated binary: %v\n", err)
+		os.Exit(1)
+	}
+
+	deferredMsg, err := replaceExecutable(execPath, tmpPath)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "ERROR: install updated binary: %v\n", err)
+		os.Exit(1)
+	}
+	if deferredMsg != "" {
+		fmt.Println(deferredMsg)
+	}
 
 	fmt.Printf("\nSUCCESS: freebuff-proxy updated to %s!\n", rel.TagName)
 	fmt.Println("Please restart freebuff-proxy to run the new version.")

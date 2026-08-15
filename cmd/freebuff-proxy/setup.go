@@ -228,13 +228,66 @@ func setupOpencodeConfig(p string) bool {
 }
 
 func setupAiderConfig(p string) bool {
-	content := "openai-api-base: http://localhost:3457/v1\nopenai-api-key: not-needed\nmodel: openai/deepseek/deepseek-v4-flash\n"
+	newLines := []string{
+		"openai-api-base: http://localhost:3457/v1",
+		"openai-api-key: not-needed",
+		"model: openai/deepseek/deepseek-v4-flash",
+	}
 	if fileExists(p) {
 		existing, err := os.ReadFile(p)
 		if err == nil && strings.Contains(string(existing), "localhost:3457") {
 			return true
 		}
 		backupFile(p)
+		if err == nil {
+			merged := mergeAiderConfig(string(existing), newLines)
+			return os.WriteFile(p, []byte(merged), 0644) == nil
+		}
 	}
-	return os.WriteFile(p, []byte(content), 0644) == nil
+	return os.WriteFile(p, []byte(strings.Join(newLines, "\n")+"\n"), 0644) == nil
+}
+
+// mergeAiderConfig merges key:value lines into existing YAML-style config
+// text, preserving every unrelated line. A key already present (matched by its
+// "key:" line prefix) is replaced in place; missing keys are appended at the
+// end. The file's original line-ending style is preserved.
+func mergeAiderConfig(existing string, lines []string) string {
+	nl := "\n"
+	if strings.Contains(existing, "\r\n") {
+		nl = "\r\n"
+	}
+
+	split := strings.Split(existing, "\n")
+	// Strip the \r left by CRLF line endings so replacement lines don't end
+	// up with doubled \r after the join below.
+	for i, l := range split {
+		split[i] = strings.TrimSuffix(l, "\r")
+	}
+	found := make(map[string]bool)
+	for _, line := range lines {
+		key := line[:strings.Index(line, ":")+1]
+		for i, l := range split {
+			if strings.HasPrefix(l, key) {
+				split[i] = line
+				found[key] = true
+				break
+			}
+		}
+	}
+
+	var missing []string
+	for _, line := range lines {
+		if key := line[:strings.Index(line, ":")+1]; !found[key] {
+			missing = append(missing, line)
+		}
+	}
+
+	out := strings.Join(split, nl)
+	if len(missing) > 0 {
+		if !strings.HasSuffix(out, nl) {
+			out += nl
+		}
+		out += strings.Join(missing, nl) + nl
+	}
+	return out
 }

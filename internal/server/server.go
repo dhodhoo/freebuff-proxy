@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"freebuff-proxy/internal/config"
@@ -45,9 +46,11 @@ const (
 	maxStreamLine = 16 << 20
 )
 
-// Server is the HTTP handler holder: routes are built by Handler().
+// Server is the HTTP handler holder: routes are built by Handler(). cfg is an
+// atomic pointer because /admin/reload swaps it while requests are in flight;
+// every read site must Load() it once per request and use the local.
 type Server struct {
-	cfg     *config.Config
+	cfg     atomic.Pointer[config.Config]
 	pool    *pool.Pool
 	reg     *registry.Registry
 	logger  *slog.Logger
@@ -61,7 +64,9 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{cfg: cfg, pool: p, reg: reg, logger: logger, started: time.Now()}
+	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now()}
+	s.cfg.Store(cfg)
+	return s
 }
 
 // Handler returns the route table wrapped in an access-log middleware. Method
@@ -141,10 +146,12 @@ func remoteHost(r *http.Request) string {
 // AUTH_TOKENS) also passes through: the Authorization header IS the upstream
 // token there, and API_KEYS is meaningless.
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
-	if len(s.cfg.APIKeys) == 0 || s.cfg.BridgeMode() {
-		return next
-	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.cfg.Load()
+		if len(cfg.APIKeys) == 0 || cfg.BridgeMode() {
+			next(w, r)
+			return
+		}
 		if !s.authorized(r) {
 			s.writeJSONError(w, http.StatusUnauthorized,
 				"Invalid API key", "invalid_request_error", "invalid_api_key", 0)
@@ -158,6 +165,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 // either as "Authorization: Bearer <key>" or "x-api-key: <key>". Comparison
 // is constant-time against every configured key.
 func (s *Server) authorized(r *http.Request) bool {
+	cfg := s.cfg.Load()
 	provided := ""
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		provided = strings.TrimPrefix(h, "Bearer ")
@@ -167,7 +175,7 @@ func (s *Server) authorized(r *http.Request) bool {
 	if provided == "" {
 		return false
 	}
-	for _, key := range s.cfg.APIKeys {
+	for _, key := range cfg.APIKeys {
 		if subtle.ConstantTimeCompare([]byte(provided), []byte(key)) == 1 {
 			return true
 		}
@@ -256,7 +264,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// upstream token. No token → 401 before touching the pool.
 	var up io.ReadCloser
 	var lease *pool.Lease
-	if s.cfg.BridgeMode() {
+	cfg := s.cfg.Load()
+	if cfg.BridgeMode() {
 		tok := clientToken(r)
 		if tok == "" {
 			s.writeJSONError(w, http.StatusUnauthorized,
@@ -390,9 +399,15 @@ func (s *Server) chatAttempt(
 		case errors.Is(err, upstream.ErrSessionInvalid):
 			release()
 			invalidateSession(lease)
+			if attempts > 1 {
+				return nil, nil, err
+			}
 		case errors.Is(err, upstream.ErrRunInvalid):
 			release()
 			invalidateRun(lease, lease.AgentID)
+			if attempts > 1 {
+				return nil, nil, err
+			}
 		case errors.Is(err, upstream.ErrAuthRejected):
 			cooldownAuth(lease)
 			release()
@@ -699,7 +714,7 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONError(w, http.StatusInternalServerError, "failed to reload config: "+err.Error(), "internal_error", "reload_failed", 0)
 		return
 	}
-	s.cfg = &newCfg
+	s.cfg.Store(&newCfg)
 	s.logger.Info("config reloaded successfully", "auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{

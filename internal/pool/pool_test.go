@@ -1266,6 +1266,78 @@ func TestBridgeEviction(t *testing.T) {
 	}
 }
 
+// TestBridgeEvictionFinishOutsideLock is the regression guard for the P1
+// "FINISH under bridgeMu" bug: eviction used to run FinishAllRuns (a
+// sequential upstream call bounded by the session-call timeout) while
+// holding bridgeMu, stalling every other bridge operation for the whole
+// eviction. Here the evicted entry's FINISH is held in flight for
+// FinishDelay: a concurrent BridgeCount (which takes bridgeMu) must return
+// immediately, proving the FINISH no longer runs under the lock.
+func TestBridgeEvictionFinishOutsideLock(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ids := make([]string, maxBridgeEntries+8)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	// Slow FINISH responses hold the eviction's upstream call in flight long
+	// enough to probe the lock: with the old code BridgeCount would block
+	// for the full delay; with the fix it returns in microseconds.
+	mock.FinishDelay = 300 * time.Millisecond
+	p := newBridgePool(t, mock)
+
+	// Fill the cache to the cap.
+	for i := range maxBridgeEntries {
+		lease, err := p.AcquireBridge(context.Background(), fmt.Sprintf("client-tok-%02d", i), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.LeaseRelease(lease)
+	}
+
+	// A 33rd distinct token evicts the oldest entry; its FINISH is held in
+	// flight by FinishDelay while the rest of the acquire proceeds.
+	evictDone := make(chan error, 1)
+	go func() {
+		lease, err := p.AcquireBridge(context.Background(), "client-tok-evict", modelA)
+		if err == nil {
+			p.LeaseRelease(lease)
+		}
+		evictDone <- err
+	}()
+
+	// Wait until the eviction FINISH is actually being served by the mock
+	// (the handler counts it before sleeping the delay).
+	eventually(t, "eviction FINISH in flight", func() bool {
+		return mock.FinishesStartedSnapshot() >= 1
+	})
+
+	// While the FINISH is in flight, bridge operations must not block:
+	// BridgeCount takes bridgeMu, which eviction holds only for the
+	// map/order mutation, never across the upstream FINISH.
+	start := time.Now()
+	count := p.BridgeCount()
+	if elapsed := time.Since(start); elapsed >= mock.FinishDelay/2 {
+		t.Errorf("BridgeCount during eviction FINISH took %v, want < %v (FINISH ran under bridgeMu)", elapsed, mock.FinishDelay/2)
+	}
+	if count > maxBridgeEntries {
+		t.Errorf("BridgeCount = %d, want <= %d", count, maxBridgeEntries)
+	}
+
+	// The evicting acquire completes, the evicted run is FINISHed, and the
+	// oldest entry is gone.
+	if err := <-evictDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := mock.FinishedRunsSnapshot(); len(got) < 1 {
+		t.Errorf("finished runs = %d, want >= 1 (evicted entry finished)", len(got))
+	}
+	if p.bridgeToken("client-tok-00") != nil {
+		t.Error("oldest bridge entry still cached, want evicted")
+	}
+}
+
 func TestBridgeAcquireEmptyToken(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()

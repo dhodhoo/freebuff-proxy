@@ -1321,7 +1321,7 @@ func (c *Client) dump(kind string, req *http.Request, status int, body string) {
 	fmt.Fprintf(&buf, "%s %s\n", req.Method, req.URL.String())
 	for k, vs := range req.Header {
 		for _, v := range vs {
-			if strings.EqualFold(k, "Authorization") {
+			if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "x-codebuff-api-key") {
 				v = "[redacted]"
 			}
 			fmt.Fprintf(&buf, "%s: %s\n", k, v)

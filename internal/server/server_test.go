@@ -378,6 +378,40 @@ func TestRunInvalidRecovers(t *testing.T) {
 	}
 }
 
+func TestChatSessionInvalidBoundedRetry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	// Every chat returns a session-invalid error. Without a retry budget the
+	// recovery loop re-creates the session and re-chats forever, hanging the
+	// client; the budget must cap it at one retry (2 chat attempts total).
+	mock.ChatStatus = http.StatusBadRequest
+	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	ts, _ := newTestServer(t, nil, mock)
+
+	// A client timeout makes a regression (unbounded loop) fail fast instead
+	// of hanging the whole suite.
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(ts.URL+"/v1/chat/completions", "application/json", bytes.NewReader(chatBody(modelA)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "upstream_unavailable") {
+		t.Errorf("body missing upstream_unavailable: %s", data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 2 {
+		t.Errorf("upstream chat attempts = %d, want exactly 2 (bounded retry)", got)
+	}
+	if got := mock.SessionCreates; got != 2 {
+		t.Errorf("upstream session creates = %d, want exactly 2 (bounded retry)", got)
+	}
+}
+
 func TestClientAbortPropagates(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -708,6 +742,62 @@ func TestAdminReload(t *testing.T) {
 	if !strings.Contains(string(data), `"status":"ok"`) {
 		t.Errorf("reload response missing ok status: %s", data)
 	}
+}
+
+func TestConcurrentReloadAndChat(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-c1", 1, `"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]`))
+	ts, _ := newTestServer(t, nil, mock)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	// Hammer chat and models while handleReload swaps s.cfg. The local run
+	// exercises the concurrent paths without panicking; the -race build in CI
+	// is the real data-race gate.
+	worker := func(method, url string, body []byte) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				var reader io.Reader
+				if body != nil {
+					reader = bytes.NewReader(body)
+				}
+				req, err := http.NewRequest(method, url, reader)
+				if err != nil {
+					t.Errorf("worker request build: %v", err)
+					return
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Errorf("worker request: %v", err)
+					continue
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}
+		}()
+	}
+	for i := 0; i < 8; i++ {
+		worker(http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA))
+	}
+	for i := 0; i < 4; i++ {
+		worker(http.MethodGet, ts.URL+"/v1/models", nil)
+	}
+	for i := 0; i < 20; i++ {
+		resp, data := doJSON(t, http.MethodPost, ts.URL+"/admin/reload", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("reload %d status = %d, want 200: %s", i, resp.StatusCode, data)
+		}
+	}
+	close(stop)
+	wg.Wait()
 }
 
 func TestAllTokensDead502(t *testing.T) {

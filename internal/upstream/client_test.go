@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -931,6 +933,52 @@ func newRetryClient(t *testing.T, baseURL string, retries int, fingerprint strin
 	rt := &flakyRT{}
 	client.http.Transport = rt
 	return client, rt
+}
+
+// TestDumpRedactsTokenHeaders verifies the debug dump redacts both the
+// Authorization header and x-codebuff-api-key (which carries the same token).
+// Regression: dump() only redacted Authorization, so DEBUG_DUMP=true leaked
+// the plaintext token into dump/ files via x-codebuff-api-key.
+func TestDumpRedactsTokenHeaders(t *testing.T) {
+	t.Chdir(t.TempDir())
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatStatus = http.StatusUnauthorized
+	mock.ChatErrorBody = `{"error":"unauthorized"}`
+
+	client, err := New("tok-secret-1234", testConfig(mock.URL(), func(c *config.Config) {
+		c.DebugDump = true
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	if _, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, body); err == nil {
+		t.Fatal("expected error from 401 response")
+	}
+
+	entries, err := filepath.Glob(filepath.Join("dump", "*.dump"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("no dump file written")
+	}
+	data, err := os.ReadFile(entries[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	dump := string(data)
+	if strings.Contains(dump, "tok-secret-1234") {
+		t.Fatalf("dump file leaks token:\n%s", dump)
+	}
+	if !strings.Contains(dump, "Authorization: [redacted]") {
+		t.Errorf("dump file missing redacted Authorization header:\n%s", dump)
+	}
+	if !strings.Contains(dump, "X-Codebuff-Api-Key: [redacted]") {
+		t.Errorf("dump file missing redacted X-Codebuff-Api-Key header:\n%s", dump)
+	}
 }
 
 func TestChatCompletionsRetriesTransientFailure(t *testing.T) {
