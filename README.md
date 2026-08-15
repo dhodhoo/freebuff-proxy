@@ -285,7 +285,10 @@ The proxy ships with an embedded web dashboard — same single binary, no extra 
 
 - **Login**: enter the `ADMIN_TOKEN` from your config. Without `ADMIN_TOKEN` the dashboard is open (matching `/admin/reload`'s legacy behavior; a startup warning is logged) — but the secret-bearing **Config and Logs pages require a loopback client** in that mode, so a remotely reachable proxy cannot leak or rewrite its `.env`. Failed logins are rate-limited per IP (5 fails → 1 minute lockout), and the session cookie is `HttpOnly` + `SameSite=Strict` (+ `Secure` when the proxy listens beyond loopback).
 - **Overview**: live relay state (pooled/bridge mode, model count, uptime, safe mode) with per-token cards — session status, ban/429 risk level, usage vs `MAX_MESSAGES_PER_DAY`, transient-retry counters. Polls every 5s.
-- **Tokens**: per-token session detail and the live per-model session quota table (limit/recent/period/reset/entitlement).
+- **Tokens**: per-token session detail + the live per-model session quota table (limit/recent/period/reset/entitlement) with **usage bars and reset countdowns**; per-token **Unlock** (clears cooldown/ban), **Finish runs**, and **Test** (real upstream session probe). Polls every 30s.
+- **Models**: the live catalog with upstream agent mappings and `MODEL_ALIASES`.
+- **Traces**: recent chat requests and their routing outcome (token, model, status, duration, error class) — the observability view for ban-avoidance debugging. Polls every 3s.
+- **Setup**: copy-paste client snippets (OpenCode, Continue, aider, 9router, curl) generated from the effective config.
 - **Config**: edit the proxy's `.env` file in place. Save runs the same validation as startup (durations, URLs, `Validate`) and hot-reloads; invalid input is rejected with the file rolled back. The effective-value table shows secrets redacted to set/unset + counts.
 - **Logs**: the last 200 records from an in-memory ring (no log file or docker needed), level-colored, polling every 3s.
 - **Metrics**: sampled counter trends as server-rendered sparklines; the full Prometheus exposition stays at `/metrics`.

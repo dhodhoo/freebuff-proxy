@@ -26,15 +26,35 @@ restarting the proxy signs everyone out, which is the safe default.
   queue position, cooldown end, transient retries. Refreshes every 5s.
 - **Tokens** — the same per-token state in detail (session instance id) plus
   the live **per-model session quota** table (`limit`, `recent`, `period`,
-  `reset`, `entitlement`) parsed from the last upstream admission. The token
-  pool is built at startup, so adding/removing `AUTH_TOKENS` requires a restart
-  — the page says so rather than pretending otherwise.
+  `reset`, `entitlement`) parsed from the last upstream admission, now with
+  **usage bars and reset countdowns** ("resets in 4h 12m", amber at ≥80%).
+  Refreshes every 30s so countdowns stay honest. Three per-token actions:
+  - **Test** — a real upstream session handshake (create + end) through that
+    token, surfacing validity/network errors — the same idea as 9router's
+    per-connection Test button.
+  - **Unlock** — clears a cooldown / rate-limit lock / ban window (only shown
+    while a lock is active; `hx-confirm` guards it — upstream locks are
+    usually correct, and unlocking a banned token resumes traffic).
+  - **Finish runs** — finishes the token's active runs without touching
+    in-flight requests.
+  These are gated like Config (loopback-only when `ADMIN_TOKEN` is unset).
+  The token pool is built at startup, so adding/removing `AUTH_TOKENS` still
+  requires a restart.
+- **Models** — the live registry catalog: every model id with the upstream
+  agent that serves it, plus the `MODEL_ALIASES` table.
+- **Traces** — recent chat requests and their routing outcome: token chosen,
+  model, status (`ok`/`error` + class `rate_limited`/`banned`/`waiting_room`/
+  `upstream`), duration, and error string. This is the ban-avoidance
+  observability view — see 429/ban events as they happen. Refreshes every 3s.
 - **Config** — a raw `.env` editor next to the effective-value table (secrets
   redacted to set/unset + counts). Save validates with the same pipeline as
   startup (durations, URLs, `Config.Validate`) and hot-reloads via the atomic
   config swap; invalid input is rejected **with the previous file restored**.
   When no `.env` exists yet, the editor is seeded with a commented template of
   every key and its default.
+- **Setup** — copy-paste client configuration: OpenCode, Continue, aider,
+  9router, and a curl smoke test, all generated from the effective config
+  (base URL, mode, first catalog model), plus the full model list as chips.
 - **Logs** — the last 200 records from an in-memory ring that mirrors the
   process logger (stderr and any `LOG_FILE` still receive everything). No log
   file, no docker access needed. Refreshes every 3s.
