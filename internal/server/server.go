@@ -462,24 +462,6 @@ func isLoopback(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// listenOnLoopback reports whether the listen address is loopback-only
-// ("127.0.0.1:port", "localhost:port", "[::1]:port") as opposed to
-// wildcard/container binds (":3457", "0.0.0.0:3457").
-func listenOnLoopback(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		return false
-	}
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
 // handleAdminLogin renders the login page and processes the token form:
 // constant-time ADMIN_TOKEN comparison, per-IP rate limiting, and a signed
 // session cookie on success. With ADMIN_TOKEN unset it redirects straight to
@@ -499,9 +481,11 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		token := r.FormValue("token")
 		if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.AdminToken)) == 1 {
 			s.adminAuth.clearFails(ip)
-			// Secure only when the proxy listens beyond loopback: the cookie
-			// would otherwise be rejected over the plain-HTTP localhost case.
-			s.adminAuth.setCookie(w, !listenOnLoopback(cfg.ListenAddr))
+			// Secure only when the login arrived over an actual TLS
+			// connection (direct HTTPS or a TLS-terminating reverse proxy
+			// setting X-Forwarded-Proto). A Secure cookie over plain HTTP is
+			// rejected by browsers, silently breaking remote login.
+			s.adminAuth.setCookie(w, r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"))
 			http.Redirect(w, r, "/admin", http.StatusFound)
 			return
 		}
