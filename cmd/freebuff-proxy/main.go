@@ -191,10 +191,21 @@ func main() {
 		serveErr <- httpServer.ListenAndServe()
 	}()
 
+	// A bind failure (port already in use) is the most common startup
+	// error and the one that looks like "cannot open" when the EXE is
+	// double-clicked: print a prominent hint naming the offender before
+	// draining. Any server failure exits non-zero so scripts/health checks
+	// can tell the process did not come up.
+	exitCode := 0
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("http server failed", "err", err)
+			if isPortInUse(err) {
+				printPortInUseHint(cfg.ListenAddr, err)
+			} else {
+				logger.Error("http server failed", "err", err)
+			}
+			exitCode = 1
 			stop() // cancel ctx: stop the pool jobs, then drain
 		}
 	case <-ctx.Done():
@@ -210,6 +221,9 @@ func main() {
 	}
 	p.Shutdown(shutdownCtx)
 	logger.Info("shutdown complete")
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }
 
 // refreshLoop refreshes the registry immediately, then every interval.

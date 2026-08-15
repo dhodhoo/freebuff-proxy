@@ -1,0 +1,162 @@
+// Port-conflict diagnostics: when the HTTP server cannot bind because
+// another process holds LISTEN_ADDR's port, print a prominent, actionable
+// hint naming the offender instead of the silent flash-and-exit that makes a
+// double-clicked EXE look like it "cannot open".
+package main
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"syscall"
+)
+
+// isPortInUse reports whether err is a bind failure because the address is
+// already taken. EADDRINUSE is portable: net.Listen wraps it in
+// *net.OpError → *os.SyscallError → syscall.Errno, and errors.Is unwraps.
+// On Windows the bind error is WSAEADDRINUSE, which this toolchain's
+// syscall.EADDRINUSE constant does not equal, so the OS message is matched
+// as a fallback (same substring style as upstream's isTransient).
+func isPortInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "only one usage of each socket address")
+}
+
+// portOf extracts the numeric port from a ListenAddr (":3457",
+// "127.0.0.1:3457", "[::1]:3457"). Empty when unparseable.
+func portOf(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return port
+}
+
+// portOwner returns a human label for the process listening on port, e.g.
+// "PID 44420  freebuff-proxy-dash.exe". Best-effort: empty when detection
+// fails or the tool is missing.
+func portOwner(port string) string {
+	var pid string
+	switch runtime.GOOS {
+	case "windows":
+		pid = windowsPortPID(port)
+	case "linux", "darwin":
+		pid = unixPortPID(port)
+	}
+	if pid == "" {
+		return ""
+	}
+	label := "PID " + pid
+	if name := processName(pid); name != "" {
+		label += "  " + name
+	}
+	return label
+}
+
+// windowsPortPID finds the LISTENING PID for port from netstat -ano output.
+func windowsPortPID(port string) string {
+	out, err := exec.Command("netstat", "-ano").Output()
+	if err != nil {
+		return ""
+	}
+	return windowsPortPIDFromOutput(string(out), port)
+}
+
+// windowsPortPIDFromOutput parses netstat -ano text: the local address field
+// ends with ":PORT" and the state field is LISTENING; the last field is the
+// PID. Pure so the parsing is testable.
+func windowsPortPIDFromOutput(out, port string) string {
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		if strings.EqualFold(f[0], "TCP") && strings.HasSuffix(f[1], ":"+port) && strings.Contains(strings.ToUpper(f[3]), "LISTEN") {
+			return f[len(f)-1]
+		}
+	}
+	return ""
+}
+
+// unixPortPID returns the first LISTENING PID for port via lsof -ti.
+func unixPortPID(port string) string {
+	out, err := exec.Command("lsof", "-ti", ":"+port, "-sTCP:LISTEN").Output()
+	if err != nil {
+		return ""
+	}
+	if f := strings.Fields(string(out)); len(f) > 0 {
+		return f[0]
+	}
+	return ""
+}
+
+// processName resolves a PID to a process name: tasklist CSV on Windows,
+// ps on unix. Empty when unavailable.
+func processName(pid string) string {
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("tasklist", "/FI", "PID eq "+pid, "/FO", "CSV", "/NH").Output()
+		if err != nil {
+			return ""
+		}
+		return taskNameFromCSV(string(out))
+	}
+	out, err := exec.Command("ps", "-p", pid, "-o", "comm=").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// taskNameFromCSV extracts the quoted image name from a tasklist CSV line
+// like "freebuff-proxy-dash.exe","44420","Console","1","50,776 K".
+func taskNameFromCSV(line string) string {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, `"`) {
+		return ""
+	}
+	if i := strings.IndexByte(line[1:], '"'); i >= 0 {
+		return line[1 : 1+i]
+	}
+	return ""
+}
+
+// printPortInUseHint writes the actionable port-conflict message to stderr.
+// On an interactive console (stderr is a char device — the double-clicked
+// EXE case) it holds the window open until Enter so the message is readable.
+func printPortInUseHint(addr string, err error) {
+	port := portOf(addr)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "freebuff-proxy: cannot listen on", addr)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  Port "+port+" is already in use by another process.")
+	if owner := portOwner(port); owner != "" {
+		fmt.Fprintln(os.Stderr, "  The process using it:  "+owner)
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  To close the other app, find and stop it:")
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, "    netstat -ano | findstr :"+port+"   (note the PID of the LISTENING line)")
+		fmt.Fprintln(os.Stderr, "    taskkill /PID <pid> /F")
+	} else {
+		fmt.Fprintln(os.Stderr, "    lsof -i :"+port+"   (note the PID)")
+		fmt.Fprintln(os.Stderr, "    kill <pid>")
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  Then start freebuff-proxy again.")
+	fmt.Fprintln(os.Stderr)
+	if fi, _ := os.Stderr.Stat(); fi != nil && fi.Mode()&os.ModeCharDevice != 0 {
+		fmt.Fprintln(os.Stderr, "Press Enter to exit.")
+		_, _ = fmt.Scanln()
+	}
+}
