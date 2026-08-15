@@ -3,12 +3,12 @@
 Thanks for wanting to help! Both **issues** and **pull requests** are welcome.
 
 This project is a community proxy for an undocumented upstream API. That
-upstream changes often, so behavior can break or shift between releases —
-that is expected, not a sign of neglect.
+upstream changes often, so behavior can break or shift between releases.
+That is expected, not a sign of neglect.
 
 ## Before you start
 
-- Read the [README](README.md) — it explains what the proxy does, how it is
+- Read the [README](README.md): it explains what the proxy does, how it is
   configured, and the terms-of-service risk.
 - Public documentation lives in `README.md` and `docs/guides/`. Anything
   under the rest of `docs/` is local-only and gitignored; keep new docs in
@@ -25,7 +25,7 @@ that is expected, not a sign of neglect.
 Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.md). The
 more precise the reproduction, the faster it gets fixed:
 
-- **Sanitize everything** — no real tokens. Replace them with `cb_xxx`
+- **Sanitize everything**: no real tokens. Replace them with `cb_xxx`
   placeholders and do **not** paste `.env` contents.
 - Include the config keys you changed, the exact request (endpoint, headers,
   body), and what happened vs. what you expected.
@@ -40,7 +40,7 @@ more precise the reproduction, the faster it gets fixed:
 Use the [feature request template](.github/ISSUE_TEMPLATE/feature_request.md):
 what problem it solves, how the proxy should behave (config keys/endpoints in
 mind), and what you tried instead. If the feature needs coordination with the
-undocumented upstream API, say so — that affects feasibility.
+undocumented upstream API, say so, as that affects feasibility.
 
 ### Security issues
 
@@ -58,15 +58,15 @@ and use GitHub's private vulnerability reporting.
   - Public docs (`README.md`, `docs/guides/`) are updated when config or
     behavior changes
 - **No secrets.** Never commit real FreeBuff tokens, `.env` files, or
-  `config.json` contents. These are gitignored — keep them that way.
+  `config.json` contents. These are gitignored, so keep them that way.
 - **CI must be green.** If a failure is unrelated to your change, say so in
   the PR description.
 - **Commit style.** Conventional commits, matching the repo history:
 
-  - `fix(scope): ...` — bug fix
-  - `feat(scope): ...` — new functionality
-  - `chore(scope): ...` — maintenance, tooling, deps, docs meta
-  - `docs: ...` — documentation changes only
+  - `fix(scope): ...`: bug fix
+  - `feat(scope): ...`: new functionality
+  - `chore(scope): ...`: maintenance, tooling, deps, docs meta
+  - `docs: ...`: documentation changes only
 
   One logical change per commit.
 

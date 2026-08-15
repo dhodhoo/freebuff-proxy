@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Something is broken — create a report to help fix it
+about: Something is broken: create a report to help fix it
 title: ""
 labels: bug
 assignees: ""
@@ -11,7 +11,7 @@ A clear and concise description of what is broken.
 
 **To reproduce**
 Steps to reproduce the behavior:
-1. Config used (sanitized — no real tokens, replace with `cb_xxx` placeholders; do NOT paste `.env` contents)
+1. Config used (sanitized, no real tokens, replace with `cb_xxx` placeholders; do NOT paste `.env` contents)
 2. Request sent (endpoint, headers, body)
 3. What happened
 

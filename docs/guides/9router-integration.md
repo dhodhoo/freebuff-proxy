@@ -76,7 +76,7 @@ sudo cp freebuff-proxy.service /etc/systemd/system/ && sudo systemctl enable --n
 ### 1.1 Bridge mode (no proxy token)
 
 Don't want to put your FreeBuff token in the proxy's `.env`? Leave `AUTH_TOKENS=` **empty**
-(bridge mode) — the proxy holds no token of its own and relays each request with the token
+(bridge mode). The proxy holds no token of its own and relays each request with the token
 the client sends:
 
 - 9router **API Key** (node + Add API Key): use **your FreeBuff token** (not a placeholder).
@@ -86,14 +86,14 @@ the client sends:
 - `/v1/models` and `/healthz` need no header; `API_KEYS` is ignored in bridge mode.
 - Sessions/runs are created lazily per token and reused; the cache is capped at 32 tokens
   with LRU eviction and ~2h idle eviction. Ban/quota errors stay per account (403/429/503).
-- Want several FreeBuff accounts? Add several 9router keys — each carries its own token.
+- Want several FreeBuff accounts? Add several 9router keys: each carries its own token.
 
-> **Connection strategy — do NOT use round-robin.** With multiple keys, set 9router's
+> **Connection strategy: do NOT use round-robin.** With multiple keys, set 9router's
 > connection strategy to **fallback / priority (fill the first)**. Round-robin spreads
 > traffic across every account at once: all accounts burn their daily quota together and
 > expose the same rotated access pattern, which is a high-risk signal for account bans.
 > Fallback keeps one account active at a time and only moves to the next when the active
-> one is rate-limited (429) or unavailable — the same drain order the proxy uses in pooled
+> one is rate-limited (429) or unavailable, the same drain order the proxy uses in pooled
 > mode. Expect the active account to surface a 429 (`reset at <next 00:00 PT>`) once its
 > daily quota is exhausted; that is the normal end-of-quota signal, not a ban, and 9router
 > auto-falls back to the next key.
@@ -129,7 +129,7 @@ npm run build
 PORT=20128 HOSTNAME=0.0.0.0 node .next/standalone/server.js
 ```
 
-**Option C — Docker (published image):**
+**Option C, Docker (published image):**
 
 Multi-platform images (`linux/amd64`, `linux/arm64`) are published to Docker Hub
 (`decolua/9router`) and GHCR (`ghcr.io/decolua/9router`):
@@ -151,14 +151,14 @@ docker run -d \
 - **Useful commands:** `docker logs -f 9router`, `docker restart 9router`,
   `docker stop 9router && docker rm 9router`, `docker pull decolua/9router:latest` to update.
 - **9router in Docker + freebuff-proxy on the host:** use the compose bridge gateway as
-  the proxy's Base URL (section 1) — the container reaches the host via the gateway IP
+  the proxy's Base URL (section 1). The container reaches the host via the gateway IP
   (commonly `172.17.0.1`/`172.18.0.1`).
 - **Freebuff-proxy also in Docker:** both on the same bridge network; the proxy's compose
   publishes port 3457, so use the proxy container's network-gateway Base URL
   (print it with `scripts/setup-proxy-docker.sh`).
 - The reference repo ships a `docker-compose.yml` that also starts a **headroom** companion
   container (`ghcr.io/chopratejas/headroom`, port 8787, `HEADROOM_URL=http://headroom:8787`)
-  for the RTK headroom saver — optional; freebuff-proxy does not need it.
+  for the RTK headroom saver (optional; freebuff-proxy does not need it).
 
 Data lives in `DATA_DIR` (SQLite). Default port: **20128** (dashboard `/dashboard`, API `/v1`).
 On first run (v0.5.50+) 9router auto-provisions a **Default Key** for the dashboard.
@@ -293,7 +293,7 @@ On the provider page, per node and per connection (verified against `providers/[
   - **Disable / enable** individual models without deleting them.
   - **Test model**: probe a single model through the node.
   - **Suggested models import**: available only for built-in providers that ship a public
-    models-fetcher config; custom nodes have no such import — add catalog ids manually
+    models-fetcher config; custom nodes have no such import. Add catalog ids manually
     via Add Model.
 
 ---
@@ -467,6 +467,6 @@ message.
 
 ## Related docs
 
-- [Getting Started](getting-started.md) — 5-minute setup walkthrough
-- [Client Integration](client-integration.md) — Continue, Cursor, aider, opencode, SDK configs
-- [README](../../README.md) — overview, config reference, quick start
+- [Getting Started](getting-started.md): 5-minute setup walkthrough
+- [Client Integration](client-integration.md): OpenCode, pi, 9router, LiteLLM, SDK configs
+- [README](../../README.md): overview, config reference, quick start

@@ -6,12 +6,12 @@ This guide takes you from zero to a working OpenAI-compatible proxy connected to
 
 ## What is freebuff-proxy?
 
-`freebuff-proxy` is a local bridge server. It sits between your favorite coding tools (like Continue, Cursor, aider, or opencode) and FreeBuff's free AI models. Your tools talk standard OpenAI API to `localhost:3457`, and the proxy manages sessions and tokens behind the scenes.
+`freebuff-proxy` is a local bridge server. It sits between your favorite coding tools (OpenCode, pi, 9router, LiteLLM, or your own scripts) and FreeBuff's free AI models. Your tools talk standard OpenAI API to `localhost:3457`, and the proxy manages sessions and tokens behind the scenes.
 
 ```
 +-------------------+      OpenAI API      +-------------------+      FreeBuff      +-------------------+
 | Your AI Client    | -------------------> | freebuff-proxy    | -----------------> | codebuff.com      |
-| (Continue/Cursor) | <------------------- | (localhost:3457)  | <----------------- | (Free Models)     |
+| (OpenCode / pi)  | <------------------- | (localhost:3457)  | <----------------- | (Free Models)     |
 +-------------------+      SSE Streams     +-------------------+     CLI Envelope   +-------------------+
 ```
 
@@ -20,10 +20,10 @@ This guide takes you from zero to a working OpenAI-compatible proxy connected to
 ## Important Safety Warning
 
 Using this proxy conflicts with Codebuff's terms of service. Upstream abuse detection scans for automation patterns and suspends accounts.
-- **Keep `SAFE_MODE=true`** — it is the default and is set explicitly in `.env.example`; it enables anti-ban stealth (TLS fingerprint, header sanitization, request jitter, idle rotation).
+- **Keep `SAFE_MODE=true`** (it is the default, set explicitly in `.env.example`). It enables anti-ban stealth (TLS fingerprint, header sanitization, request jitter, idle rotation).
 - Do **not** run 24/7 on heavy unattended automated tasks.
 - Keep one modest account; do not create spam clusters of accounts.
-- **Use one key until it is rate-limited.** The proxy prefers the token with a live session and only switches when it is exhausted — don't rotate several healthy keys aggressively (farming signals).
+- **Use one key until it is rate-limited.** The proxy prefers the token with a live session and only switches when it is exhausted. Don't rotate several healthy keys aggressively (farming signals).
 - **For 24h of coding, budget 4–5 keys**, each registered with a **real email address** (e.g. Gmail). Temp-mail registrations are flagged as not-legitimate and are more likely to be banned.
 
 ---
@@ -45,7 +45,16 @@ irm https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/instal
 Follow the prompts to pick your token or enable bridge mode.
 
 #### How to obtain your FreeBuff token (`authToken`):
-Run `npm i -g freebuff` and `freebuff` to log in via browser. The CLI saves your `authToken` in `~/.config/manicode/credentials.json` (Windows: `C:\Users\<you>\.config\manicode\credentials.json`).
+
+Fastest path: run the bundled gen script. It opens a browser OAuth login and prints the token to the terminal without saving it:
+
+- Linux / macOS: `./scripts/gen-token.sh --clipboard`
+- Windows (PowerShell): `.\scripts\gen-token.ps1 -ToClipboard`
+
+`gen-token.*` is an alias for `gen-freebuff-token.*`, which also supports `--save` (store in the CLI credentials file), `--append` (add to `.env` `AUTH_TOKENS`), and `--env <path>`.
+
+Alternatively, log in with the official CLI: `npm i -g freebuff` and run `freebuff`. The CLI saves your `authToken` in `~/.config/manicode/credentials.json` (Windows: `C:\Users\<you>\.config\manicode\credentials.json`).
+
 ---
 
 ### Option B: Docker Compose
@@ -63,8 +72,13 @@ docker compose up -d --build
 Run the diagnostic tool or curl:
 
 ```bash
-# Diagnostic doctor check:
+# Diagnostic doctor check: config, port, DNS/TLS, and a real session
+# handshake per token (catches expired tokens before the first chat 401):
 ./freebuff-proxy -doctor
+
+# Standalone token probe: real upstream session handshake, exit 0/1
+# (handy for installers and scripts):
+./freebuff-proxy -test-token
 
 # Quick health check (JSON: status, uptime, model count, per-token snapshot):
 curl http://localhost:3457/healthz
@@ -76,7 +90,7 @@ curl http://localhost:3457/metrics
 curl http://localhost:3457/v1/models
 ```
 
-`/healthz` returning status `200` means the proxy is running and reachable — it does not validate your token (a bad `AUTH_TOKENS` only surfaces when a chat request is made).
+`/healthz` returning status `200` means the proxy is running and reachable. It does **not** validate your token. Use `./freebuff-proxy -test-token` (or the dashboard smoke test on the Overview page) to prove a token is valid before your first chat; `-doctor` runs the same per-token session probe among its checks.
 
 `/healthz` also reports each token's live per-model quota (`quota` map) when the last session admission carried it.
 
@@ -85,11 +99,11 @@ curl http://localhost:3457/v1/models
 Point your AI tool to:
 - **Base URL:** `http://localhost:3457/v1`
 - **API Key:** `not-needed` (or your token in bridge mode)
-- **Model:** `deepseek/deepseek-v4-flash` (or `z-ai/glm-5.2`)
+- **Model:** `deepseek/deepseek-v4-flash`
 
-Fastest path: run `./freebuff-proxy -setup` to write the config for Continue, opencode, or aider automatically.
+Fastest path: run `./freebuff-proxy -setup` to write the client config automatically.
 
-See the [Client Integration Guide](client-integration.md) for copy-paste config for Continue, Cursor, aider, opencode, and more.
+See the [Client Integration Guide](client-integration.md) for copy-paste config for OpenCode, pi, 9router, LiteLLM, and more.
 
 ---
 
@@ -99,8 +113,8 @@ Run `./freebuff-proxy -doctor` to diagnose problems automatically.
 
 | Error / Symptom | Cause & Fix |
 |---|---|
-| `502` + `403 free_mode_cli_required` | The request was missing the CLI system prompt marker or envelope. The proxy injects this automatically — update to the latest version. |
-| `502` + `401 Invalid API key` | Token in `.env` is expired or invalid. Re-run `freebuff` to log in and update `AUTH_TOKENS`. |
+| `502` + `403 free_mode_cli_required` | The request was missing the CLI system prompt marker or envelope. The proxy injects this automatically. Update to the latest version. |
+| `502` + `401 Invalid API key` | Token in `.env` is expired or invalid. Catch it before the first chat: `./freebuff-proxy -test-token` (or `-doctor`) probes with a real session handshake and fails with a clear message. Then re-run `freebuff` to log in and update `AUTH_TOKENS`, or swap the token live on the dashboard Tokens page (no restart). |
 | Connection refused | Proxy is not running, or in Docker without `LISTEN_ADDR=:3457`. |
 | `403 account_banned` | Account suspended upstream. Token is dead; use a new established account. |
 
@@ -108,6 +122,6 @@ Run `./freebuff-proxy -doctor` to diagnose problems automatically.
 
 ## Related docs
 
-- [Client Integration](client-integration.md) — Continue, Cursor, aider, opencode, SDK configs
-- [9router Integration](9router-integration.md) — wiring the proxy into 9router
-- [README](../../README.md) — overview, config reference, quick start
+- [Client Integration](client-integration.md): OpenCode, pi, 9router, LiteLLM, or your own scripts
+- [9router Integration](9router-integration.md): wiring the proxy into 9router
+- [README](../../README.md): overview, config reference, quick start

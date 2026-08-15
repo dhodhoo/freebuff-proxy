@@ -12,7 +12,7 @@ provenance. Only the **latest tagged release** and the latest commit on
 **Please do not open a public issue for security problems.**
 
 - Preferred: use GitHub's **Private vulnerability reporting**
-  (Security tab → "Report a vulnerability") — public repos have this enabled
+  (Security tab → "Report a vulnerability"). Public repos have this enabled
   by default on github.com. It creates a private draft advisory.
 - Alternative: email the maintainer if an email address is listed on your
   dashboard profile.
@@ -20,7 +20,7 @@ provenance. Only the **latest tagged release** and the latest commit on
 What to include:
 - Affected surface (e.g. HTTP endpoint, config parsing, upstream request
   handling)
-- Steps to reproduce (keep any FreeBuff auth tokens out of the report — use
+- Steps to reproduce (keep any FreeBuff auth tokens out of the report: use
   placeholders)
 - Impact and, if known, a suggested fix
 
@@ -35,7 +35,7 @@ In scope, in particular:
 
 - **HTTP surface**: `/v1/chat/completions`, `/v1/models`, `POST /admin/reload`
   (reloads config from disk and can echo config errors), and the
-  unauthenticated `/healthz` + `/metrics` endpoints (operational snapshot —
+  unauthenticated `/healthz` + `/metrics` endpoints (operational snapshot:
   uptime, model count, per-token counters; no secrets).
 - **Client auth**: `API_KEYS` handling and its interplay with bridge mode
   (where `API_KEYS` is deliberately ignored because the `Authorization`
@@ -52,4 +52,4 @@ In scope, in particular:
   the binary itself is a code-execution surface.
 
 Out of scope: the FreeBuff/Codebuff upstream service itself, and behavioral
-"abuse" of the free tier (quota bypassing) — report those upstream.
+"abuse" of the free tier (quota bypassing). Report those upstream.
