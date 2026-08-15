@@ -117,6 +117,27 @@ func (d *Dashboard) RenderLogin(w http.ResponseWriter, r *http.Request, errMsg s
 	d.render(w, r, "login", loginData{Error: errMsg})
 }
 
+// RenderRestricted renders the styled access-denied page (the loopback gate
+// and sensitive routes use it so blocked pages never look broken).
+func (d *Dashboard) RenderRestricted(w http.ResponseWriter, r *http.Request, msg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if isHX(r) {
+		// htmx polls get a small fragment, not a full page.
+		_, _ = w.Write([]byte("<p class=\"result result-err\" role=\"status\">" + template.HTMLEscapeString(msg) + "</p>"))
+		return
+	}
+	var buf bytes.Buffer
+	if err := d.tpl.ExecuteTemplate(&buf, "restricted", loginData{Error: msg}); err != nil {
+		d.logger.Error("dashboard restricted render failed", "err", err)
+		http.Error(w, msg, http.StatusForbidden)
+		return
+	}
+	w.WriteHeader(http.StatusForbidden)
+	if err := d.tpl.ExecuteTemplate(w, "layout", layoutData{Body: template.HTML(buf.String()), Page: "restricted"}); err != nil {
+		d.logger.Error("dashboard restricted layout failed", "err", err)
+	}
+}
+
 // dataFor resolves the page data for a named content template.
 func (d *Dashboard) dataFor(name string) any {
 	switch name {
@@ -199,10 +220,8 @@ func (d *Dashboard) metricsData() metricsData {
 	md := metricsData{
 		TransientRetries:     ps.TransientRetries,
 		FingerprintRotations: ps.FingerprintRotations,
+		RequestsTotal:        int64(ps.RequestsServed),
 		Models:               d.reg.ModelCount(),
-	}
-	for _, t := range ps.Tokens {
-		md.RequestsTotal += int64(t.Requests)
 	}
 	d.metricsMu.Lock()
 	d.metricHist = append(d.metricHist, metricSample{Requests: md.RequestsTotal, Retries: ps.TransientRetries, Rotation: ps.FingerprintRotations})

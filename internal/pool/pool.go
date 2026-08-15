@@ -117,6 +117,11 @@ type Pool struct {
 	rr     atomic.Uint64 // round-robin start index
 	logger *slog.Logger
 
+	// requestsServed counts successful upstream chat calls across BOTH
+	// pooled and bridge leases (bridge entries are ephemeral and excluded
+	// from the per-token counters, so this is the mode-independent total).
+	requestsServed atomic.Uint64
+
 	once   sync.Once
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -620,6 +625,7 @@ func (p *Pool) Chat(ctx context.Context, lease *Lease, opts upstream.ChatOptions
 			// Only chats that actually went upstream count against the
 			// daily cap; errors are not recorded.
 			p.bridgeRecordChat(lease.Bridge)
+			p.requestsServed.Add(1)
 		}
 		return rc, err
 	}
@@ -631,6 +637,7 @@ func (p *Pool) Chat(ctx context.Context, lease *Lease, opts upstream.ChatOptions
 		// Only chats that actually went upstream count against the daily
 		// cap; errors are not recorded.
 		p.recordChat(lease.Token)
+		p.requestsServed.Add(1)
 	}
 	return rc, err
 }
@@ -758,21 +765,32 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 
 // PoolSnapshot is the pool-wide metrics view: aggregate transient-retry
 // counters summed across every fixed token's client, plus the per-token rows
-// (same shape as Snapshot). Bridge-mode entries are not counted: they are
-// per-client-token ephemeral slots with no fixed token index.
+// (same shape as Snapshot). Bridge-mode entries are not counted in the
+// per-token rows (they are per-client-token ephemeral slots), but live
+// bridge clients' retry/rotation counters are summed in, and RequestsServed
+// is mode-independent (every successful upstream chat).
 type PoolSnapshot struct {
 	TransientRetries     int64
 	FingerprintRotations int64
+	RequestsServed       uint64
 	Tokens               []TokenSnapshot
 }
 
 // PoolSnapshot returns the pool-wide snapshot with aggregate counters.
 func (p *Pool) PoolSnapshot() PoolSnapshot {
-	ps := PoolSnapshot{Tokens: p.Snapshot()}
+	ps := PoolSnapshot{Tokens: p.Snapshot(), RequestsServed: p.requestsServed.Load()}
 	for _, tok := range p.toks {
 		ps.TransientRetries += tok.client.TransientRetries()
 		ps.FingerprintRotations += tok.client.FingerprintRotations()
 	}
+	// Live bridge entries: their counters survive while the entry is cached
+	// (LRU eviction drops old ones — the view is "recent bridge activity").
+	p.bridgeMu.Lock()
+	for _, be := range p.bridge {
+		ps.TransientRetries += be.client.TransientRetries()
+		ps.FingerprintRotations += be.client.FingerprintRotations()
+	}
+	p.bridgeMu.Unlock()
 	return ps
 }
 

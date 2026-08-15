@@ -451,7 +451,7 @@ func (s *Server) adminSensitive(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfg.Load()
 		if cfg.AdminToken == "" && !isLoopback(r) {
-			http.Error(w, "admin config/logs require loopback access or ADMIN_TOKEN", http.StatusForbidden)
+			s.dash.RenderRestricted(w, r, "This page is only available to loopback clients while ADMIN_TOKEN is unset.")
 			return
 		}
 		next.ServeHTTP(w, r)

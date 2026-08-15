@@ -1241,3 +1241,22 @@ func TestMetricsTransientRetryCounters(t *testing.T) {
 		t.Errorf("metrics emitted a fingerprint rotation value with no rotation: %s", body)
 	}
 }
+
+// RequestsServed counts successful upstream chats in bridge mode too (the
+// metrics page reads it, so it must not stay 0 when no AUTH_TOKENS exist).
+func TestBridgeRequestsServedCounter(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-b2", 1, `"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]`))
+	ts, p := newBridgeTestServer(t, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+	for range 3 {
+		resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer client-tok"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d: %s", resp.StatusCode, data)
+		}
+	}
+	if got := p.PoolSnapshot().RequestsServed; got != 3 {
+		t.Fatalf("RequestsServed = %d, want 3 (bridge chats must count)", got)
+	}
+}
