@@ -1,11 +1,13 @@
 package server_test
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -498,6 +500,70 @@ func TestDashboardConfigPage(t *testing.T) {
 	for _, want := range []string{"Effective configuration", "LISTEN_ADDR", "AUTH_TOKENS", "Editor", "Save &amp; reload"} {
 		if !strings.Contains(page, want) {
 			t.Errorf("config page missing %q", want)
+		}
+	}
+}
+
+// A CRLF .env stays CRLF after a token add: updateAuthTokensEnv must not
+// rewrite a Windows-edited file with mixed line endings.
+func TestDashboardTokenAddPreservesCRLF(t *testing.T) {
+	t.Chdir(t.TempDir())
+	seed := "SAFE_MODE=true\r\nMAX_MESSAGES_PER_DAY=7\r\n"
+	if err := os.WriteFile(".env", []byte(seed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	resp := postJSON(t, ts.URL, cookie, "/admin/tokens/add", `{"token":"cb_crlf_token"}`)
+	if !strings.Contains(bodyOf(t, resp), "Token added") {
+		t.Errorf("add response = %q, want success", bodyOf(t, resp))
+	}
+
+	env, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(env), "cb_crlf_token") {
+		t.Error("added token missing from .env")
+	}
+	if !strings.Contains(string(env), "SAFE_MODE=true\r\n") {
+		t.Error("seed line lost CRLF")
+	}
+	// No bare \n outside a \r\n pair: the file must be uniformly CRLF.
+	if strings.Contains(strings.ReplaceAll(string(env), "\r\n", ""), "\n") {
+		t.Errorf("mixed line endings after token add:\n%s", env)
+	}
+}
+
+// Concurrent token adds must not lose updates: adminSaveMu serializes the
+// cfg read + .env write + reload, so every added token lands in .env.
+func TestDashboardConcurrentTokenAdds(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	const n = 8
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			token := fmt.Sprintf("cb_conc_%d", i)
+			resp := postJSON(t, ts.URL, cookie, "/admin/tokens/add", `{"token":"`+token+`"}`)
+			_ = resp.Body.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	env, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		want := fmt.Sprintf("cb_conc_%d", i)
+		if !strings.Contains(string(env), want) {
+			t.Errorf("token %q lost from .env after concurrent adds", want)
 		}
 	}
 }

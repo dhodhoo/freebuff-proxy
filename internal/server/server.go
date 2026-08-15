@@ -15,6 +15,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -33,7 +34,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -706,14 +706,21 @@ func readBounded(r io.Reader, n int) ([]byte, error) {
 }
 
 // updateAuthTokensEnv rewrites the AUTH_TOKENS= line in .env (appending it
-// when absent), preserving every other line. Returns the new content.
+// when absent), preserving every other line. Returns the new content. The
+// existing EOL style is preserved — CRLF files stay CRLF — so a
+// Windows-edited .env is never rewritten with mixed line endings.
 func updateAuthTokensEnv(tokens []string) ([]byte, error) {
 	content, err := os.ReadFile(".env")
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	crlf := bytes.Contains(content, []byte("\r"))
 	line := "AUTH_TOKENS=" + strings.Join(tokens, ",")
-	lines := strings.Split(string(content), "\n")
+	raw := strings.Split(string(content), "\n")
+	lines := make([]string, 0, len(raw))
+	for _, l := range raw {
+		lines = append(lines, strings.TrimSuffix(l, "\r"))
+	}
 	replaced := false
 	for i, l := range lines {
 		if strings.HasPrefix(strings.TrimSpace(l), "AUTH_TOKENS=") {
@@ -725,7 +732,11 @@ func updateAuthTokensEnv(tokens []string) ([]byte, error) {
 	if !replaced {
 		lines = append(lines, line)
 	}
-	out := []byte(strings.Join(lines, "\n"))
+	eol := "\n"
+	if crlf {
+		eol = "\r\n"
+	}
+	out := []byte(strings.Join(lines, eol))
 	if err := writeFileAtomic(".env", out); err != nil {
 		return nil, err
 	}
@@ -771,6 +782,12 @@ func (s *Server) handleTokenAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// adminSaveMu serializes the pool mutation + persist + reload with the
+	// other .env writers (config editor, token remove, mode switch) so a
+	// concurrent save cannot interleave and lose a token from .env.
+	s.adminSaveMu.Lock()
+	defer s.adminSaveMu.Unlock()
+
 	idx, err := s.pool.AddToken(req.Token)
 	if err != nil {
 		s.dash.RenderConfigResult(w, r, false, err.Error())
@@ -790,6 +807,11 @@ func (s *Server) handleTokenAdd(w http.ResponseWriter, r *http.Request) {
 
 // handleTokenRemove removes the last pooled token (dashboard "Remove last").
 func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
+	// adminSaveMu serializes the pool mutation + persist + reload with the
+	// other .env writers, exactly like handleTokenAdd.
+	s.adminSaveMu.Lock()
+	defer s.adminSaveMu.Unlock()
+
 	cfg := s.cfg.Load()
 	if err := s.pool.RemoveLastToken(); err != nil {
 		s.dash.RenderConfigResult(w, r, false, err.Error())
@@ -840,6 +862,13 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 			s.dash.RenderConfigResult(w, r, false, "Already in bridge mode.")
 			return
 		}
+		// adminSaveMu serializes the persist → verify → rollback sequence
+		// with the other .env writers (config editor, token add/remove) so a
+		// concurrent save cannot interleave between the write and the reload.
+		// The live-pool drain stays outside the lock, after the reload is
+		// verified (persist → verify → drain).
+		s.adminSaveMu.Lock()
+		defer s.adminSaveMu.Unlock()
 		// Persist AUTH_TOKENS= (explicit empty) and reload, verifying the
 		// effective config actually lands in bridge mode before touching the
 		// live pool. Roll the .env back on any failure.
@@ -989,8 +1018,10 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 
 // writeFileAtomic writes data to path via a temp file + rename: readers never
 // observe a truncated file, and a crash mid-write leaves the previous content
-// intact. Windows rename-over-existing is not atomic, so the target is removed
-// first there (a tiny non-atomic window, acceptable for an admin action).
+// intact. os.Rename replaces an existing target atomically on every supported
+// platform (Windows uses MoveFileEx with MOVEFILE_REPLACE_EXISTING); only
+// filesystems without atomic replace support need the remove-then-rename
+// fallback (a tiny non-atomic window, acceptable for an admin action).
 func writeFileAtomic(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
@@ -1006,10 +1037,18 @@ func writeFileAtomic(path string, data []byte) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	if runtime.GOOS == "windows" {
-		_ = os.Remove(path)
-	}
 	if err := os.Rename(tmpName, path); err != nil {
+		if _, statErr := os.Stat(path); statErr == nil {
+			// The target exists but rename-over-existing failed: fall back
+			// to removing it first, then renaming.
+			_ = os.Remove(path)
+			if err := os.Rename(tmpName, path); err == nil {
+				return nil
+			} else {
+				_ = os.Remove(tmpName)
+				return err
+			}
+		}
 		_ = os.Remove(tmpName)
 		return err
 	}

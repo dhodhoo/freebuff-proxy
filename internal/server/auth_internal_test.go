@@ -3,6 +3,8 @@ package server
 import (
 	"fmt"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -66,4 +68,62 @@ func TestAdminCookieSecureFlag(t *testing.T) {
 	if c.Secure {
 		t.Error("cookie Secure flag set for plain-HTTP loopback")
 	}
+}
+
+// assertNoTmpFiles fails if writeFileAtomic left its temp file behind.
+func assertNoTmpFiles(t *testing.T, dir, base string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, "."+base+".tmp*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("temp files left behind: %v", matches)
+	}
+}
+
+// writeFileAtomic must atomically replace an existing file and clean up its
+// temp file, on every platform (no unconditional pre-remove on Windows).
+func TestWriteFileAtomicReplacesAndCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("OLD\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(path, []byte("NEW\n")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "NEW\n" {
+		t.Errorf("content after write = %q, want %q", got, "NEW\n")
+	}
+	assertNoTmpFiles(t, dir, ".env")
+}
+
+// On failure the target must be left exactly as it was and the temp file
+// cleaned up. A non-empty directory cannot be replaced by a rename on any
+// platform, so it doubles as a deterministic failure injection.
+func TestWriteFileAtomicFailurePreservesTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	kept := filepath.Join(path, "keep.txt")
+	if err := os.WriteFile(kept, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(path, []byte("NEW\n")); err == nil {
+		t.Fatal("writeFileAtomic over a non-empty directory succeeded, want error")
+	}
+	if st, err := os.Stat(path); err != nil || !st.IsDir() {
+		t.Errorf("target dir missing or not a dir after failed write: %v", err)
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Errorf("target content lost after failed write: %v", err)
+	}
+	assertNoTmpFiles(t, dir, ".env")
 }
