@@ -245,6 +245,68 @@ footer.muted p {
   font-size: 0.9rem;
 }
 
+/* --- config editor --- */
+
+.config-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .config-grid { grid-template-columns: 1fr; }
+}
+
+.kv-table th {
+  color: var(--fp-muted);
+  font-weight: 400;
+  white-space: nowrap;
+  padding: 0.3rem 0.75rem 0.3rem 0;
+}
+
+.kv-table td {
+  padding: 0.3rem 0;
+  text-align: right;
+}
+
+.secret {
+  color: var(--fp-muted);
+  font-style: italic;
+}
+
+textarea[name="content"] {
+  font-size: 0.85rem;
+  line-height: 1.45;
+  resize: vertical;
+  min-height: 22rem;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.6rem;
+}
+
+.result {
+  margin-top: 0.75rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 6px;
+  font-size: 0.92rem;
+}
+
+.result-ok {
+  color: var(--fp-teal);
+  border: 1px solid rgba(95, 184, 167, 0.4);
+  background: rgba(95, 184, 167, 0.08);
+}
+
+.result-err {
+  color: var(--fp-red);
+  border: 1px solid rgba(217, 123, 123, 0.4);
+  background: rgba(217, 123, 123, 0.08);
+}
+
 /* --- reduced motion --- */
 
 @media (prefers-reduced-motion: reduce) {

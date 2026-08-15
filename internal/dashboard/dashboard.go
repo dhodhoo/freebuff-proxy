@@ -12,9 +12,12 @@ package dashboard
 import (
 	"bytes"
 	"embed"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"freebuff-proxy/internal/config"
@@ -103,9 +106,17 @@ func (d *Dashboard) dataFor(name string) any {
 	switch name {
 	case "overview":
 		return d.overviewData()
+	case "config":
+		return d.configData()
 	default:
 		return nil
 	}
+}
+
+// RenderConfigResult renders the htmx response fragment after a config save
+// attempt (success or validation failure).
+func (d *Dashboard) RenderConfigResult(w http.ResponseWriter, r *http.Request, ok bool, message string) {
+	d.render(w, r, "config_result", configResultData{OK: ok, Message: message})
 }
 
 // --- overview ---
@@ -144,6 +155,104 @@ type tokenCard struct {
 type loginData struct {
 	Error string
 }
+
+// --- config editor ---
+
+type configData struct {
+	EnvContent string     // current .env text (or a commented template)
+	HasEnvFile bool       // whether ./.env existed on disk
+	Effective  []configKV // effective values, secrets redacted
+}
+
+type configKV struct {
+	Key    string
+	Value  string
+	Secret bool // rendered as a redacted summary, never the raw value
+}
+
+type configResultData struct {
+	OK      bool
+	Message string
+}
+
+func (d *Dashboard) configData() configData {
+	cfg := d.cfg()
+	cd := configData{}
+	if raw, err := os.ReadFile(".env"); err == nil {
+		cd.HasEnvFile = true
+		cd.EnvContent = string(raw)
+	} else {
+		cd.EnvContent = defaultEnvTemplate
+	}
+	cd.Effective = []configKV{
+		{Key: "LISTEN_ADDR", Value: cfg.ListenAddr},
+		{Key: "UPSTREAM_BASE_URL", Value: cfg.UpstreamBaseURL},
+		{Key: "AUTH_TOKENS", Value: fmt.Sprintf("%d token(s)", len(cfg.AuthTokens)), Secret: true},
+		{Key: "API_KEYS", Value: fmt.Sprintf("%d key(s)", len(cfg.APIKeys)), Secret: true},
+		{Key: "ADMIN_TOKEN", Value: boolWord(cfg.AdminToken != ""), Secret: true},
+		{Key: "ROTATION_INTERVAL", Value: cfg.RotationInterval.String()},
+		{Key: "REQUEST_TIMEOUT", Value: cfg.RequestTimeout.String()},
+		{Key: "SESSION_CALL_TIMEOUT", Value: cfg.SessionCallTimeout.String()},
+		{Key: "PROXY_ROTATION", Value: cfg.ProxyRotation},
+		{Key: "COST_MODE", Value: cfg.CostMode},
+		{Key: "TLS_FINGERPRINT", Value: cfg.TLSFingerprint},
+		{Key: "REGISTRY_REFRESH", Value: cfg.RegistryRefresh.String()},
+		{Key: "DEBUG_DUMP", Value: strconv.FormatBool(cfg.DebugDump)},
+		{Key: "LOG_FILE", Value: cfg.LogFile},
+		{Key: "LOG_LEVEL", Value: cfg.LogLevel},
+		{Key: "MAX_MESSAGES_PER_DAY", Value: strconv.Itoa(cfg.MaxMessagesPerDay)},
+		{Key: "IDLE_ROTATION_TIMEOUT", Value: cfg.IdleRotationTimeout.String()},
+		{Key: "SAFE_MODE", Value: strconv.FormatBool(cfg.SafeMode)},
+		{Key: "REQUEST_JITTER", Value: cfg.RequestJitter.String()},
+		{Key: "CLI_VERSION", Value: cfg.CLIVersion},
+		{Key: "MODEL_ALIASES", Value: fmt.Sprintf("%d alias(es)", len(cfg.ModelAliases)), Secret: true},
+		{Key: "TRANSIENT_RETRIES", Value: strconv.Itoa(cfg.TransientRetries)},
+		{Key: "HTTP_PROXY", Value: cfg.HTTPProxy},
+		{Key: "SOCKS5_PROXY", Value: boolWord(cfg.SOCKS5Proxy != ""), Secret: true},
+		{Key: "SOCKS5_PROXIES", Value: fmt.Sprintf("%d proxy(es)", len(cfg.SOCKS5Proxies)), Secret: true},
+	}
+	return cd
+}
+
+func boolWord(v bool) string {
+	if v {
+		return "set"
+	}
+	return "unset"
+}
+
+// defaultEnvTemplate seeds the editor when no ./.env file exists yet. Values
+// mirror the loader defaults; uncomment and edit what you need.
+const defaultEnvTemplate = `# freebuff-proxy configuration (.env)
+# Keys mirror the environment variables; leave commented to keep the default.
+# See the README and docs/guides for the full reference.
+
+#LISTEN_ADDR=127.0.0.1:3457
+#UPSTREAM_BASE_URL=https://www.codebuff.com
+#AUTH_TOKENS=token1,token2
+#API_KEYS=sk-local-...
+#ADMIN_TOKEN=change-me
+#ROTATION_INTERVAL=24h
+#REQUEST_TIMEOUT=15m
+#SESSION_CALL_TIMEOUT=5s
+#PROXY_ROTATION=per-token
+#COST_MODE=free
+#TLS_FINGERPRINT=chrome120
+#REGISTRY_REFRESH=6h
+#DEBUG_DUMP=false
+#LOG_FILE=
+#LOG_LEVEL=info
+#MAX_MESSAGES_PER_DAY=0
+#IDLE_ROTATION_TIMEOUT=0
+#SAFE_MODE=true
+#REQUEST_JITTER=0s
+#CLI_VERSION=0.10.7
+#MODEL_ALIASES=
+#TRANSIENT_RETRIES=1
+#HTTP_PROXY=
+#SOCKS5_PROXY=
+#SOCKS5_PROXIES=
+`
 
 func (d *Dashboard) overviewData() overviewData {
 	cfg := d.cfg()

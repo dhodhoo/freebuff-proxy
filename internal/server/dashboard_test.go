@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -169,3 +170,103 @@ func TestDashboardLoginRateLimit(t *testing.T) {
 
 // maxLoginFailsForTest mirrors the server's maxLoginFails constant.
 const maxLoginFailsForTest = 5
+
+// --- config editor ---
+
+// postConfig submits .env content to the authed config endpoint.
+func postConfig(t *testing.T, url, cookie, content string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url+"/admin/config", strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Cookie", cookie)
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// authedCookie logs into the test dashboard and returns the session cookie.
+func authedCookie(t *testing.T, ts *httptest.Server) string {
+	t.Helper()
+	resp := postLogin(t, ts.URL+"/admin/login", "secret")
+	defer func() { _ = resp.Body.Close() }()
+	cookies := resp.Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login issued %d cookies, want 1", len(cookies))
+	}
+	return cookies[0].Name + "=" + cookies[0].Value
+}
+
+// A valid .env save persists the file and reports success.
+func TestDashboardConfigSave(t *testing.T) {
+	t.Chdir(t.TempDir())
+	// Seed a prior .env with an unrelated key to prove the editor replaces
+	// the file wholesale (not merge).
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	content := "# my config\nMAX_MESSAGES_PER_DAY=7\nSAFE_MODE=true\n"
+	resp := postConfig(t, ts.URL, cookie, content)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("save status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(bodyOf(t, resp), "result-ok") {
+		t.Error("save response missing success class")
+	}
+	got, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != content {
+		t.Errorf(".env after save = %q, want %q", got, content)
+	}
+}
+
+// A rejected save restores the previous .env content (rollback).
+func TestDashboardConfigSaveRejectedRollsBack(t *testing.T) {
+	t.Chdir(t.TempDir())
+	original := "SAFE_MODE=true\n"
+	if err := os.WriteFile(".env", []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	// LISTEN_ADDR without a port fails Validate — the save must be rejected
+	// and the file restored.
+	resp := postConfig(t, ts.URL, cookie, "LISTEN_ADDR=127.0.0.1\n")
+	defer func() { _ = resp.Body.Close() }()
+	if !strings.Contains(bodyOf(t, resp), "result-err") {
+		t.Error("rejected save missing error class")
+	}
+	got, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Errorf(".env after rejected save = %q, want original %q", got, original)
+	}
+}
+
+// The config page renders the effective values with secrets redacted.
+func TestDashboardConfigPage(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+	resp := get(t, ts.URL+"/admin/config", cookie)
+	defer func() { _ = resp.Body.Close() }()
+	page := bodyOf(t, resp)
+	for _, want := range []string{"Effective configuration", "LISTEN_ADDR", "AUTH_TOKENS", "Editor", "Save &amp; reload"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("config page missing %q", want)
+		}
+	}
+}

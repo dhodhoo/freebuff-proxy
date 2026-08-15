@@ -29,6 +29,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,6 +99,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/login", s.handleAdminLogin)
 	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
+	mux.Handle("GET /admin/config", s.dashboardAuth(s.dash.Page("config")))
+	mux.Handle("POST /admin/config", s.dashboardAuth(http.HandlerFunc(s.handleConfigSave)))
 	mux.Handle("GET /admin/assets/", s.dashboardAuth(http.StripPrefix("/admin/", http.FileServerFS(dashboard.AssetsFS()))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -375,6 +378,52 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.dash.RenderLogin(w, r, "")
+}
+
+// maxEnvSize caps the .env editor payload (64KB is generous for a config file).
+const maxEnvSize = 64 << 10
+
+// handleConfigSave persists the submitted .env text and hot-reloads the
+// config. The flow: lenient parse (syntax check) → write the file → full
+// config.Load("") — the same pipeline used at startup, so every semantic
+// validation (durations, URLs, fingerprints, Validate) runs — and swap the
+// atomic pointer. Any failure restores the previous .env content.
+func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
+	const envPath = ".env"
+	r.Body = http.MaxBytesReader(w, r.Body, maxEnvSize)
+	content, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Failed to read request body.")
+		return
+	}
+	text := string(content)
+	// Lenient parse rejects nothing today (unknown lines are skipped), but
+	// keeps the editor's intent explicit and future-proofs strict checks.
+	_ = config.ParseDotenv(text)
+
+	old, oldErr := os.ReadFile(envPath)
+	if err := os.WriteFile(envPath, content, 0o644); err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Failed to write .env: "+err.Error())
+		return
+	}
+	restore := func() {
+		if oldErr == nil {
+			_ = os.WriteFile(envPath, old, 0o644)
+		} else {
+			_ = os.Remove(envPath)
+		}
+	}
+	newCfg, err := config.Load("")
+	if err != nil {
+		restore()
+		s.logger.Warn("dashboard config save rejected", "err", err)
+		s.dash.RenderConfigResult(w, r, false, "Configuration rejected: "+err.Error())
+		return
+	}
+	s.cfg.Store(&newCfg)
+	s.logger.Info("dashboard config saved and reloaded",
+		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
+	s.dash.RenderConfigResult(w, r, true, "Saved and reloaded — effective configuration updated.")
 }
 
 // clientToken returns the request's bearer token (Authorization: Bearer or

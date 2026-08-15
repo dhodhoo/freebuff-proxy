@@ -485,6 +485,13 @@ func readDotenv(path string) (map[string]string, error) {
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
+	return parseDotenv(data), nil
+}
+
+// parseDotenv splits .env content into KEY=VALUE pairs using the same lenient
+// rules as readDotenv: blank lines and # comments skipped, single/double
+// quotes stripped, unquoted trailing # comments trimmed.
+func parseDotenv(data []byte) map[string]string {
 	out := make(map[string]string)
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -514,7 +521,13 @@ func readDotenv(path string) (map[string]string, error) {
 		}
 		out[key] = value
 	}
-	return out, nil
+	return out
+}
+
+// ParseDotenv parses .env text (for the dashboard config editor's pre-write
+// syntax check) with the same rules the loader applies at startup.
+func ParseDotenv(content string) map[string]string {
+	return parseDotenv([]byte(content))
 }
 
 func overrideString(target *string, envName string) {
