@@ -1666,3 +1666,65 @@ func TestShutdownDrainsBridgeEntries(t *testing.T) {
 		t.Errorf("session ends = %d, want 2 (bridge sessions ended on shutdown)", mock.SessionEnds)
 	}
 }
+
+// Runtime token management: AddToken/RemoveLastToken/RemoveAllTokens mutate
+// the pool safely, and a chat through an added token works end to end.
+func TestRuntimeTokenManagement(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	// Bridge-mode pool (zero fixed tokens) pointed at the mock.
+	p := newTestPoolCfg(t, func(c *config.Config) {
+		c.AuthTokens = nil
+		c.UpstreamBaseURL = mock.URL()
+	})
+	if p.TokenCount() != 0 {
+		t.Fatalf("TokenCount = %d, want 0 at start", p.TokenCount())
+	}
+
+	idx, err := p.AddToken("rt-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx != 0 || p.TokenCount() != 1 {
+		t.Fatalf("after AddToken: idx=%d count=%d, want 0/1", idx, p.TokenCount())
+	}
+
+	// A real chat through the added token works (mock upstream).
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ChatBody = testutil.SSEEvent(`data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\n")
+	rc, err := p.Chat(context.Background(), lease, upstream.ChatOptions{Model: modelA}, []byte(`{"model":"z-ai/glm-5.2"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	p.LeaseRelease(lease)
+
+	// RemoveLastToken refuses while a lease is in flight.
+	lease2, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RemoveLastToken(); err == nil {
+		t.Fatal("RemoveLastToken succeeded with an in-flight lease, want refusal")
+	}
+	p.LeaseRelease(lease2)
+
+	if err := p.RemoveLastToken(); err != nil {
+		t.Fatalf("RemoveLastToken: %v", err)
+	}
+	if p.TokenCount() != 0 {
+		t.Fatalf("TokenCount = %d, want 0 after removal", p.TokenCount())
+	}
+
+	// Re-add + remove-all path.
+	if _, err := p.AddToken("rt-2"); err != nil {
+		t.Fatal(err)
+	}
+	p.RemoveAllTokens(context.Background())
+	if p.TokenCount() != 0 {
+		t.Fatalf("TokenCount = %d, want 0 after RemoveAllTokens", p.TokenCount())
+	}
+}

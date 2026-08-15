@@ -13,7 +13,48 @@ import (
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/upstream"
 )
+
+// runTokenTest probes the first configured token with a real session
+// handshake (the same path the pool uses) and exits 0 on success, 1 on
+// failure. Exposed as -test-token for installers and scripts.
+func runTokenTest(configPath string) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: config load failed: %v\n", err)
+		os.Exit(1)
+	}
+	if cfg.BridgeMode() {
+		fmt.Fprintln(os.Stderr, "freebuff-proxy: -test-token: no AUTH_TOKENS configured (bridge mode); nothing to probe")
+		os.Exit(1)
+	}
+	reg := registry.New(&cfg, &http.Client{Timeout: 10 * time.Second})
+	reg.LoadFallback()
+	models := reg.Models()
+	if len(models) == 0 {
+		fmt.Fprintln(os.Stderr, "freebuff-proxy: -test-token: registry has no models to probe against")
+		os.Exit(1)
+	}
+	clientCfg := cfg
+	client, err := upstream.New(cfg.AuthTokens[0], &clientCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: %v\n", err)
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	st, err := client.CreateSessionForModel(ctx, models[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: token rejected upstream: %v\n", err)
+		os.Exit(1)
+	}
+	endCtx, endCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = client.EndSession(endCtx, st.InstanceID)
+	endCancel()
+	fmt.Printf("freebuff-proxy: token OK (%s, session %s)\n", models[0], st.InstanceID)
+	os.Exit(0)
+}
 
 func runDoctor(configPath string) {
 	fmt.Println("freebuff-proxy doctor diagnostic tool")
@@ -101,6 +142,36 @@ func runDoctor(configPath string) {
 		warn(fmt.Sprintf("Registry live refresh warning: %v (offline fallback retained)", err))
 	} else {
 		ok(fmt.Sprintf("Registry live refresh succeeded (%d models)", reg.ModelCount()))
+	}
+
+	// Token validity probe: one real session handshake per configured token,
+	// through the same client path the pool uses. This is the check that
+	// catches expired/revoked tokens before the first chat 401s.
+	if !cfg.BridgeMode() {
+		models := reg.Models()
+		if len(models) == 0 {
+			warn("Cannot probe tokens: registry has no models")
+		} else {
+			for i, tok := range cfg.AuthTokens {
+				clientCfg := cfg
+				client, err := upstream.New(tok, &clientCfg)
+				if err != nil {
+					fail(fmt.Sprintf("Token #%d: cannot build client: %v", i+1, err))
+					continue
+				}
+				probeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				st, err := client.CreateSessionForModel(probeCtx, models[0])
+				cancel()
+				if err != nil {
+					fail(fmt.Sprintf("Token #%d validity probe failed: %v (re-run the upstream CLI to refresh the token)", i+1, err))
+					continue
+				}
+				endCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = client.EndSession(endCtx, st.InstanceID)
+				cancel()
+				ok(fmt.Sprintf("Token #%d validity probe succeeded (session handshake)", i+1))
+			}
+		}
 	}
 
 	fmt.Printf("\nSummary: %d passed, %d warnings, %d failed\n", passed, warnings, failed)

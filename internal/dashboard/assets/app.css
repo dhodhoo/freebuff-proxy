@@ -476,6 +476,77 @@ textarea[name="content"] {
   width: auto;
 }
 
+.smoke-card {
+  margin: 1rem 0;
+}
+
+.smoke-form {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0;
+}
+
+.smoke-form select,
+.smoke-form input {
+  margin: 0;
+  width: auto;
+  flex: 0 1 auto;
+}
+
+.smoke-form input {
+  flex: 1 1 16rem;
+}
+
+.smoke-preview {
+  font-size: 0.8rem;
+  background: var(--fp-surface-2);
+  padding: 0.6rem 0.8rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.token-actions-bar {
+  margin-bottom: 0.6rem;
+}
+
+.step-card {
+  margin-bottom: 1rem;
+}
+
+.step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  background: var(--fp-amber);
+  color: #12141a;
+  font-size: 0.85rem;
+  font-weight: 700;
+  margin-right: 0.5rem;
+}
+
+.setup-snippet h3 {
+  font-size: 0.9rem;
+  margin: 0 0 0.4rem;
+  color: var(--fp-muted);
+}
+
+.result-warn {
+  color: var(--fp-amber);
+  border: 1px solid rgba(217, 160, 91, 0.4);
+  background: rgba(217, 160, 91, 0.08);
+}
+
+.diag-list .result {
+  margin: 0.3rem 0;
+}
+
 /* --- reduced motion --- */
 
 @media (prefers-reduced-motion: reduce) {

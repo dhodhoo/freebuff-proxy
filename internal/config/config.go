@@ -58,9 +58,15 @@ func (c Config) BridgeMode() bool { return len(c.AuthTokens) == 0 }
 // rawConfig mirrors the JSON file / env keys as strings so that parsing and
 // validation happen once, after all overrides are applied.
 type rawConfig struct {
-	ListenAddr          string   `json:"LISTEN_ADDR"`
-	UpstreamBaseURL     string   `json:"UPSTREAM_BASE_URL"`
-	AuthTokens          []string `json:"AUTH_TOKENS"`
+	ListenAddr      string   `json:"LISTEN_ADDR"`
+	UpstreamBaseURL string   `json:"UPSTREAM_BASE_URL"`
+	AuthTokens      []string `json:"AUTH_TOKENS"`
+	// AuthTokensSet records that AUTH_TOKENS was explicitly provided (even
+	// as an empty value) by the JSON file, .env, or the environment. An
+	// explicitly-empty AUTH_TOKENS means the operator chose bridge mode, so
+	// CLI auto-discovery must not refill it (runtime mode switch persists
+	// "AUTH_TOKENS=" to .env and relies on this).
+	AuthTokensSet       bool     `json:"-"`
 	RotationInterval    string   `json:"ROTATION_INTERVAL"`
 	RequestTimeout      string   `json:"REQUEST_TIMEOUT"`
 	SessionCallTimeout  string   `json:"SESSION_CALL_TIMEOUT"`
@@ -242,7 +248,7 @@ func Load(configPath string) (Config, error) {
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("AUTO_DISCOVER_TOKEN"))); v == "false" || v == "0" || v == "off" || v == "no" {
 		autoDiscover = false
 	}
-	if autoDiscover && len(cfg.AuthTokens) == 0 {
+	if autoDiscover && len(cfg.AuthTokens) == 0 && !raw.AuthTokensSet {
 		if token, email, srcPath, ok := discoverCLIToken(); ok {
 			cfg.AuthTokens = []string{token}
 			cfg.DiscoveredSource = srcPath
@@ -425,6 +431,9 @@ func loadRaw(configPath string) (rawConfig, error) {
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return rawConfig{}, fmt.Errorf("parse config file: %w", err)
 		}
+		// A non-nil AuthTokens after unmarshal means the JSON key was present
+		// ([] is an explicit empty list; absent leaves it nil).
+		cfg.AuthTokensSet = cfg.AuthTokens != nil
 	}
 
 	return cfg, nil
@@ -440,6 +449,12 @@ func applyDotenv(raw *rawConfig) error {
 		return err
 	}
 	get := func(name string) string { return vals[name] }
+	// An empty AUTH_TOKENS= line in .env is an explicit bridge-mode choice
+	// (the dashboard mode switch persists exactly this), so record presence
+	// even when the value is empty — auto-discovery must not refill it.
+	if _, ok := vals["AUTH_TOKENS"]; ok {
+		raw.AuthTokensSet = true
+	}
 	overrideStringFrom(&raw.ListenAddr, get, "LISTEN_ADDR")
 	overrideStringFrom(&raw.UpstreamBaseURL, get, "UPSTREAM_BASE_URL")
 	overrideCSVFrom(&raw.AuthTokens, get, "AUTH_TOKENS")

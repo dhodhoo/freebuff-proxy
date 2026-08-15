@@ -40,22 +40,26 @@ func main() {
 	showDoctor := flag.Bool("doctor", false, "run environment and configuration diagnostics")
 	showUpdate := flag.Bool("update", false, "check for and download the latest release update")
 	showSetup := flag.Bool("setup", false, "run interactive client configuration helper")
+	testToken := flag.Bool("test-token", false, "probe the first configured token with a real session handshake and exit 0/1")
 	autoYes := flag.Bool("yes", false, "auto-confirm prompts during setup")
 	flag.Parse()
 
 	modeFlags := 0
-	for _, set := range []bool{*showDoctor, *showUpdate, *showSetup} {
+	for _, set := range []bool{*showDoctor, *showUpdate, *showSetup, *testToken} {
 		if set {
 			modeFlags++
 		}
 	}
 	if modeFlags > 1 {
-		fmt.Fprintln(os.Stderr, "freebuff-proxy: warning: -doctor, -update and -setup are mutually exclusive; only the first will run")
+		fmt.Fprintln(os.Stderr, "freebuff-proxy: warning: -doctor, -update, -setup and -test-token are mutually exclusive; only the first will run")
 	}
 
 	if *showVersion {
 		fmt.Println("freebuff-proxy", version)
 		os.Exit(0)
+	}
+	if *testToken {
+		runTokenTest(*configPath)
 	}
 	if *showDoctor {
 		runDoctor(*configPath)

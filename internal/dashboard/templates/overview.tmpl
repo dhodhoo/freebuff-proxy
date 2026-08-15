@@ -6,10 +6,25 @@
   </div>
   <div class="pills">
     <span class="pill pill-{{if .InBridge}}bridge{{else}}pool{{end}}">{{.Mode}}</span>
-    <span class="pill">{{.Models}} models</span>
+    <span class="pill">{{.ModelCount}} models</span>
     <span class="pill">up {{.Uptime}}</span>
     {{if .SafeMode}}<span class="pill pill-safe">safe mode</span>{{end}}
   </div>
+</section>
+
+<section class="card smoke-card">
+  <h2>Smoke test</h2>
+  <p class="muted">Send one real chat through the proxy — proves the whole path end to end.</p>
+  <form hx-post="/admin/smoke" hx-target="#smoke-result" hx-swap="innerHTML" class="smoke-form">
+    <label for="smoke-model" class="visually-hidden">Model</label>
+    <select id="smoke-model" name="model">
+      {{range .Models}}<option value="{{.}}">{{.}}</option>{{end}}
+    </select>
+    <label for="smoke-prompt" class="visually-hidden">Prompt</label>
+    <input type="text" id="smoke-prompt" name="prompt" value="ping" maxlength="200" placeholder="prompt">
+    <button type="submit">Run test</button>
+  </form>
+  <div id="smoke-result"></div>
 </section>
 
 {{if .InBridge}}

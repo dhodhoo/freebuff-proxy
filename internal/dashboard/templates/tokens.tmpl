@@ -14,15 +14,38 @@
 <article class="card bridge-card">
   <h2>Bridge mode</h2>
   <p>Upstream tokens are relayed per client request ({{.BridgeTokens}} active bridge client{{if ne .BridgeTokens 1}}s{{end}}); session state and quota are per-client and are not tracked here.</p>
-  <p class="muted">Add <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a> to switch to the pooled relay with per-token tracking.</p>
+  <p class="muted">Paste a FreeBuff token below to switch to pooled mode — it is added live and persisted to <code>.env</code>.</p>
 </article>
 {{else if not .HasTokens}}
 <article class="card empty-card">
   <h2>No tokens configured</h2>
-  <p>Add <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a>, then restart the proxy — the token pool is built at startup.</p>
+  <p>Paste a FreeBuff token below to start the pooled relay.</p>
 </article>
 {{else}}
-<p class="muted manage-note">Tokens are configured via <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a>; the pool is built at startup, so add/remove requires a restart. Actions below hit the real upstream (Test) or the local pool state (Unlock/Finish).</p>
+<article class="card mode-card">
+  <h2>Pooled mode — {{.TokenCount}} token(s)</h2>
+  <p class="muted">Tokens below are live: Test/Unlock/Finish act on them immediately, and the pool persists changes to <code>.env</code> (no restart needed).</p>
+  <div class="token-actions-bar">
+    <button class="action-btn" hx-post="/admin/tokens/remove" hx-confirm="Remove the last token from the pool and .env?" hx-target="#token-result" hx-swap="innerHTML">Remove last token</button>
+    <button class="action-btn" hx-post="/admin/mode" hx-vals='{"mode":"bridge"}' hx-confirm="Switch to bridge mode? All pooled tokens are removed (clients then send their own token)." hx-target="#token-result" hx-swap="innerHTML">Switch to bridge mode</button>
+  </div>
+</article>
+{{end}}
+
+<article class="card add-token-card">
+  <h2>Add token</h2>
+  <p class="muted">Paste a FreeBuff token (<code>cb_...</code>) — added to the live pool and persisted.</p>
+  <form hx-post="/admin/tokens/add" hx-target="#token-result" hx-swap="innerHTML" class="smoke-form">
+    <label for="new-token" class="visually-hidden">Token</label>
+    <input type="text" id="new-token" name="token" placeholder="cb_..." autocomplete="off" spellcheck="false" class="mono">
+    <button type="submit">Add</button>
+  </form>
+</article>
+
+<p class="muted manage-note">Advanced: <code>AUTH_TOKENS</code> can also be edited raw in <a href="/admin/config">Config</a>.</p>
+<div class="token-actions-bar">
+  {{if not .InBridge}}<button class="action-btn" hx-post="/admin/tokens/test-all" hx-target="#token-result" hx-swap="innerHTML">Test all tokens</button>{{end}}
+</div>
 <div id="token-result"></div>
 {{range .Tokens}}
 <article class="card token-detail">
@@ -78,6 +101,5 @@
   </div>
   {{end}}
 </article>
-{{end}}
 {{end}}
 {{end}}

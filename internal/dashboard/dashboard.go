@@ -284,6 +284,7 @@ func sparklineSVG(values []float64, color, label string) template.HTML {
 type tokensData struct {
 	InBridge     bool
 	BridgeTokens int
+	TokenCount   int
 	Tokens       []tokenDetail
 	HasTokens    bool
 }
@@ -312,7 +313,7 @@ type quotaRow struct {
 
 func (d *Dashboard) tokensData() tokensData {
 	cfg := d.cfg()
-	td := tokensData{BridgeTokens: d.pool.BridgeCount()}
+	td := tokensData{BridgeTokens: d.pool.BridgeCount(), TokenCount: d.pool.TokenCount()}
 	if cfg.BridgeMode() {
 		td.InBridge = true
 	}
@@ -452,11 +453,14 @@ func (d *Dashboard) tracesData() tracesData {
 // setupData renders copy-paste client configuration snippets from the
 // effective config (mirrors the -setup command's shapes).
 type setupData struct {
-	BaseURL string
-	KeyHint string
-	Model   string
-	Models  []string
-	Bridge  bool
+	BaseURL      string
+	KeyHint      string
+	Model        string
+	Models       []string
+	Bridge       bool
+	BridgeTokens int
+	TokenCount   int
+	HasTokens    bool
 }
 
 func (d *Dashboard) setupData() setupData {
@@ -466,10 +470,13 @@ func (d *Dashboard) setupData() setupData {
 		host = h
 	}
 	sd := setupData{
-		BaseURL: "http://" + host + "/v1",
-		Bridge:  cfg.BridgeMode(),
-		Models:  d.reg.Models(),
+		BaseURL:      "http://" + host + "/v1",
+		Bridge:       cfg.BridgeMode(),
+		BridgeTokens: d.pool.BridgeCount(),
+		TokenCount:   d.pool.TokenCount(),
+		Models:       d.reg.Models(),
 	}
+	sd.HasTokens = sd.TokenCount > 0
 	if len(sd.Models) > 0 {
 		sd.Model = sd.Models[0]
 	}
@@ -566,13 +573,34 @@ func (d *Dashboard) RenderConfigResult(w http.ResponseWriter, r *http.Request, o
 	d.render(w, r, "config_result", configResultData{OK: ok, Message: message})
 }
 
+// RenderTestResult appends one per-token outcome to the test-all results
+// area (one fragment per token, appended with hx-swap-oob semantics).
+func (d *Dashboard) RenderTestResult(w http.ResponseWriter, r *http.Request, token int, ok bool, message, instanceID string) {
+	d.render(w, r, "test_result", testResultData{
+		Token: token, OK: ok, Message: message, InstanceID: shortID(instanceID),
+	})
+}
+
+// RenderSmokeResult renders the smoke-test outcome fragment.
+func (d *Dashboard) RenderSmokeResult(w http.ResponseWriter, r *http.Request, model, token string, ms int64, preview []byte) {
+	d.render(w, r, "smoke_result", smokeResultData{
+		Model: model, Token: token, Ms: ms, Preview: string(preview),
+	})
+}
+
+// RenderDiag renders the diagnostics results fragment.
+func (d *Dashboard) RenderDiag(w http.ResponseWriter, r *http.Request, checks []DiagCheck) {
+	d.render(w, r, "diag_result", diagData{Checks: checks})
+}
+
 // --- overview ---
 
 type overviewData struct {
 	Mode                 string // "bridge" | "pooled"
 	InBridge             bool
 	BridgeTokens         int
-	Models               int
+	Models               []string
+	ModelCount           int
 	Uptime               string
 	Rotation             string
 	SafeMode             bool
@@ -620,6 +648,31 @@ type configKV struct {
 type configResultData struct {
 	OK      bool
 	Message string
+}
+
+type testResultData struct {
+	Token      int
+	OK         bool
+	Message    string
+	InstanceID string
+}
+
+type smokeResultData struct {
+	Model   string
+	Token   string
+	Ms      int64
+	Preview string
+}
+
+// DiagCheck is one diagnostics row (mirrors -doctor's pass/warn/fail model).
+type DiagCheck struct {
+	OK      bool
+	Warn    bool
+	Message string
+}
+
+type diagData struct {
+	Checks []DiagCheck
 }
 
 func (d *Dashboard) configData() configData {
@@ -706,7 +759,8 @@ func (d *Dashboard) overviewData() overviewData {
 	ps := d.pool.PoolSnapshot()
 	od := overviewData{
 		Mode:                 "pooled",
-		Models:               d.reg.ModelCount(),
+		Models:               d.reg.Models(),
+		ModelCount:           d.reg.ModelCount(),
 		Uptime:               time.Since(d.started).Round(time.Second).String(),
 		Rotation:             cfg.ProxyRotation,
 		SafeMode:             cfg.SafeMode,

@@ -1053,6 +1053,48 @@ func TestAutoDiscoverWarnsOnBridgeToPooled(t *testing.T) {
 	}
 }
 
+// TestAutoDiscoverSkippedWhenTokensExplicitlyCleared verifies that an
+// explicitly-empty AUTH_TOKENS (the shape the dashboard mode switch persists
+// as "AUTH_TOKENS=" in .env) suppresses CLI auto-discovery — the operator
+// chose bridge mode, so a local CLI login must not silently refill the pool.
+func TestAutoDiscoverSkippedWhenTokensExplicitlyCleared(t *testing.T) {
+	clearEnv(t)
+	// Re-enable auto-discovery; the explicit-empty AUTH_TOKENS below is what
+	// must suppress it (not the AUTO_DISCOVER_TOKEN=off switch).
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The dashboard mode switch writes exactly "AUTH_TOKENS=" into .env.
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.AuthTokens) != 0 {
+		t.Errorf("AuthTokens = %v, want empty (explicit bridge mode, not refilled by discovery)", cfg.AuthTokens)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode() = false, want true with explicitly-cleared AUTH_TOKENS")
+	}
+	if cfg.DiscoveredSource != "" {
+		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must be suppressed)", cfg.DiscoveredSource)
+	}
+}
+
 func TestReadDotenvQuotingAndComments(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
 	content := strings.Join([]string{

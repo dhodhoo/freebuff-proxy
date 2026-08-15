@@ -30,6 +30,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -126,6 +127,12 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/tokens/{id}/unlock", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenUnlock))))
 	mux.Handle("POST /admin/tokens/{id}/finish", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenFinish))))
 	mux.Handle("POST /admin/tokens/{id}/test", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenTest))))
+	mux.Handle("POST /admin/tokens/test-all", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenTestAll))))
+	mux.Handle("POST /admin/tokens/add", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenAdd))))
+	mux.Handle("POST /admin/tokens/remove", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenRemove))))
+	mux.Handle("POST /admin/mode", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleModeSwitch))))
+	mux.Handle("POST /admin/diag", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleDiag))))
+	mux.Handle("POST /admin/smoke", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleSmoke))))
 	mux.Handle("GET /admin/assets/", http.StripPrefix("/admin/assets/", noDirListing(http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -570,6 +577,337 @@ func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Info("dashboard token test ok", "token", id, "model", model, "instance", instanceID)
 	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" OK — session handshake succeeded ("+model+").")
+}
+
+// handleTokenTestAll probes every pooled token (dashboard "Test all"). Each
+// token gets a real session handshake with its own timeout; per-token results
+// are rendered as a fragment.
+func (s *Server) handleTokenTestAll(w http.ResponseWriter, r *http.Request) {
+	models := s.reg.Models()
+	var probeModel string
+	if len(models) > 0 {
+		probeModel = models[0]
+	}
+	count := 0
+	for _, snap := range s.pool.PoolSnapshot().Tokens {
+		i := snap.Token
+		if probeModel == "" {
+			break
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		instanceID, err := s.pool.TestToken(ctx, i, probeModel)
+		cancel()
+		ok := err == nil
+		msg := "ok"
+		if !ok {
+			msg = err.Error()
+		}
+		s.dash.RenderTestResult(w, r, i, ok, msg, instanceID)
+		count++
+	}
+	if count == 0 {
+		s.dash.RenderConfigResult(w, r, false, "No tokens to test (bridge mode has no fixed AUTH_TOKENS).")
+	}
+}
+
+// smokeRequest is the dashboard smoke-test payload (a real chat through the
+// exact client path clients use).
+type smokeRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+	Token  string `json:"token"` // bridge mode: client token to relay upstream
+}
+
+// maxSmokeBytes bounds the upstream body read for the smoke preview.
+const maxSmokeBytes = 32 << 10
+
+// handleSmoke sends one real chat request through the pool (Acquire + Chat,
+// the same path clients use) and reports status, latency, and a content
+// preview. Bridge mode requires a client token in the payload.
+func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
+	var req smokeRequest
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Failed to read request: "+err.Error())
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Invalid request JSON: "+err.Error())
+		return
+	}
+	req.Model = strings.TrimSpace(req.Model)
+	if req.Model == "" {
+		models := s.reg.Models()
+		if len(models) == 0 {
+			s.dash.RenderConfigResult(w, r, false, "No models in the registry to test.")
+			return
+		}
+		req.Model = models[0]
+	}
+	if req.Prompt == "" {
+		req.Prompt = "ping"
+	}
+	if len(req.Prompt) > 200 {
+		s.dash.RenderConfigResult(w, r, false, "Prompt too long (max 200 chars).")
+		return
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	cfg := s.cfg.Load()
+	chatBody := []byte(`{"model":` + strconv.Quote(req.Model) + `,"messages":[{"role":"user","content":` + strconv.Quote(req.Prompt) + `}],"stream":false}`)
+	chatOpts := upstream.ChatOptions{Model: req.Model}
+
+	var lease *pool.Lease
+	var up io.ReadCloser
+	if cfg.BridgeMode() {
+		if req.Token == "" {
+			s.dash.RenderConfigResult(w, r, false, "Bridge mode: include a client token in the smoke request.")
+			return
+		}
+		lease, err = s.pool.AcquireBridge(ctx, req.Token, req.Model)
+	} else {
+		lease, err = s.pool.Acquire(ctx, req.Model)
+	}
+	if err == nil {
+		up, err = s.pool.Chat(ctx, lease, chatOpts, chatBody)
+	}
+	if err != nil {
+		if lease != nil {
+			s.pool.LeaseRelease(lease)
+		}
+		s.logger.Warn("dashboard smoke test failed", "model", req.Model, "err", err)
+		s.dash.RenderConfigResult(w, r, false, "Smoke test failed: "+err.Error())
+		return
+	}
+	defer s.pool.LeaseRelease(lease)
+	defer func() { _ = up.Close() }()
+
+	// Read a bounded prefix of the SSE stream for the preview.
+	preview, readErr := readBounded(up, maxSmokeBytes)
+	ms := time.Since(start).Milliseconds()
+	if readErr != nil {
+		s.dash.RenderConfigResult(w, r, false, "Smoke test: upstream accepted but stream read failed: "+readErr.Error())
+		return
+	}
+	s.dash.RenderSmokeResult(w, r, req.Model, tokenLabel(lease), ms, preview)
+}
+
+// readBounded reads up to n bytes from r, tolerating an EOF mid-prefix.
+func readBounded(r io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	got, err := io.ReadFull(r, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	return buf[:got], nil
+}
+
+// updateAuthTokensEnv rewrites the AUTH_TOKENS= line in .env (appending it
+// when absent), preserving every other line. Returns the new content.
+func updateAuthTokensEnv(tokens []string) ([]byte, error) {
+	content, err := os.ReadFile(".env")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	line := "AUTH_TOKENS=" + strings.Join(tokens, ",")
+	lines := strings.Split(string(content), "\n")
+	replaced := false
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "AUTH_TOKENS=") {
+			lines[i] = line
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		lines = append(lines, line)
+	}
+	out := []byte(strings.Join(lines, "\n"))
+	if err := writeFileAtomic(".env", out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// syncTokensAfterMutation updates .env + reloads config after a pool token
+// mutation, so the change survives a restart and cfg reflects the new list.
+func (s *Server) syncTokensAfterMutation(tokens []string) error {
+	if _, err := updateAuthTokensEnv(tokens); err != nil {
+		return fmt.Errorf("persist AUTH_TOKENS: %w", err)
+	}
+	newCfg, err := config.Load(s.configPath)
+	if err != nil {
+		return fmt.Errorf("reload config: %w", err)
+	}
+	s.cfg.Store(&newCfg)
+	return nil
+}
+
+// handleTokenAdd adds a token to the live pool and persists it (dashboard
+// "Add token"). Rolls the pool back if persistence fails.
+func (s *Server) handleTokenAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	req.Token = strings.TrimSpace(r.FormValue("token"))
+	if req.Token == "" {
+		// JSON fallback for programmatic clients.
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<10))
+		if err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request: "+err.Error())
+			return
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Invalid request: "+err.Error())
+			return
+		}
+	}
+	req.Token = strings.TrimSpace(req.Token)
+	if req.Token == "" || strings.HasPrefix(strings.ToLower(req.Token), "bearer ") {
+		s.dash.RenderConfigResult(w, r, false, "Invalid token (must not start with 'Bearer ').")
+		return
+	}
+
+	idx, err := s.pool.AddToken(req.Token)
+	if err != nil {
+		s.dash.RenderConfigResult(w, r, false, err.Error())
+		return
+	}
+	cfg := s.cfg.Load()
+	tokens := append(append([]string{}, cfg.AuthTokens...), req.Token)
+	if err := s.syncTokensAfterMutation(tokens); err != nil {
+		_ = s.pool.RemoveLastToken()
+		s.logger.Warn("dashboard token add rolled back", "err", err)
+		s.dash.RenderConfigResult(w, r, false, err.Error())
+		return
+	}
+	s.logger.Info("dashboard token added", "index", idx)
+	s.dash.RenderConfigResult(w, r, true, "Token added at index "+strconv.Itoa(idx)+" and persisted to .env.")
+}
+
+// handleTokenRemove removes the last pooled token (dashboard "Remove last").
+func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg.Load()
+	if err := s.pool.RemoveLastToken(); err != nil {
+		s.dash.RenderConfigResult(w, r, false, err.Error())
+		return
+	}
+	tokens := cfg.AuthTokens
+	if len(tokens) > 0 {
+		tokens = tokens[:len(tokens)-1]
+	}
+	if err := s.syncTokensAfterMutation(tokens); err != nil {
+		s.dash.RenderConfigResult(w, r, false, err.Error())
+		return
+	}
+	s.logger.Info("dashboard token removed")
+	s.dash.RenderConfigResult(w, r, true, "Last token removed and persisted to .env.")
+}
+
+// handleModeSwitch flips between bridge and pooled mode at runtime
+// (dashboard mode control). Pooled→bridge removes all tokens; bridge→pooled
+// requires at least one token to add (use the Add-token form first).
+func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	req.Mode = r.FormValue("mode")
+	if req.Mode == "" {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
+		if err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request: "+err.Error())
+			return
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Invalid request: "+err.Error())
+			return
+		}
+	}
+	cfg := s.cfg.Load()
+	switch strings.ToLower(strings.TrimSpace(req.Mode)) {
+	case "bridge":
+		if cfg.BridgeMode() {
+			s.dash.RenderConfigResult(w, r, false, "Already in bridge mode.")
+			return
+		}
+		s.pool.RemoveAllTokens(r.Context())
+		if err := s.syncTokensAfterMutation(nil); err != nil {
+			s.dash.RenderConfigResult(w, r, false, err.Error())
+			return
+		}
+		s.logger.Info("dashboard switched to bridge mode")
+		s.dash.RenderConfigResult(w, r, true, "Switched to bridge mode — AUTH_TOKENS cleared; clients now send their own token.")
+	case "pooled":
+		if !cfg.BridgeMode() {
+			s.dash.RenderConfigResult(w, r, false, "Already in pooled mode.")
+			return
+		}
+		s.dash.RenderConfigResult(w, r, false, "Pooled mode needs tokens — add one via the Add-token form first.")
+	default:
+		s.dash.RenderConfigResult(w, r, false, "Mode must be 'bridge' or 'pooled'.")
+	}
+}
+
+// handleDiag runs the dashboard diagnostics: config state, upstream
+// reachability (DNS + TLS), registry health, and per-token validity probes —
+// the same checks -doctor performs, rendered as a fragment.
+func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
+	checks := []dashboard.DiagCheck{}
+
+	cfg := s.cfg.Load()
+	if cfg.BridgeMode() {
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "Configuration: bridge mode (clients relay their own token)"})
+	} else {
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Configuration: pooled mode, %d token(s)", len(cfg.AuthTokens))})
+	}
+
+	// Upstream reachability: DNS + TLS to the configured base host.
+	targetHost := "www.codebuff.com"
+	if u, err := url.Parse(cfg.UpstreamBaseURL); err == nil && u.Host != "" {
+		targetHost = u.Host
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if _, err := net.DefaultResolver.LookupHost(ctx, targetHost); err != nil {
+		checks = append(checks, dashboard.DiagCheck{Message: "DNS lookup failed for " + targetHost + ": " + err.Error()})
+	} else {
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "DNS resolves " + targetHost})
+	}
+	if conn, err := net.DialTimeout("tcp", targetHost+":443", 5*time.Second); err != nil {
+		checks = append(checks, dashboard.DiagCheck{Message: "TCP connect to " + targetHost + ":443 failed: " + err.Error()})
+	} else {
+		_ = conn.Close()
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "TCP reachable " + targetHost + ":443"})
+	}
+
+	checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Model registry: %d models", s.reg.ModelCount())})
+
+	// Per-token validity probes (pooled mode only).
+	if !cfg.BridgeMode() {
+		models := s.reg.Models()
+		if len(models) == 0 {
+			checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Cannot probe tokens: registry has no models"})
+		} else {
+			for _, snap := range s.pool.PoolSnapshot().Tokens {
+				idx := snap.Token
+				probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
+				_, err := s.pool.TestToken(probeCtx, idx, models[0])
+				probeCancel()
+				if err != nil {
+					checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
+				} else {
+					checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Token #%d validity probe succeeded", idx+1)})
+				}
+			}
+		}
+	} else {
+		checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Bridge mode: no tokens to probe (the smoke test uses a client token)"})
+	}
+
+	s.dash.RenderDiag(w, r, checks)
 }
 
 // handleConfigSave persists the submitted .env text and hot-reloads the

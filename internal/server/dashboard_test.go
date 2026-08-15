@@ -315,6 +315,49 @@ func doTokenAction(t *testing.T, url, cookie, path string) *http.Response {
 	return resp
 }
 
+// Runtime token management endpoints: add, remove, mode switch, persisted to
+// .env (isolated via t.Chdir).
+func TestDashboardTokenAddRemoveMode(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	// Add a token: pool grows, .env updated.
+	resp := postJSON(t, ts.URL, cookie, "/admin/tokens/add", `{"token":"cb_newtoken123"}`)
+	if !strings.Contains(bodyOf(t, resp), "Token added") {
+		t.Errorf("add response = %q, want success", bodyOf(t, resp))
+	}
+	env, _ := os.ReadFile(".env")
+	if !strings.Contains(string(env), "cb_newtoken123") {
+		t.Error("added token not persisted to .env")
+	}
+
+	// Mode switch to bridge: pool empties, AUTH_TOKENS cleared.
+	resp = postJSON(t, ts.URL, cookie, "/admin/mode", `{"mode":"bridge"}`)
+	if !strings.Contains(bodyOf(t, resp), "Switched to bridge mode") {
+		t.Errorf("mode response = %q, want bridge switch", bodyOf(t, resp))
+	}
+	env, _ = os.ReadFile(".env")
+	if strings.Contains(string(env), "cb_newtoken123") {
+		t.Error("token still in .env after bridge switch")
+	}
+}
+
+func postJSON(t *testing.T, url, cookie, path, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", cookie)
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
 // A valid .env save persists the file and reports success.
 func TestDashboardConfigSave(t *testing.T) {
 	t.Chdir(t.TempDir())
