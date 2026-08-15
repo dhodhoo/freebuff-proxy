@@ -116,7 +116,7 @@ git clone https://github.com/decolua/9router && cd 9router
 cp .env.example .env          # then set JWT_SECRET and INITIAL_PASSWORD (default is 123456!)
 npm install
 npm run build
-PORT=20128 HOSTNAME=0.0.0.0 npm run start
+PORT=20128 HOSTNAME=0.0.0.0 node .next/standalone/server.js
 ```
 
 **Option C — Docker (published image):**
@@ -163,12 +163,12 @@ On first run (v0.5.50+) 9router auto-provisions a **Default Key** for the dashbo
 | `PORT` | `20128` | HTTP port |
 | `HOSTNAME` | `0.0.0.0` (prod) | Bind address |
 | `NODE_ENV` | `production` | `development` enables dev-only behavior |
-| `API_KEY_SECRET` | auto | Secret for hashing client API keys at rest |
-| `MACHINE_ID_SALT` | auto | Salt for machine-bound key generation |
+| `API_KEY_SECRET` | `endpoint-proxy-api-key-secret` | Fixed default; secret for hashing client API keys at rest |
+| `MACHINE_ID_SALT` | `endpoint-proxy-salt` | Fixed default; salt for machine-bound key generation |
 | `ENABLE_REQUEST_LOGS` | off | Per-request logging |
-| `OBSERVABILITY_ENABLED` | off | OpenTelemetry export (documented inconsistently; check the env example) |
+| `OBSERVABILITY_ENABLED` | on | Request-details recording; set `"false"` to disable (the dashboard `enableObservability` toggle overrides when set) |
 | `AUTH_COOKIE_SECURE` | off | Set when serving dashboard over HTTPS |
-| `REQUIRE_API_KEY` | on | When off, clients can call `/v1` without a key ("local mode") |
+| `REQUIRE_API_KEY` | `false` | Enforce Bearer API key on `/v1` routes (README/.env.example default; the server actually reads the dashboard `requireApiKey` setting, default on) |
 | `BASE_URL` / `CLOUD_URL` |  | Public URL / cloud mode (not needed for local use) |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` |  | Outbound proxy for 9router's own upstream calls (not per-provider) |
 | `SEARXNG_URL` |  | Optional search backend for `/v1/search` |
@@ -243,8 +243,8 @@ outboundProxy, observability, quotaVisibility, dnsToolEnabled.
    from `/v1/models` (section 6) can be added to the node afterwards and are addressed as
    `freebuff/<model-id>`.
 
-Equivalent raw config shape (config-file or headless setups; this is the object 9router
-persists in its DB):
+Effective values the node holds after Create + Add API Key (9router v0.5.50 persists
+provider nodes and connections as separate SQLite rows, not this object; shown flattened):
 
 ```json
 {
@@ -278,11 +278,13 @@ On the provider page, per node and per connection (verified against `providers/[
 - **Models section** (compatible providers use the custom-models list):
   - **Add Model** (`AddCustomModelModal`): `POST /api/models/custom {providerAlias, id,
     type}`; add any catalog id from section 6.
-  - **Aliases**: map an alias to a real model id (`POST /api/models/alias`) so you can expose
+  - **Aliases**: map an alias to a real model id (`PUT /api/models/alias`) so you can expose
     e.g. `freebuff/flash` instead of `freebuff/deepseek/deepseek-v4-flash`.
   - **Disable / enable** individual models without deleting them.
   - **Test model**: probe a single model through the node.
-  - **Suggested models import**: pull the catalog the proxy advertises via `/v1/models`.
+  - **Suggested models import**: available only for built-in providers that ship a public
+    models-fetcher config; custom nodes have no such import — add catalog ids manually
+    via Add Model.
 
 ---
 
@@ -310,23 +312,23 @@ providers, before nothing, or as a dedicated free tier).
 | Text rules: rate limit / quota / capacity / overloaded | Same backoff, applied at level <= 15 |
 | "No credentials" | Connection skipped for 2 minutes |
 | Any other error (incl. `502` / `503` / `504`) | No status rule matched; next connection tried with a 30s transient cooldown (the 5s cooldown in the source applies only to "request not allowed" text errors) |
-| All models failed | Client gets `503` with the earliest `retryAfter` |
+| All models failed | Client gets `503` (or the last failure's status) with the earliest `retryAfter` |
 | Per-model locks | A failing model is locked per `modelLock_<model>` so other models keep working |
 
 The proxy itself also returns `503 waiting_room_queued` + `Retry-After` and
-`429 rate_limited` + `resetAt`, which 9router's fallback engine understands.
+`429 rate_limited` + `Retry-After`, which 9router's fallback engine understands.
 
 ---
 
 ## 6. RTK token saver and companion savers
 
-**RTK token saver** compresses `tool_result` content **in place, before format translation**
-(OpenAI `role:"tool"` messages, Claude `tool_result` blocks, Responses
-`function_call_output`). Filters: git-diff, git-status, git-log, grep, find, ls, tree,
-dedup-log, smart-truncate, read-numbered, search-list. It auto-detects content (peeks 1KB),
-never grows or empties a result, and respects `MIN_COMPRESS_SIZE` / `RAW_CAP`.
+**RTK token saver** compresses `tool_result` content **in place, on the translated request
+body** (OpenAI `role:"tool"` messages, Claude `tool_result` blocks, Responses
+`function_call_output`). Filters: git-diff, git-status, git-log, build-output, grep, find, ls,
+tree, dedup-log, smart-truncate, read-numbered, search-list. It auto-detects content (peeks
+1KB), never grows or empties a result, and respects `MIN_COMPRESS_SIZE` / `RAW_CAP`.
 
-- **Default: enabled** (`rtkEnabled: true`). Toggle in Dashboard -> Endpoint settings.
+- **Default: enabled** (`rtkEnabled: true`). Toggle in Dashboard -> Token Saver.
 - **Per-request bypass**: send header `x-9router-token-saver: off`.
 - **Why it matters here**: compressing `tool_result` before it reaches the proxy saves
   FreeBuff quota too. Leave it on.
@@ -429,7 +431,7 @@ message.
 | `400 model_not_found` (proxy) | Model not in the registry catalog. Check `/v1/models` |
 | `404 unknown model` (9router) | The model combo is not registered. Re-add the model in the provider config |
 | `503 waiting_room_queued` + Retry-After | FreeBuff waiting room (quota/hourly). Normal; 9router/opencode retry automatically |
-| `429` with `rate_limited` | GLM 5/20h cap, or token daily quota (6 sessions on the limited tier). Switch model or wait; 9router backs off with the proxy's `resetAt` |
+| `429` with `rate_limited` | GLM 5/20h cap, or token daily quota (6 sessions on the limited tier). Switch model or wait; 9router backs off automatically (status-based exponential backoff) |
 | `502 upstream_unavailable` | Token in 30-min cooldown after a 401, or all tokens failed. Check `healthz`. Transient transport failures (TLS handshake/reset/EOF) are retried once automatically (`TRANSIENT_RETRIES`, default 1; 0 disables) before a 502 |
 | `403` `account_banned` / `{"status":"banned"}` | The FreeBuff account was banned upstream (terminal per official source; see the README **WARNING**). The proxy skips the token during the ban window (upstream `resumes-at`, or 24h) and re-probes once after it; if it still fails, rotate to a new account with an established GitHub login and a clean IP |
 | Model streams `reasoning_content` | By design (CLI-faithful). 9router handles it; don't strip it |

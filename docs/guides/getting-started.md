@@ -20,9 +20,11 @@ This guide takes you from zero to a working OpenAI-compatible proxy connected to
 ## Important Safety Warning
 
 Using this proxy conflicts with Codebuff's terms of service. Upstream abuse detection scans for automation patterns and suspends accounts.
-- **Keep `SAFE_MODE=true`** — it is the default and is set explicitly in `.env.example`; it enables anti-ban stealth (TLS fingerprint, header sanitization, request jitter, idle rotation, daily cap).
+- **Keep `SAFE_MODE=true`** — it is the default and is set explicitly in `.env.example`; it enables anti-ban stealth (TLS fingerprint, header sanitization, request jitter, idle rotation).
 - Do **not** run 24/7 on heavy unattended automated tasks.
 - Keep one modest account; do not create spam clusters of accounts.
+- **Use one key until it is rate-limited.** The proxy prefers the token with a live session and only switches when it is exhausted — don't rotate several healthy keys aggressively (farming signals).
+- **For 24h of coding, budget 4–5 keys**, each registered with a **real email address** (e.g. Gmail). Temp-mail registrations are flagged as not-legitimate and are more likely to be banned.
 
 ---
 
@@ -74,7 +76,7 @@ curl http://localhost:3457/metrics
 curl http://localhost:3457/v1/models
 ```
 
-`/healthz` returning status `200` means your proxy setup is **100% correct**.
+`/healthz` returning status `200` means the proxy is running and reachable — it does not validate your token (a bad `AUTH_TOKENS` only surfaces when a chat request is made).
 
 `/healthz` also reports each token's live per-model quota (`quota` map) when the last session admission carried it.
 
