@@ -122,7 +122,13 @@ func (r *constantResolver) resolve(name string, depth int) string {
 			return ""
 		}
 		// Port of `new RegExp(\b${prop}\s*:\s*'([^']+)')` — first match wins.
-		re := regexp.MustCompile(`\b` + prop + `\s*:\s*'([^']+)'`)
+		// The property name is derived from upstream TS alias targets and may
+		// contain regex metacharacters: compile defensively and skip the
+		// lookup instead of panicking.
+		re, err := regexp.Compile(`\b` + prop + `\s*:\s*'([^']+)'`)
+		if err != nil {
+			return ""
+		}
 		m := re.FindStringSubmatch(objText)
 		if m == nil {
 			return ""

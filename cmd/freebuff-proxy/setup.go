@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -86,7 +87,9 @@ func runSetup(autoYes bool) {
 
 	// 3. aider
 	aiderCfgPath := filepath.Join(home, ".aider.conf.yml")
-	if ask("Would you like to configure aider in ~/.aider.conf.yml?") {
+	if _, err := exec.LookPath("aider"); err != nil {
+		fmt.Println("[-] aider not found on this system")
+	} else if ask("Would you like to configure aider in ~/.aider.conf.yml?") {
 		if setupAiderConfig(aiderCfgPath) {
 			fmt.Printf("    [ok] Configured aider in %s\n", aiderCfgPath)
 			configured++
@@ -99,7 +102,9 @@ func runSetup(autoYes bool) {
 	fmt.Printf("\n======================================\n")
 	fmt.Printf("Setup complete! Configured %d client tool(s).\n", configured)
 	fmt.Println("Base URL: http://localhost:3457/v1")
-	fmt.Println("Models available: deepseek/deepseek-v4-flash, thudm/glm-5.2, moonshot/kimi-k2.5, minimax/minimax-m3, xiaomi/mimo-v2.5, deepseek/deepseek-v4-pro")
+	// The model list is served live by the proxy; pointing at the endpoint
+	// beats maintaining a hardcoded, drifting copy here.
+	fmt.Println("Models available: query http://localhost:3457/v1/models for the live list")
 	os.Exit(0)
 }
 

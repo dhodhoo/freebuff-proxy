@@ -26,6 +26,12 @@ import (
 // proxy-freebuff's normalizeSchemaMap, which resolves with depth 12.
 const maxSchemaDepth = 12
 
+// maxSchemaNodes is the total-node budget for one request's schema
+// normalization: beyond it, remaining structure is returned unchanged. A
+// pathological schema would otherwise be re-copied at every ancestor up to
+// maxSchemaDepth (12x memory amplification). Tests may shrink it.
+var maxSchemaNodes = 100_000
+
 // upstreamKeys is the whitelist of chat-completions body keys forwarded to
 // the upstream, plus messages/model which are always kept. Ported from
 // freebuff-api-kiprana's _UPSTREAM_CHAT_KEYS. Note "stream" is NOT
@@ -160,6 +166,8 @@ func normalizeToolSchemas(payload map[string]any) {
 	if len(tools) == 0 {
 		return
 	}
+	// One node budget per request, shared across tools.
+	budget := maxSchemaNodes
 	hasEndTurn := false
 	for _, t := range tools {
 		tool, ok := t.(map[string]any)
@@ -177,7 +185,7 @@ func normalizeToolSchemas(payload map[string]any) {
 		if !ok {
 			continue
 		}
-		fn["parameters"] = normalizeSchemaMap(params, extractDefinitions(params), maxSchemaDepth)
+		fn["parameters"] = normalizeSchemaMap(params, extractDefinitions(params), maxSchemaDepth, &budget)
 	}
 	// Inject end_turn tool definition to pass Codebuff's foreign_toolset validation
 	if !hasEndTurn {
@@ -237,24 +245,26 @@ func mergeDefinitions(parent, local map[string]any) map[string]any {
 }
 
 // normalizeSchemaMap normalizes one JSON-schema node: resolves bare $ref
-// nodes against the definition table, recurses into values (depth-capped),
-// drops definitions/$defs/nullable, simplifies nullable anyOf/oneOf, and
-// cleans up type/enum/const fields. The returned map is always freshly
-// allocated except at the depth cap, where the node is returned as-is.
-func normalizeSchemaMap(node map[string]any, defs map[string]any, maxDepth int) map[string]any {
-	if maxDepth <= 0 {
-		return node // depth cap: leave the remaining structure untouched
+// nodes against the definition table, recurses into values (depth-capped and
+// node-budgeted), drops definitions/$defs/nullable, simplifies nullable
+// anyOf/oneOf, and cleans up type/enum/const fields. The returned map is
+// always freshly allocated except at the depth cap or budget exhaustion,
+// where the node is returned as-is.
+func normalizeSchemaMap(node map[string]any, defs map[string]any, maxDepth int, budget *int) map[string]any {
+	if maxDepth <= 0 || *budget <= 0 {
+		return node // cap: leave the remaining structure untouched
 	}
+	*budget--
 	defs = mergeDefinitions(defs, extractDefinitions(node))
-	if replaced, ok := tryResolveRef(node, defs); ok {
+	if replaced, ok := tryResolveRef(node, defs, maxDepth); ok {
 		if resolved, isMap := replaced.(map[string]any); isMap {
-			return normalizeSchemaMap(resolved, defs, maxDepth-1)
+			return normalizeSchemaMap(resolved, defs, maxDepth-1, budget)
 		}
 		return node
 	}
 	normalized := make(map[string]any, len(node))
 	for key, value := range node {
-		normalized[key] = normalizeSchemaValue(value, defs, maxDepth-1)
+		normalized[key] = normalizeSchemaValue(value, defs, maxDepth-1, budget)
 	}
 	delete(normalized, "definitions")
 	delete(normalized, "$defs")
@@ -269,16 +279,16 @@ func normalizeSchemaMap(node map[string]any, defs map[string]any, maxDepth int) 
 
 // normalizeSchemaValue recurses into arrays and objects; scalars pass
 // through untouched.
-func normalizeSchemaValue(value any, defs map[string]any, maxDepth int) any {
+func normalizeSchemaValue(value any, defs map[string]any, maxDepth int, budget *int) any {
 	switch v := value.(type) {
 	case []any:
 		out := make([]any, len(v))
 		for i, e := range v {
-			out[i] = normalizeSchemaValue(e, defs, maxDepth)
+			out[i] = normalizeSchemaValue(e, defs, maxDepth, budget)
 		}
 		return out
 	case map[string]any:
-		return normalizeSchemaMap(v, defs, maxDepth)
+		return normalizeSchemaMap(v, defs, maxDepth, budget)
 	default:
 		return value
 	}
@@ -286,10 +296,11 @@ func normalizeSchemaValue(value any, defs map[string]any, maxDepth int) any {
 
 // tryResolveRef resolves a node that is a BARE {"$ref": "..."} (no sibling
 // keys) against the definition table. Returns (replacement, true) on
-// success; the replacement is a deep clone. Ported from JS tryResolveRef:
-// only "#/definitions/<name>" and "#/$defs/<name>" pointers resolve, and
-// only when the name exists in the table.
-func tryResolveRef(node map[string]any, defs map[string]any) (any, bool) {
+// success; the replacement is a deep clone, depth-capped so cyclic or deeply
+// nested definitions cannot explode. Ported from JS tryResolveRef: only
+// "#/definitions/<name>" and "#/$defs/<name>" pointers resolve, and only
+// when the name exists in the table.
+func tryResolveRef(node map[string]any, defs map[string]any, maxDepth int) (any, bool) {
 	ref, _ := node["$ref"].(string)
 	if ref == "" || len(node) != 1 || defs == nil {
 		return nil, false
@@ -308,22 +319,28 @@ func tryResolveRef(node map[string]any, defs map[string]any) (any, bool) {
 	if !ok {
 		return nil, false
 	}
-	return cloneValue(resolved), true
+	return cloneValue(resolved, maxDepth), true
 }
 
-// cloneValue deep-clones any JSON value (maps, arrays, scalars).
-func cloneValue(v any) any {
+// cloneValue deep-clones any JSON value, stopping below depth 0 (returning
+// the value unchanged there) so a single $ref cannot balloon on deeply
+// nested or cyclic definition subtrees. Values shared by the depth cap are
+// only ever read downstream, never mutated.
+func cloneValue(v any, maxDepth int) any {
+	if maxDepth <= 0 {
+		return v
+	}
 	switch x := v.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(x))
 		for k, val := range x {
-			out[k] = cloneValue(val)
+			out[k] = cloneValue(val, maxDepth-1)
 		}
 		return out
 	case []any:
 		out := make([]any, len(x))
 		for i, val := range x {
-			out[i] = cloneValue(val)
+			out[i] = cloneValue(val, maxDepth-1)
 		}
 		return out
 	default:

@@ -4,18 +4,15 @@
 package telemetry
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 // ANSI 4-color scheme: DEBUG gray, INFO green, WARN yellow, ERROR red.
@@ -55,10 +52,10 @@ func ParseLevel(s string) (slog.Level, bool) {
 
 // New builds the process logger at the given level. stderr gets the
 // colorized text handler; when logFile is set the same lines are appended
-// there via io.MultiWriter. Coloring is disabled whenever a log file is
-// present — a single handler writes to both sinks and ANSI escapes in a file
-// are noise. A log file that cannot be opened is reported on stderr and
-// stderr-only logging continues.
+// there via io.MultiWriter. Coloring is disabled only when a log file is
+// actually opened — a single handler writes to both sinks and ANSI escapes
+// in a file are noise. A log file that cannot be opened is reported on
+// stderr and stderr-only logging continues, keeping its colors.
 func New(level slog.Level, logFile string) *slog.Logger {
 	w := io.Writer(os.Stderr)
 	var file *os.File
@@ -72,7 +69,7 @@ func New(level slog.Level, logFile string) *slog.Logger {
 		}
 	}
 
-	h := &textHandler{w: w, level: level, colorize: logFile == "", file: file}
+	h := &textHandler{w: w, level: level, colorize: file == nil, file: file}
 	return slog.New(h)
 }
 
@@ -166,52 +163,25 @@ func RedactHeaders(h http.Header) map[string][]string {
 	return out
 }
 
-// dumpBodyLimit truncates dumped bodies, mirroring the upstream client.
-const dumpBodyLimit = 20000
-
-// DumpRequest writes a debug record for one HTTP request to ./dump/ when
-// enabled, mirroring the upstream client's dump format:
-// `<kind>-<unixnano>-<sanitized-path>.dump`, mode 0600, sensitive headers
-// redacted, body truncated to 20000 bytes. This is the server-layer helper
-// (the upstream client dumps its own traffic independently on DEBUG_DUMP).
-func DumpRequest(kind string, req *http.Request, status int, body string, enabled bool) {
-	if !enabled || req == nil {
-		return
-	}
-	name := fmt.Sprintf("%s-%d-%s.dump", kind, time.Now().UnixNano(), sanitizeName(reqPath(req)))
-	path := filepath.Join("dump", name)
-	_ = os.MkdirAll("dump", 0o755)
-
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "%s %s\n", req.Method, req.URL.String())
-	for k, vs := range RedactHeaders(req.Header) {
-		for _, v := range vs {
-			fmt.Fprintf(&buf, "%s: %s\n", k, v)
-		}
-	}
-	fmt.Fprintf(&buf, "\n[status %d]\n%s\n", status, truncate(body, dumpBodyLimit))
-	_ = os.WriteFile(path, buf.Bytes(), 0o600)
-}
-
-func reqPath(req *http.Request) string {
-	if req.URL != nil {
-		return req.URL.Path
-	}
-	return ""
-}
-
+// sanitizeName makes a request path safe to embed in a dump file name on
+// every platform: separators, dots and each character that is invalid in
+// Windows file names are replaced with underscores.
 func sanitizeName(p string) string {
-	p = strings.ReplaceAll(p, "/", "_")
-	p = strings.ReplaceAll(p, ".", "_")
+	for _, r := range `/\:*?"<>|.` {
+		p = strings.ReplaceAll(p, string(r), "_")
+	}
 	if len(p) > 60 {
 		p = p[:60]
 	}
 	return p
 }
 
+// truncate shortens s to at most n runes (UTF-8-safe: multi-byte sequences
+// are never split) plus an ellipsis.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
 }

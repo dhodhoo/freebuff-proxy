@@ -77,7 +77,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	mux.HandleFunc("POST /admin/reload", s.requireAuth(s.handleReload))
+	mux.HandleFunc("POST /admin/reload", s.requireAdminToken(s.requireAuth(s.handleReload)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -181,6 +181,31 @@ func (s *Server) authorized(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// requireAdminToken guards POST /admin/reload when ADMIN_TOKEN is set: the
+// request must present it as "Authorization: Bearer <token>" (constant-time
+// compare). When ADMIN_TOKEN is unset the handler passes through untouched —
+// the legacy API_KEYS gate still applies via requireAuth, and main.go logs a
+// startup warning for the open (default) case.
+func (s *Server) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.cfg.Load()
+		if cfg.AdminToken == "" {
+			next(w, r)
+			return
+		}
+		provided := ""
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			provided = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		}
+		if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.AdminToken)) != 1 {
+			s.writeJSONError(w, http.StatusUnauthorized,
+				"Invalid admin token", "invalid_request_error", "invalid_admin_token", 0)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // clientToken returns the request's bearer token (Authorization: Bearer or
@@ -612,6 +637,29 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// escapeLabelValue escapes a Prometheus label value per the text exposition
+// format: backslash, double quote, and newline are escaped; everything else
+// passes through unchanged.
+func escapeLabelValue(v string) string {
+	if !strings.ContainsAny(v, `\"\n`) {
+		return v
+	}
+	var sb strings.Builder
+	for _, r := range v {
+		switch r {
+		case '\\':
+			sb.WriteString(`\\`)
+		case '"':
+			sb.WriteString(`\"`)
+		case '\n':
+			sb.WriteString(`\n`)
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
 // handleMetrics exports Prometheus metrics (#24).
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -670,7 +718,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, snap := range snaps {
 		for model, q := range snap.QuotaByModel {
 			fmt.Fprintf(&sb, "freebuff_proxy_quota_recent{token=\"%d\",model=\"%s\",period=\"%s\"} %g\n",
-				snap.Token+1, model, q.Period, q.RecentCount)
+				snap.Token+1, escapeLabelValue(model), escapeLabelValue(q.Period), q.RecentCount)
 		}
 	}
 	sb.WriteString("\n")
@@ -680,7 +728,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, snap := range snaps {
 		for model, q := range snap.QuotaByModel {
 			fmt.Fprintf(&sb, "freebuff_proxy_quota_limit{token=\"%d\",model=\"%s\",period=\"%s\"} %g\n",
-				snap.Token+1, model, q.Period, q.Limit)
+				snap.Token+1, escapeLabelValue(model), escapeLabelValue(q.Period), q.Limit)
 		}
 	}
 	sb.WriteString("\n")

@@ -1464,3 +1464,205 @@ func TestPoolSnapshotZeroCountersWhenNoRetries(t *testing.T) {
 		t.Errorf("per-token counters = %+v, want zero", ps.Tokens)
 	}
 }
+
+// TestSnapshotBanRiskLevel is the regression guard for the P2 ban
+// mislabeling: a banned token must show "critical" during the ban window
+// (not "high" from the cooldown case shadowing it), and the risk must drop
+// after the window expires instead of staying sticky "critical" forever.
+func TestSnapshotBanRiskLevel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// Short ban window: CooldownBan also fills the shared cooldown
+	// deadline, so before the fix the cooldown case matched first ("high")
+	// and the remembered BanError stayed non-nil past the window.
+	p.CooldownTokenBan(0, &upstream.BanError{Body: "banned", ResumesAt: time.Now().Add(60 * time.Millisecond)})
+
+	if got := p.Snapshot()[0].RiskLevel; got != "critical" {
+		t.Errorf("RiskLevel during ban = %q, want critical", got)
+	}
+
+	// Once the ban window expires the label must drop (not sticky).
+	eventually(t, "risk drop after ban window", func() bool {
+		return p.Snapshot()[0].RiskLevel != "critical"
+	})
+	if got := p.Snapshot()[0].RiskLevel; got != "low" {
+		t.Errorf("RiskLevel after ban window = %q, want low", got)
+	}
+}
+
+// TestIdleFinishAllRunsHonorsMaintainCtx is the regression guard for the P2
+// context.Background bug in the idle FINISH: Pool.Shutdown cancels the
+// maintain ctx first and waits on the maintain goroutine, so a mid-drain
+// FinishAllRuns must abort on cancel instead of blocking shutdown for the
+// full upstream call timeout.
+func TestIdleFinishAllRunsHonorsMaintainCtx(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+	p.cfg.IdleRotationTimeout = time.Millisecond
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	time.Sleep(20 * time.Millisecond) // past the idle threshold
+
+	// Hold every FINISH upstream: only ctx cancellation can end it.
+	mock.FinishDelay = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.maintainTick(ctx)
+		close(done)
+	}()
+
+	eventually(t, "idle FINISH in flight", func() bool {
+		return mock.FinishesStartedSnapshot() >= 1
+	})
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("maintainTick did not return after ctx cancel (FinishAllRuns used context.Background)")
+	}
+}
+
+// TestBridgeMaintainEvictHonorsCtx is the bridge-mode half of the same P2
+// fix: the idle-eviction FinishAllRuns in bridgeMaintain must honor the
+// maintain ctx so shutdown is not blocked by an in-flight FINISH.
+func TestBridgeMaintainEvictHonorsCtx(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newBridgePool(t, mock)
+
+	lease, err := p.AcquireBridge(context.Background(), "idle-bridge-tok", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	// Age the entry past bridgeIdleEvict so the sweep evicts it.
+	entry := p.bridgeToken("idle-bridge-tok")
+	if entry == nil {
+		t.Fatal("bridge entry missing")
+	}
+	entry.lastUsed = time.Now().Add(-bridgeIdleEvict - time.Minute)
+
+	mock.FinishDelay = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.bridgeMaintain(ctx)
+		close(done)
+	}()
+
+	eventually(t, "idle-eviction FINISH in flight", func() bool {
+		return mock.FinishesStartedSnapshot() >= 1
+	})
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridgeMaintain did not return after ctx cancel (FinishAllRuns used context.Background)")
+	}
+}
+
+// TestBridgeEvictionSkipsBusyEntry is the regression guard for the P2
+// eviction bug: LRU eviction used to FINISH the runs of any victim, even
+// one with an outstanding lease, killing the in-flight request. Eviction
+// must skip busy entries (the idle sweep handles them once leases drain).
+func TestBridgeEvictionSkipsBusyEntry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ids := make([]string, maxBridgeEntries+8)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	p := newBridgePool(t, mock)
+
+	// Fill the cache to the cap, holding an ACTIVE LEASE on the oldest
+	// entry (client-tok-00) so it must survive eviction.
+	var busy *Lease
+	for i := 0; i < maxBridgeEntries; i++ {
+		lease, err := p.AcquireBridge(context.Background(), fmt.Sprintf("client-tok-%02d", i), modelA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			busy = lease
+		} else {
+			p.LeaseRelease(lease)
+		}
+	}
+
+	// A new distinct token pushes the cache over the cap: eviction must
+	// pick an idle victim, not the busy oldest entry.
+	lease, err := p.AcquireBridge(context.Background(), "client-tok-new", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	if e := p.bridgeToken("client-tok-00"); e == nil {
+		t.Fatal("busy bridge entry was evicted while its lease is outstanding")
+	}
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 1 {
+		t.Errorf("finished runs = %d, want 1 (only the idle evicted entry)", len(finished))
+	}
+	for _, f := range finished {
+		if f.RunID == busy.Run.RunID {
+			t.Errorf("busy entry's run %s FINISHed during eviction", f.RunID)
+		}
+	}
+	if got := p.bridgeLen(); got != maxBridgeEntries {
+		t.Errorf("bridge entries = %d, want %d", got, maxBridgeEntries)
+	}
+	p.LeaseRelease(busy)
+}
+
+// TestShutdownDrainsBridgeEntries is the regression guard for the P3 gap:
+// Pool.Shutdown only drained the fixed tokens, leaving cached bridge
+// entries' runs and sessions alive upstream. Shutdown must drain them
+// best-effort after the fixed-token pass.
+func TestShutdownDrainsBridgeEntries(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newBridgePool(t, mock)
+
+	lease1, err := p.AcquireBridge(context.Background(), "shutdown-tok-1", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease1)
+	lease2, err := p.AcquireBridge(context.Background(), "shutdown-tok-2", modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease2)
+
+	p.Shutdown(context.Background())
+
+	// Both bridge entries' runs were FINISHed and sessions ended.
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 2 {
+		t.Errorf("finished runs = %d, want 2 (bridge runs drained on shutdown)", len(finished))
+	}
+	for _, f := range finished {
+		if f.Status != "completed" {
+			t.Errorf("run %s finished with status %q, want completed", f.RunID, f.Status)
+		}
+	}
+	if mock.SessionEnds != 2 {
+		t.Errorf("session ends = %d, want 2 (bridge sessions ended on shutdown)", mock.SessionEnds)
+	}
+}

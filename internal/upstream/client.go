@@ -238,6 +238,18 @@ type Client struct {
 	profileMu      sync.Mutex
 	stealthProfile *stealth.Profile
 
+	// socksProxies is the normalized SOCKS5 proxy list when SOCKS5_PROXIES
+	// is configured (host:port each), with one prebuilt SOCKS5 dialer per
+	// entry in socksDialers. The proxy for a request is chosen per request
+	// by proxyIndex() and stashed in the request context; the transport
+	// dialer reads the stash so the chosen proxy is the one actually dialed
+	// (PROXY_ROTATION: per-token | round-robin | random). Empty when the
+	// legacy single SOCKS5_PROXY or no proxy is configured.
+	socksProxies  []string
+	socksDialers  []proxy.Dialer
+	proxyRotation string
+	proxyCounter  atomic.Uint64 // round-robin cursor (per token)
+
 	// Counters surfaced via the pool snapshot for /metrics.
 	transientRetries     atomic.Int64 // transient transport failures retried
 	fingerprintRotations atomic.Int64 // pinned fingerprint swaps ahead of a retry
@@ -258,8 +270,11 @@ func New(token string, cfg *config.Config) (*Client, error) {
 	return NewWithIndex(token, 0, cfg)
 }
 
-// NewWithIndex builds the client for token at index tokenIndex. SOCKS5Proxies
-// (plural) binds each token to an outbound proxy round-robin (#23).
+// NewWithIndex builds the client for token at tokenIndex. SOCKS5Proxies
+// (plural) selects the outbound proxy per request per ProxyRotation: the
+// legacy per-token binding pins token tokenIndex to proxy
+// tokenIndex % len(proxies); round-robin advances a per-token atomic
+// cursor; random draws via crypto/rand (#23).
 func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, error) {
 	if token == "" {
 		return nil, errors.New("upstream: empty token")
@@ -268,16 +283,51 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		return nil, errors.New("upstream: nil config")
 	}
 
-	socksProxy := cfg.SOCKS5Proxy
-	if len(cfg.SOCKS5Proxies) > 0 {
-		idx := tokenIndex % len(cfg.SOCKS5Proxies)
-		socksProxy = cfg.SOCKS5Proxies[idx]
+	cliVer := cfg.CLIVersion
+	if cliVer == "" {
+		cliVer = "0.10.7"
+	}
+
+	c := &Client{
+		token:                 token,
+		tokenIndex:            tokenIndex,
+		baseURL:               cfg.UpstreamBaseURL,
+		requestTimeout:        cfg.RequestTimeout,
+		sessionCallTimeout:    cfg.SessionCallTimeout,
+		requestJitter:         cfg.RequestJitter,
+		cliVersion:            cliVer,
+		costMode:              cfg.CostMode,
+		debugDump:             cfg.DebugDump,
+		transientRetriesLimit: cfg.TransientRetries,
+		proxyRotation:         cfg.ProxyRotation,
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	var baseDial func(ctx context.Context, network, addr string) (net.Conn, error)
-	if socksProxy != "" {
-		socksAddr, err := parseProxyAddr(socksProxy)
+
+	if len(cfg.SOCKS5Proxies) > 0 {
+		// PROXY_ROTATION: the proxy is chosen per request (newRequest stashes
+		// the selected index) and this dialer reads the stash, so round-robin
+		// and random actually rotate the outbound connection. per-token is
+		// the default binding (token tokenIndex → proxy tokenIndex % n).
+		for _, raw := range cfg.SOCKS5Proxies {
+			addr, err := parseProxyAddr(raw)
+			if err != nil {
+				return nil, fmt.Errorf("upstream: SOCKS5_PROXIES: %w", err)
+			}
+			dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+			if err != nil {
+				return nil, fmt.Errorf("upstream: SOCKS5 dialer: %w", err)
+			}
+			c.socksProxies = append(c.socksProxies, addr)
+			c.socksDialers = append(c.socksDialers, dialer)
+		}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return c.socksDialers[c.proxyIndexFor(ctx)].Dial(network, addr)
+		}
+		baseDial = transport.DialContext
+	} else if cfg.SOCKS5Proxy != "" {
+		socksAddr, err := parseProxyAddr(cfg.SOCKS5Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("upstream: SOCKS5_PROXY: %w", err)
 		}
@@ -305,37 +355,22 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		stealthProf = profile
 	}
 
-	cliVer := cfg.CLIVersion
-	if cliVer == "" {
-		cliVer = "0.10.7"
-	}
-
-	c := &Client{
-		token:                 token,
-		tokenIndex:            tokenIndex,
-		baseURL:               cfg.UpstreamBaseURL,
-		requestTimeout:        cfg.RequestTimeout,
-		sessionCallTimeout:    cfg.SessionCallTimeout,
-		requestJitter:         cfg.RequestJitter,
-		cliVersion:            cliVer,
-		costMode:              cfg.CostMode,
-		debugDump:             cfg.DebugDump,
-		stealthProfile:        stealthProf,
-		transientRetriesLimit: cfg.TransientRetries,
-	}
 	if stealthProf != nil {
-		// Resolve the profile per connection (instead of capturing it) so a
+		// Resolve the profile per request (instead of capturing it) so a
 		// transient retry can swap the pinned fingerprint without rebuilding
 		// the transport: rotateStealthProfileForRetry swaps c.stealthProfile
-		// and the next dial picks it up.
+		// and the next dial picks it up. For auto/random, newRequest resolves
+		// a concrete profile and stashes it so the browser headers and the
+		// ClientHello always match; dialProfileFor prefers that stash.
 		// NOTE: for HTTP_PROXY (CONNECT tunnel), Go uses Proxy + DialTLSContext
 		// transparently; the stealth dialer replaces the TLS layer. baseDial is
 		// nil when no SOCKS5 proxy is set; Dialer uses its internal default
 		// net.Dialer in that case.
 		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return stealth.Dialer(c.currentStealthProfile(), baseDial, false)(ctx, network, addr)
+			return stealth.Dialer(c.dialProfileFor(ctx), baseDial, false)(ctx, network, addr)
 		}
 	}
+	c.stealthProfile = stealthProf
 	c.http = &http.Client{
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -422,8 +457,9 @@ func (c *Client) CreateSessionForModel(ctx context.Context, model string) (*Sess
 	return c.sessionCall(req)
 }
 
-// GetSession polls /api/v1/freebuff/session for the given instance. A 404
-// maps to Status "disabled" (proxy-freebuff treats it as disabled).
+// GetSession polls /api/v1/freebuff/session for the given instance. A poll
+// 404 maps to Status "ended" (the session vanished upstream; the session
+// manager re-creates it). Only a CREATE 404 maps to "disabled".
 func (c *Client) GetSession(ctx context.Context, instanceID string) (*SessionState, error) {
 	return c.GetSessionWithOpts(ctx, instanceID, false, false)
 }
@@ -545,7 +581,14 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 	defer func() { _ = resp.Body.Close() }()
 	body := drainBody(resp.Body)
 	if resp.StatusCode == 404 {
-		return &SessionState{Status: "disabled"}, nil
+		if req.Method == http.MethodPost {
+			// A create 404 means no session slot exists upstream.
+			return &SessionState{Status: "disabled"}, nil
+		}
+		// A poll 404 means the session no longer exists upstream (expired or
+		// evicted). Treat it as ended so the session manager re-creates it,
+		// instead of caching a permanent "disabled" with no expiry.
+		return &SessionState{Status: "ended"}, nil
 	}
 
 	c.dump("session", req, resp.StatusCode, body)
@@ -647,6 +690,28 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 	return nil, fmt.Errorf("upstream: unparseable session response %q", truncate(body, 200))
 }
 
+// requestProfileKey stashes the concrete stealth profile resolved for one
+// request in its context, so the transport dialer builds the ClientHello
+// from the SAME profile whose browser headers were applied (auto/random
+// must not draw twice — headers and TLS fingerprint would mismatch).
+type requestProfileKey struct{}
+
+// proxyIndexKey stashes the per-request SOCKS5 proxy choice (PROXY_ROTATION)
+// in the request context, so the transport dialer uses the proxy selected
+// for this request.
+type proxyIndexKey struct{}
+
+func withStealthProfile(ctx context.Context, p *stealth.Profile) context.Context {
+	return context.WithValue(ctx, requestProfileKey{}, p)
+}
+
+func stealthProfileFrom(ctx context.Context) *stealth.Profile {
+	if p, ok := ctx.Value(requestProfileKey{}).(*stealth.Profile); ok {
+		return p
+	}
+	return nil
+}
+
 func (c *Client) newRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
 	var reader io.Reader
 	if body != nil {
@@ -659,8 +724,14 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("x-codebuff-api-key", c.token)
 	req.Header.Set("Content-Type", "application/json")
+	ctx = req.Context()
 	if profile := c.currentStealthProfile(); profile != nil {
+		// Resolve the concrete profile ONCE per request and stash it: the
+		// dialer reads the stash for the ClientHello, so the browser headers
+		// applied here always match the TLS fingerprint. Pinned profiles
+		// resolve to themselves; auto/random get one concrete draw.
 		connProf := stealth.GetProfileForConnection(profile)
+		ctx = withStealthProfile(ctx, connProf)
 		stealth.SanitizeAndApply(req.Header, connProf)
 	} else {
 		ver := c.cliVersion
@@ -668,6 +739,12 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 			ver = "0.10.7"
 		}
 		req.Header.Set("User-Agent", fmt.Sprintf("ai-sdk/openai-compatible/%s/codebuff", ver))
+	}
+	if len(c.socksProxies) > 0 {
+		ctx = context.WithValue(ctx, proxyIndexKey{}, c.proxyIndex())
+	}
+	if ctx != req.Context() {
+		req = req.WithContext(ctx)
 	}
 	return req, nil
 }
@@ -722,12 +799,14 @@ func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, c
 		if c.transientRetriesLimit > 0 && attempt <= c.transientRetriesLimit &&
 			ctx.Err() == nil && replayBody != nil && isTransient(err) {
 			c.rotateStealthProfileForRetry(req)
-			c.transientRetries.Add(1)
 			body, bodyErr := replayBody()
 			if bodyErr != nil {
 				slog.Debug("upstream retry aborted: body replay failed",
 					"token", c.tokenIndex+1, "attempt", attempt, "err", bodyErr)
 			} else {
+				// Count the retry only once the replay succeeded: the counter
+				// reflects retries that actually fired, not aborted ones.
+				c.transientRetries.Add(1)
 				req.Body = body
 				req.Close = true // fresh connection for the retry
 				slog.Debug("upstream transient failure, retrying",
@@ -772,6 +851,63 @@ func (c *Client) currentStealthProfile() *stealth.Profile {
 	return c.stealthProfile
 }
 
+// dialProfileFor returns the stealth profile the transport dialer should use
+// for a connection under ctx. For ProfileAuto/ProfileRandom the concrete
+// profile stashed by newRequest wins, so the ClientHello matches the browser
+// headers applied to that request; a bare context (no stash) resolves per
+// connection as before. For pinned profiles the current c.stealthProfile is
+// authoritative: the retry loop swaps it (and re-applies headers) ahead of a
+// retry, so the stash would be stale.
+func (c *Client) dialProfileFor(ctx context.Context) *stealth.Profile {
+	profile := c.currentStealthProfile()
+	if profile != nil && (profile.ID == stealth.ProfileIDAuto || profile.ID == stealth.ProfileIDRandom) {
+		if stashed := stealthProfileFrom(ctx); stashed != nil {
+			return stashed
+		}
+	}
+	return profile
+}
+
+// proxyIndexFor returns the SOCKS5 proxy index to dial for a request. The
+// per-request choice stashed by newRequest wins; a bare context (e.g. a dial
+// not preceded by newRequest) falls back to the per-token binding.
+func (c *Client) proxyIndexFor(ctx context.Context) int {
+	if idx, ok := ctx.Value(proxyIndexKey{}).(int); ok && idx >= 0 && idx < len(c.socksProxies) {
+		return idx
+	}
+	return c.tokenIndex % len(c.socksProxies)
+}
+
+// proxyIndex selects the SOCKS5 proxy index for a new request according to
+// PROXY_ROTATION: per-token (default) pins the token to its index,
+// round-robin advances a per-token atomic cursor, random draws via
+// crypto/rand. Unknown rotation values behave as per-token.
+func (c *Client) proxyIndex() int {
+	n := len(c.socksProxies)
+	if n == 0 {
+		return 0
+	}
+	switch c.proxyRotation {
+	case "round-robin":
+		return int((c.proxyCounter.Add(1) - 1) % uint64(n))
+	case "random":
+		return cryptoRandN(n)
+	default:
+		return c.tokenIndex % n
+	}
+}
+
+// cryptoRandN returns a crypto-random integer in [0, n).
+func cryptoRandN(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	var b [8]byte
+	_, _ = cryptoRand.Read(b[:])
+	u := binary.BigEndian.Uint64(b[:])
+	return int(u % uint64(n))
+}
+
 // TransientRetries returns how many transient transport failures were
 // retried by this client (pool snapshot /metrics aggregation).
 func (c *Client) TransientRetries() int64 { return c.transientRetries.Load() }
@@ -800,7 +936,6 @@ var transientMarkers = []string{
 	"connection refused",
 	"connection reset",
 	"unexpected eof",
-	"eof",
 	"network is unreachable",
 	"no route to host",
 	"i/o timeout", // dial timeout
@@ -810,6 +945,10 @@ var transientMarkers = []string{
 // retry. It walks the wrapped error chain and matches message fragments, so
 // stealth-wrapped dial errors ("stealth: tcp dial failed: ...: connection
 // refused") classify the same as the bare dial error.
+//
+// Bare "EOF" is matched on exact whole-message equality only: a substring
+// match on "eof" would over-retry unrelated errors that merely mention the
+// letters ("... eof marker ...").
 func isTransient(err error) bool {
 	if err == nil {
 		return false
@@ -820,6 +959,9 @@ func isTransient(err error) bool {
 			if strings.Contains(msg, marker) {
 				return true
 			}
+		}
+		if msg == "eof" {
+			return true
 		}
 	}
 	return false
@@ -1071,16 +1213,28 @@ func NextPacificMidnight() time.Time {
 	loc, err := time.LoadLocation("America/Los_Angeles")
 	now := time.Now()
 	if err != nil {
-		// Fallback: 07:00 UTC (PDT summer) or 08:00 UTC (PST winter)
-		t := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 7, 0, 0, 0, time.UTC)
-		if !t.After(now) {
-			t = t.Add(24 * time.Hour)
-		}
-		return t
+		return pacificMidnightFallback(now)
 	}
 	nowLoc := now.In(loc)
 	nextDay := time.Date(nowLoc.Year(), nowLoc.Month(), nowLoc.Day()+1, 0, 0, 0, 0, loc)
 	return nextDay.UTC()
+}
+
+// pacificMidnightFallback approximates the upcoming Pacific midnight without
+// the IANA tzdata database: America/Los_Angeles is UTC-7 during PDT
+// (roughly March-November) and UTC-8 during PST (roughly November-March).
+// The month range is the documented approximation; the exact DST transition
+// dates require tzdata.
+func pacificMidnightFallback(now time.Time) time.Time {
+	hour := 7 // PDT
+	if m := now.UTC().Month(); m < time.March || m > time.November {
+		hour = 8 // PST: December, January, February
+	}
+	t := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), hour, 0, 0, 0, time.UTC)
+	if !t.After(now) {
+		t = t.Add(24 * time.Hour)
+	}
+	return t
 }
 
 func getNumber(m map[string]any, keys ...string) (float64, bool) {
@@ -1181,15 +1335,18 @@ func parseRateLimit(body string, headerRetryAfter time.Duration) error {
 }
 
 // parseBan builds a BanError from a 403 banned body, extracting the
-// resumes_at timestamp best-effort.
+// resumes_at timestamp best-effort. resumes_at may be RFC3339, unix seconds,
+// or unix milliseconds (parseFlexTime).
 func parseBan(body string) error {
 	be := &BanError{Body: truncate(body, 200)}
 	var parsed struct {
-		ResumesAt time.Time `json:"resumes_at"`
-		Status    string    `json:"status"`
+		ResumesAt any    `json:"resumes_at"`
+		Status    string `json:"status"`
 	}
-	if err := json.Unmarshal([]byte(body), &parsed); err == nil && !parsed.ResumesAt.IsZero() {
-		be.ResumesAt = parsed.ResumesAt
+	if err := json.Unmarshal([]byte(body), &parsed); err == nil {
+		if t, perr := parseFlexTime(parsed.ResumesAt); perr == nil {
+			be.ResumesAt = t
+		}
 	}
 	return be
 }

@@ -28,6 +28,7 @@ type Config struct {
 	RequestTimeout      time.Duration
 	SessionCallTimeout  time.Duration
 	APIKeys             []string
+	AdminToken          string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
 	HTTPProxy           string
 	SOCKS5Proxy         string
 	SOCKS5Proxies       []string // comma-separated list of SOCKS5 proxies (#23)
@@ -64,6 +65,7 @@ type rawConfig struct {
 	RequestTimeout      string   `json:"REQUEST_TIMEOUT"`
 	SessionCallTimeout  string   `json:"SESSION_CALL_TIMEOUT"`
 	APIKeys             []string `json:"API_KEYS"`
+	AdminToken          string   `json:"ADMIN_TOKEN"`
 	HTTPProxy           string   `json:"HTTP_PROXY"`
 	SOCKS5Proxy         string   `json:"SOCKS5_PROXY"`
 	SOCKS5Proxies       []string `json:"SOCKS5_PROXIES"`
@@ -123,9 +125,11 @@ func Load(configPath string) (Config, error) {
 	overrideString(&raw.RequestTimeout, "REQUEST_TIMEOUT")
 	overrideString(&raw.SessionCallTimeout, "SESSION_CALL_TIMEOUT")
 	overrideCSV(&raw.APIKeys, "API_KEYS")
+	overrideString(&raw.AdminToken, "ADMIN_TOKEN")
 	overrideString(&raw.HTTPProxy, "HTTP_PROXY")
 	overrideString(&raw.SOCKS5Proxy, "SOCKS5_PROXY")
 	overrideCSV(&raw.SOCKS5Proxies, "SOCKS5_PROXIES")
+	overrideString(&raw.ProxyRotation, "PROXY_ROTATION")
 	overrideString(&raw.CostMode, "COST_MODE")
 	overrideString(&raw.TLSFingerprint, "TLS_FINGERPRINT")
 	overrideString(&raw.RegistryRefresh, "REGISTRY_REFRESH")
@@ -212,6 +216,7 @@ func Load(configPath string) (Config, error) {
 		RequestTimeout:      requestTimeout,
 		SessionCallTimeout:  sessionCallTimeout,
 		APIKeys:             dedupeStrings(raw.APIKeys),
+		AdminToken:          strings.TrimSpace(raw.AdminToken),
 		HTTPProxy:           strings.TrimSpace(raw.HTTPProxy),
 		SOCKS5Proxy:         strings.TrimSpace(raw.SOCKS5Proxy),
 		SOCKS5Proxies:       dedupeStrings(raw.SOCKS5Proxies),
@@ -242,6 +247,13 @@ func Load(configPath string) (Config, error) {
 			cfg.AuthTokens = []string{token}
 			cfg.DiscoveredSource = srcPath
 			cfg.DiscoveredEmail = email
+			// An operator running without AUTH_TOKENS intends bridge mode;
+			// auto-discovery silently flipping to pooled mode is surprising,
+			// so warn loudly and name the off switch.
+			slog.Warn("auto-discovery filled empty AUTH_TOKENS from CLI login: bridge mode switched to pooled mode",
+				"file", srcPath,
+				"email", email,
+				"hint", "set AUTO_DISCOVER_TOKEN=false to disable auto-discovery")
 		}
 	}
 
@@ -435,6 +447,7 @@ func applyDotenv(raw *rawConfig) error {
 	overrideStringFrom(&raw.RequestTimeout, get, "REQUEST_TIMEOUT")
 	overrideStringFrom(&raw.SessionCallTimeout, get, "SESSION_CALL_TIMEOUT")
 	overrideCSVFrom(&raw.APIKeys, get, "API_KEYS")
+	overrideStringFrom(&raw.AdminToken, get, "ADMIN_TOKEN")
 	overrideStringFrom(&raw.HTTPProxy, get, "HTTP_PROXY")
 	overrideStringFrom(&raw.SOCKS5Proxy, get, "SOCKS5_PROXY")
 	overrideCSVFrom(&raw.SOCKS5Proxies, get, "SOCKS5_PROXIES")
@@ -446,12 +459,24 @@ func applyDotenv(raw *rawConfig) error {
 	overrideStringFrom(&raw.LogLevel, get, "LOG_LEVEL")
 	overrideIntFrom(&raw.MaxMessagesPerDay, get, "MAX_MESSAGES_PER_DAY")
 	overrideStringFrom(&raw.IdleRotationTimeout, get, "IDLE_ROTATION_TIMEOUT")
+	// The remaining keys mirror the real-environment override set in Load.
+	// AUTO_DISCOVER_TOKEN is intentionally env-only (it controls the .env
+	// read itself, so honoring it from .env would be circular).
+	overrideBoolFrom(&raw.SafeMode, get, "SAFE_MODE")
+	overrideStringFrom(&raw.RequestJitter, get, "REQUEST_JITTER")
+	overrideStringFrom(&raw.CLIVersion, get, "CLI_VERSION")
+	overrideStringFrom(&raw.ModelAliases, get, "MODEL_ALIASES")
+	overrideIntFrom(&raw.TransientRetries, get, "TRANSIENT_RETRIES")
+	overrideStringFrom(&raw.ProxyRotation, get, "PROXY_ROTATION")
 	return nil
 }
 
 // readDotenv parses a dotenv file: KEY=VALUE lines, blank lines and #
-// comments skipped, surrounding whitespace and matching quotes trimmed.
-// Returns nil, nil when the file does not exist.
+// comments skipped, surrounding whitespace trimmed. Quotes are only removed
+// for a matching pair wrapping the value (an unmatched quote is kept as
+// literal data); inline # comments are stripped from unquoted values but
+// preserved inside quoted ones. Returns nil, nil when the file does not
+// exist.
 func readDotenv(path string) (map[string]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -475,7 +500,18 @@ func readDotenv(path string) (map[string]string, error) {
 			continue
 		}
 		value = strings.TrimSpace(value)
-		value = strings.Trim(value, `"'`)
+		quoted := false
+		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') {
+			if end := strings.IndexByte(value[1:], value[0]); end >= 0 {
+				value = value[1 : 1+end]
+				quoted = true
+			}
+		}
+		if !quoted {
+			if idx := strings.IndexByte(value, '#'); idx >= 0 {
+				value = strings.TrimSpace(value[:idx])
+			}
+		}
 		out[key] = value
 	}
 	return out, nil

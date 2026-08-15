@@ -470,3 +470,129 @@ func TestInvalidateRun(t *testing.T) {
 		t.Errorf("ActiveRuns = %d after Invalidate, want 0", snap.ActiveRuns)
 	}
 }
+
+// TestShutdownSkipsMidFinishRun is the regression guard for the P2
+// double-FINISH race: rotate spawns an untracked finishIfReady goroutine
+// that may be mid-FINISH (finishing=true, run on the draining list) when
+// Shutdown gathers. Shutdown must skip those runs instead of calling
+// FinishRun again for the same run id upstream.
+func TestShutdownSkipsMidFinishRun(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	lease, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(lease)
+
+	// Simulate the async rotator mid-FINISH for agentA's run (run-0001):
+	// draining with the finishing flag set — finishIfReady's upstream
+	// FINISH is in flight.
+	mgr.mu.Lock()
+	runA := mgr.runs[agentA]
+	runA.finishing = true
+	mgr.draining = append(mgr.draining, runA)
+	mgr.mu.Unlock()
+
+	// A second agent with a plain run must still be finished exactly once.
+	leaseB, err := mgr.Acquire(context.Background(), agentB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(leaseB)
+
+	mgr.Shutdown(context.Background())
+
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 1 {
+		t.Fatalf("finished runs = %v, want exactly 1 (only agentB's run)", finished)
+	}
+	if finished[0].RunID != "run-0002" {
+		t.Errorf("finished run = %q, want run-0002 (agentB); mid-FINISH run-0001 must not be re-FINISHed", finished[0].RunID)
+	}
+	if snap := mgr.Snapshot(); snap.ActiveRuns != 0 {
+		t.Errorf("active runs after shutdown = %d, want 0", snap.ActiveRuns)
+	}
+}
+
+// TestAcquireConcurrentFinishAllRuns hammers Acquire against a concurrent
+// idle FinishAllRuns, which used to surface a phantom "run missing after
+// rotation" failure whenever the run map was cleared mid-acquire. With the
+// re-validation loop every acquire either completes or fails with a real
+// error — never the cleared-map phantom.
+func TestAcquireConcurrentFinishAllRuns(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	// Generous id pool: acquires racing the idle FINISH can re-START the
+	// run several times per cleared window.
+	ids := make([]string, 2000)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("run-%04d", i)
+	}
+	mock.RunIDs = ids
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	const acquireGoroutines = 8
+	const perGoroutine = 60
+	var wg sync.WaitGroup
+	var failures atomicError
+
+	for g := 0; g < acquireGoroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				run, err := mgr.Acquire(context.Background(), agentA)
+				if err != nil {
+					failures.set(err)
+					continue
+				}
+				mgr.Release(run)
+			}
+		}()
+	}
+	for i := 0; i < 60; i++ {
+		mgr.FinishAllRuns(context.Background())
+	}
+	wg.Wait()
+
+	if err := failures.get(); err != nil {
+		t.Fatalf("acquire failed while FinishAllRuns raced: %v", err)
+	}
+}
+
+// TestSnapshotBannedUntil surfaces the ban window deadline the pool uses to
+// gate its ban risk label (fixes the sticky "critical" healthz after an
+// expired ban).
+func TestSnapshotBannedUntil(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	// InflightCount reflects outstanding leases (bridge eviction skips
+	// busy entries on it).
+	run, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.InflightCount(); got != 1 {
+		t.Errorf("InflightCount with one lease = %d, want 1", got)
+	}
+	mgr.Release(run)
+	if got := mgr.InflightCount(); got != 0 {
+		t.Errorf("InflightCount after release = %d, want 0", got)
+	}
+
+	until := time.Now().Add(10 * time.Minute)
+	mgr.CooldownBan(&upstream.BanError{Body: "banned", ResumesAt: until})
+
+	snap := mgr.Snapshot()
+	if snap.BanError == nil {
+		t.Fatal("Snapshot.BanError = nil, want non-nil during the ban window")
+	}
+	if !snap.BannedUntil.Equal(until) {
+		t.Errorf("Snapshot.BannedUntil = %v, want %v", snap.BannedUntil, until)
+	}
+}

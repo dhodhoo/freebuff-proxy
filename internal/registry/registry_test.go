@@ -3,6 +3,9 @@ package registry
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -238,6 +241,51 @@ func TestRefreshEmptySource(t *testing.T) {
 	err := r.Refresh(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "no free agents") {
 		t.Fatalf("Refresh on empty source err = %v, want 'no free agents' error", err)
+	}
+}
+
+// TestRefreshOverLimitSourceKeepsState verifies fetchText caps source reads
+// at maxFetchBytes: an over-limit source fails the refresh and the previous
+// registry state is kept.
+func TestRefreshOverLimitSourceKeepsState(t *testing.T) {
+	r := New(nil, nil)
+	r.SetSources([]string{fileSource(t, filepath.Join("testdata", "registry-fixture.ts"))})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh: %v", err)
+	}
+	before := r.Models()
+	want := expectFixture["beta/model-two"]
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", maxFetchBytes+1))
+	}))
+	defer srv.Close()
+
+	r.SetSources([]string{srv.URL})
+	err := r.Refresh(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("Refresh against over-limit source err = %v, want size-exceeded error", err)
+	}
+
+	if got := r.Models(); !reflect.DeepEqual(got, before) {
+		t.Errorf("Models after failed refresh = %v, want unchanged %v", got, before)
+	}
+	if agent, err := r.AgentForModel("beta/model-two"); err != nil || agent != want {
+		t.Errorf("AgentForModel after failed refresh = (%q, %v), want (%q, nil)", agent, err, want)
+	}
+}
+
+// TestResolveObjectPropertyRegexMetachar verifies an object alias target
+// whose property name contains regex metacharacters is skipped instead of
+// panicking inside regexp.MustCompile (P3).
+func TestResolveObjectPropertyRegexMetachar(t *testing.T) {
+	res := &constantResolver{
+		literals: map[string]string{},
+		aliases:  map[string]string{"WEIRD": "AGENTS.foo[bar"},
+		objects:  map[string]string{"AGENTS": "export const AGENTS = { good: 'ok/1' }"},
+	}
+	if got := res.resolve("WEIRD", 0); got != "" {
+		t.Errorf("resolve(object property with metachar) = %q, want \"\" (skipped)", got)
 	}
 }
 

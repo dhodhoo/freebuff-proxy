@@ -157,6 +157,80 @@ func TestExpiredCacheRefreshes(t *testing.T) {
 	}
 }
 
+// TestSingleFlightFailureBounded verifies a failed refresh is NOT amplified:
+// N concurrent callers must trigger exactly 1 upstream create and all N must
+// surface the retained refresh error (instead of each becoming the next
+// refresher and re-running the failing POST).
+func TestSingleFlightFailureBounded(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.RateLimit = true // every route returns 429 rate_limited
+	mgr := newTestManager(t, mock)
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = mgr.EnsureSession(context.Background())
+		}(i)
+	}
+	wg.Wait()
+
+	if mock.Requests != 1 {
+		t.Errorf("upstream requests = %d, want exactly 1 (single-flight failure must not amplify)", mock.Requests)
+	}
+	for i, err := range errs {
+		if err == nil {
+			t.Errorf("caller %d got nil error, want the retained refresh error", i)
+			continue
+		}
+		var rle *upstream.RateLimitError
+		if !errors.As(err, &rle) {
+			t.Errorf("caller %d error = %T %v, want RateLimitError", i, err, err)
+		}
+	}
+}
+
+// TestPoll404Recreates verifies a poll 404 is treated as ended (recreate
+// path) rather than a cached permanent "disabled": the session manager must
+// re-create the session after the upstream reports it gone.
+func TestPoll404Recreates(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionSequence = []string{"queued", "404"}
+	mock.EstimatedWaitMs = 100
+	mgr := newTestManager(t, mock)
+
+	_, err := mgr.EnsureSession(context.Background())
+	var wr *WaitingRoomError
+	if !errors.As(err, &wr) {
+		t.Fatalf("want WaitingRoomError from queued create, got %v", err)
+	}
+	if mock.SessionCreates != 1 {
+		t.Errorf("creates = %d, want 1", mock.SessionCreates)
+	}
+
+	// Wait for pollAt (queued minimum wait is 1s), then poll → 404 → ended →
+	// recreate.
+	time.Sleep(1100 * time.Millisecond)
+	instance, err := mgr.EnsureSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-abc-123" {
+		t.Errorf("instance = %q, want inst-abc-123 (recreated after poll 404)", instance)
+	}
+	if mock.SessionPolls != 1 {
+		t.Errorf("polls = %d, want 1", mock.SessionPolls)
+	}
+	if mock.SessionCreates != 2 {
+		t.Errorf("creates = %d, want 2 (poll 404 → recreate)", mock.SessionCreates)
+	}
+}
+
 func TestSingleFlight(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -395,6 +469,13 @@ func TestSnapshotModelAndExpiresAt(t *testing.T) {
 	}
 	if snap.ExpiresAt.IsZero() {
 		t.Error("ExpiresAt should not be zero")
+	}
+	// GracePeriodEndsAt (write-only cache field) is surfaced in the snapshot.
+	if snap.GracePeriodEndsAt.IsZero() {
+		t.Error("GracePeriodEndsAt should not be zero")
+	}
+	if want := snap.ExpiresAt.Add(graceWindow); !snap.GracePeriodEndsAt.Equal(want) {
+		t.Errorf("GracePeriodEndsAt = %v, want %v (expiresAt + graceWindow)", snap.GracePeriodEndsAt, want)
 	}
 }
 

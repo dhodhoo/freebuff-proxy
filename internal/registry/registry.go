@@ -40,6 +40,10 @@ var sourceFiles = []string{
 // fetchTimeout mirrors the JS fetch timeout of 30000ms.
 const fetchTimeout = 30 * time.Second
 
+// maxFetchBytes caps a single registry source read (2 MiB). A source larger
+// than this fails the fetch, which keeps the previous registry state.
+const maxFetchBytes = 2 << 20
+
 // fallbackAgents is the hardcoded model→agent fallback used when the sources
 // are unreachable. Ported verbatim from registry.js (lines 14-41), entry
 // order preserved: first-seen assignment decides which agent owns models that
@@ -268,9 +272,12 @@ func fetchText(ctx context.Context, client *http.Client, src string) (string, er
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("status %d", resp.StatusCode)
 	}
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(b) > maxFetchBytes {
+		return "", fmt.Errorf("source exceeds %d bytes", maxFetchBytes)
 	}
 	return string(b), nil
 }

@@ -59,6 +59,11 @@ type Manager struct {
 	state      *cachedState
 	refreshCh  chan struct{} // closed by the in-flight refresher when done
 	refreshing bool
+	// refreshErr retains the last refresh's error under mu so waiters parked
+	// on that refresh surface it (after one state re-check) instead of each
+	// becoming the next refresher and re-running the failing upstream create.
+	// Cleared when a new refresh starts, so a later caller retries normally.
+	refreshErr error
 }
 
 type cachedState struct {
@@ -127,30 +132,55 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 				// pollAt passed — fall through to refresh and advance.
 			}
 		}
-		singleFlight := m.refreshing
-		var refreshCh chan struct{}
-		if singleFlight {
-			refreshCh = m.refreshCh
-		} else {
-			m.refreshing = true
-			refreshCh = make(chan struct{})
-			m.refreshCh = refreshCh
-		}
-		m.mu.Unlock()
-
-		if singleFlight {
+		if m.refreshing {
+			// Another caller is the refresher: park on its completion signal.
+			refreshCh := m.refreshCh
+			m.mu.Unlock()
 			select {
 			case <-refreshCh:
-				continue // loop re-evaluates cached state
+				// The refresh finished. If it failed, surface its retained
+				// error to every waiter (after one state re-check) instead of
+				// letting each waiter become the next refresher and re-run
+				// the failing upstream create (N callers → N serial POSTs).
+				m.mu.Lock()
+				err := m.refreshErr
+				m.mu.Unlock()
+				if err != nil {
+					m.mu.Lock()
+					s = m.state
+					m.mu.Unlock()
+					// One state re-check: the failed refresh may still have
+					// advanced the queue (e.g. to queued with a future
+					// pollAt) — honor that before surfacing the error.
+					if s != nil && s.status == "queued" && time.Now().Before(s.pollAt) {
+						return "", &WaitingRoomError{
+							Position:   s.position,
+							QueueDepth: s.queueDepth,
+							RetryAfter: s.pollAt.Sub(time.Now()),
+						}
+					}
+					return "", err
+				}
+				continue // refresh succeeded; loop re-evaluates cached state
 			case <-ctx.Done():
 				return "", ctx.Err()
 			}
 		}
 
-		// We are the refresher. Run the loop outside the lock.
+		// We are the refresher. Run the create/poll loop outside the lock and
+		// clear any previously retained refresh error.
+		m.refreshing = true
+		m.refreshErr = nil
+		refreshCh := make(chan struct{})
+		m.refreshCh = refreshCh
+		m.mu.Unlock()
+
 		err := m.refresh(ctx, model)
 		m.mu.Lock()
 		m.refreshing = false
+		if err != nil {
+			m.refreshErr = err
+		}
 		close(m.refreshCh)
 		m.refreshCh = nil
 		m.mu.Unlock()
@@ -327,6 +357,9 @@ type SessionSnapshot struct {
 	TierCountry        string
 	CountryBlockReason string
 	ExpiresAt          time.Time
+	// GracePeriodEndsAt is when the 30-minute drain window after ExpiresAt
+	// closes (previously computed but never surfaced).
+	GracePeriodEndsAt time.Time
 	// QuotaByModel carries the live per-model session quotas (key = model id).
 	// Entitlement is a top-level per-token view; it stays empty because the
 	// upstream wire nests entitlement inside each rate-limit entry.
@@ -375,6 +408,7 @@ func (m *Manager) Snapshot() SessionSnapshot {
 		TierCountry:        m.state.countryCode,
 		CountryBlockReason: m.state.countryBlockReason,
 		ExpiresAt:          m.state.expiresAt,
+		GracePeriodEndsAt:  m.state.gracePeriodEndsAt,
 		QuotaByModel:       quota,
 	}
 }

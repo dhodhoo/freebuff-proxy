@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +18,7 @@ var envKeys = []string{
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "HTTP_PROXY",
 	"SOCKS5_PROXY", "SOCKS5_PROXIES", "COST_MODE", "TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES", "AUTO_DISCOVER_TOKEN",
-	"TRANSIENT_RETRIES",
+	"TRANSIENT_RETRIES", "ADMIN_TOKEN",
 }
 
 func clearEnv(t *testing.T) {
@@ -595,6 +597,51 @@ func TestDotenvJSONWins(t *testing.T) {
 	}
 }
 
+// TestAdminToken verifies ADMIN_TOKEN loads from env, JSON config, and .env
+// with the standard precedence (env > .env > JSON).
+func TestAdminToken(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("ADMIN_TOKEN", "from-env")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load (env): %v", err)
+	}
+	if cfg.AdminToken != "from-env" {
+		t.Errorf("AdminToken = %q, want from-env (env)", cfg.AdminToken)
+	}
+
+	// JSON file value loses to the environment.
+	if err := os.WriteFile("cfg.json", []byte(`{"ADMIN_TOKEN":"from-json"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load("cfg.json")
+	if err != nil {
+		t.Fatalf("Load (json): %v", err)
+	}
+	if cfg.AdminToken != "from-env" {
+		t.Errorf("AdminToken = %q, want from-env (env beats JSON)", cfg.AdminToken)
+	}
+
+	// dotenv value applies when the environment is empty, and wins over JSON.
+	clearEnv(t)
+	if err := os.WriteFile(".env", []byte("ADMIN_TOKEN=from-dotenv\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// clearEnv chdirs to a fresh temp dir, so the cfg.json written above is
+	// no longer in the working directory; re-write it next to .env.
+	if err := os.WriteFile("cfg.json", []byte(`{"ADMIN_TOKEN":"from-json"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load("cfg.json")
+	if err != nil {
+		t.Fatalf("Load (dotenv): %v", err)
+	}
+	if cfg.AdminToken != "from-dotenv" {
+		t.Errorf("AdminToken = %q, want from-dotenv (.env beats JSON)", cfg.AdminToken)
+	}
+}
+
 func TestDotenvMissingIsFine(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("AUTH_TOKENS", "tok-1")
@@ -886,5 +933,160 @@ func TestModelAliasesConfig(t *testing.T) {
 	}
 	if cfg.ModelAliases["gpt-4o"] != "deepseek/deepseek-v4-flash" {
 		t.Errorf("ModelAliases[gpt-4o] = %q, want deepseek/deepseek-v4-flash", cfg.ModelAliases["gpt-4o"])
+	}
+}
+
+// TestDotenvFullKeySet verifies every env-overridable key also lands in cfg
+// when set in ./.env. Regression: SAFE_MODE, REQUEST_JITTER, CLI_VERSION,
+// MODEL_ALIASES, TRANSIENT_RETRIES and PROXY_ROTATION were silently ignored
+// in .env (SOCKS5_PROXIES was already covered by TestDotenvSOCKS5Proxies).
+func TestDotenvFullKeySet(t *testing.T) {
+	clearEnv(t)
+
+	content := strings.Join([]string{
+		"SAFE_MODE=false",
+		"REQUEST_JITTER=5s",
+		"CLI_VERSION=9.9.9",
+		"MODEL_ALIASES=gpt-4o:deepseek/deepseek-v4-flash,glm:z-ai/glm-5.2",
+		"TRANSIENT_RETRIES=2",
+		"PROXY_ROTATION=round-robin",
+	}, "\n")
+	if err := os.WriteFile(".env", []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SafeMode {
+		t.Error("SafeMode = true, want false (from .env)")
+	}
+	if cfg.RequestJitter != 5*time.Second {
+		t.Errorf("RequestJitter = %v, want 5s (from .env)", cfg.RequestJitter)
+	}
+	if cfg.CLIVersion != "9.9.9" {
+		t.Errorf("CLIVersion = %q, want 9.9.9 (from .env)", cfg.CLIVersion)
+	}
+	if cfg.ModelAliases["gpt-4o"] != "deepseek/deepseek-v4-flash" {
+		t.Errorf("ModelAliases[gpt-4o] = %q, want deepseek/deepseek-v4-flash (from .env)", cfg.ModelAliases["gpt-4o"])
+	}
+	if cfg.TransientRetries != 2 {
+		t.Errorf("TransientRetries = %d, want 2 (from .env)", cfg.TransientRetries)
+	}
+	if cfg.ProxyRotation != "round-robin" {
+		t.Errorf("ProxyRotation = %q, want round-robin (from .env)", cfg.ProxyRotation)
+	}
+}
+
+// TestDotenvFullKeySetEnvWins verifies the real environment still beats the
+// .env file for the newly mirrored keys.
+func TestDotenvFullKeySetEnvWins(t *testing.T) {
+	clearEnv(t)
+
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\nPROXY_ROTATION=round-robin\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SAFE_MODE", "true")
+	t.Setenv("CLI_VERSION", "1.2.3")
+	t.Setenv("TRANSIENT_RETRIES", "5")
+	t.Setenv("PROXY_ROTATION", "random")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.SafeMode {
+		t.Error("SafeMode = false, want true (env wins over .env)")
+	}
+	if cfg.CLIVersion != "1.2.3" {
+		t.Errorf("CLIVersion = %q, want 1.2.3 (env wins)", cfg.CLIVersion)
+	}
+	if cfg.TransientRetries != 5 {
+		t.Errorf("TransientRetries = %d, want 5 (env wins)", cfg.TransientRetries)
+	}
+	if cfg.ProxyRotation != "random" {
+		t.Errorf("ProxyRotation = %q, want random (env wins)", cfg.ProxyRotation)
+	}
+}
+
+// TestAutoDiscoverWarnsOnBridgeToPooled verifies that auto-discovery filling
+// an empty AUTH_TOKENS (which silently flips bridge mode to pooled mode)
+// emits a prominent slog warning naming the source file and the off switch.
+func TestAutoDiscoverWarnsOnBridgeToPooled(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "cb_discovered" {
+		t.Fatalf("AuthTokens = %v, want [cb_discovered] (auto-discovered)", got)
+	}
+	if cfg.DiscoveredSource == "" {
+		t.Fatal("DiscoveredSource = empty, want the credentials file path")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "AUTO_DISCOVER_TOKEN=false") {
+		t.Errorf("warning missing disable hint (AUTO_DISCOVER_TOKEN=false), got: %q", out)
+	}
+	if !strings.Contains(out, "manicode") {
+		t.Errorf("warning missing source file name, got: %q", out)
+	}
+}
+
+func TestReadDotenvQuotingAndComments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	content := strings.Join([]string{
+		`KEY=value # inline comment`,
+		`QUOTED="a b # kept"`,
+		`PAIR='single quoted'`,
+		`TRAILING="a b" # comment`,
+		`UNMATCHED="stray`,
+		`EMPTY=""`,
+		`RAW=a"b`,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readDotenv(path)
+	if err != nil {
+		t.Fatalf("readDotenv: %v", err)
+	}
+	want := map[string]string{
+		"KEY":       "value",
+		"QUOTED":    "a b # kept",
+		"PAIR":      "single quoted",
+		"TRAILING":  "a b",
+		"UNMATCHED": `"stray`,
+		"EMPTY":     "",
+		"RAW":       `a"b`,
+	}
+	for k, wantVal := range want {
+		if got[k] != wantVal {
+			t.Errorf("readDotenv[%q] = %q, want %q", k, got[k], wantVal)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("readDotenv returned %d keys, want %d", len(got), len(want))
 	}
 }

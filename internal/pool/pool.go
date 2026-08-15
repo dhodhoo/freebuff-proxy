@@ -616,7 +616,10 @@ func (p *Pool) Start(ctx context.Context) {
 }
 
 // Shutdown stops the background jobs and drains every token: FINISH all
-// runs, end the sessions, bounded by a 10s force deadline per token.
+// runs, end the sessions, bounded by a 10s force deadline per token. Cached
+// bridge entries (bridge mode) are drained best-effort the same way after
+// the fixed tokens: FINISH all runs and end each entry's session so no
+// upstream activity is left behind.
 func (p *Pool) Shutdown(ctx context.Context) {
 	if p.cancel != nil {
 		p.cancel()
@@ -632,6 +635,27 @@ func (p *Pool) Shutdown(ctx context.Context) {
 			errs = append(errs, fmt.Sprintf("token-%d: %d runs left after shutdown", i+1, snap.ActiveRuns))
 		}
 	}
+
+	// Drain the cached bridge entries best-effort. The maintain loop is
+	// already stopped (wg.Wait above), so the entry list is stable.
+	p.bridgeMu.Lock()
+	entries := make([]*bridgeEntry, 0, len(p.bridge))
+	for _, entry := range p.bridge {
+		entries = append(entries, entry)
+	}
+	p.bridgeMu.Unlock()
+	for _, entry := range entries {
+		entryCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
+		entry.runs.FinishAllRuns(entryCtx)
+		if snap := entry.runs.Snapshot(); snap.ActiveRuns > 0 {
+			errs = append(errs, fmt.Sprintf("bridge %s: %d runs left after shutdown", entry.token, snap.ActiveRuns))
+		}
+		if err := entry.session.EndSession(entryCtx); err != nil {
+			errs = append(errs, fmt.Sprintf("bridge %s: end session: %v", entry.token, err))
+		}
+		cancel()
+	}
+
 	if len(errs) > 0 {
 		slog.Warn("pool: shutdown incomplete", "errors", strings.Join(errs, "; "))
 	}
@@ -656,10 +680,15 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 
 		riskLevel := "low"
 		switch {
+		// Ban is checked first: CooldownBan fills the shared cooldown
+		// deadline, so the cooldown case below would otherwise shadow a
+		// banned token as "high". The ban risk is gated on the ban window
+		// still being active (BannedUntil) so an expired ban does not stay
+		// sticky "critical" forever.
+		case rs.BanError != nil && time.Now().Before(rs.BannedUntil):
+			riskLevel = "critical"
 		case !rs.CooldownUntil.IsZero() && time.Now().Before(rs.CooldownUntil):
 			riskLevel = "high"
-		case rs.BanError != nil:
-			riskLevel = "critical"
 		case dailyLimit > 0 && usagePct >= 90:
 			riskLevel = "critical"
 		case dailyLimit > 0 && usagePct >= 70:
@@ -844,13 +873,35 @@ func (p *Pool) bridgeTouch(clientToken string) {
 func (p *Pool) bridgeEvictLocked() []*bridgeEntry {
 	var victims []*bridgeEntry
 	for len(p.bridgeOrder) > maxBridgeEntries {
-		oldest := p.bridgeOrder[0]
-		if entry, ok := p.bridge[oldest]; ok {
+		// Scan from the LRU end for an entry WITHOUT outstanding leases:
+		// FINISHing the run of an entry that still serves a request would
+		// kill the in-flight chat. Busy entries are left in the cache for
+		// the idle sweep (bridgeMaintain) once their leases drain; when
+		// every entry is busy, nothing is evicted this pass.
+		evicted := false
+		for i := 0; i < len(p.bridgeOrder); {
+			oldest := p.bridgeOrder[i]
+			entry, ok := p.bridge[oldest]
+			if !ok {
+				// Stale LRU token (cache entry dropped elsewhere): trim it
+				// and keep scanning.
+				p.bridgeOrder = removeBridgeOrder(p.bridgeOrder, oldest)
+				continue
+			}
+			if entry.runs.InflightCount() > 0 {
+				i++
+				continue
+			}
 			victims = append(victims, entry)
+			delete(p.bridge, oldest)
+			p.bridgeOrder = removeBridgeOrder(p.bridgeOrder, oldest)
+			p.logger.Debug("pool: bridge entry evicted (cache full)", "bridge_entries", len(p.bridge))
+			evicted = true
+			break
 		}
-		delete(p.bridge, oldest)
-		p.bridgeOrder = p.bridgeOrder[1:]
-		p.logger.Debug("pool: bridge entry evicted (cache full)", "bridge_entries", len(p.bridge))
+		if !evicted {
+			break
+		}
 	}
 	return victims
 }
@@ -1021,7 +1072,10 @@ func (p *Pool) maintainTick(ctx context.Context) {
 			return
 		}
 		for _, tok := range p.toks {
-			tok.runs.FinishAllRuns(context.Background())
+			// Thread the maintain ctx: Pool.Shutdown cancels it first, so a
+			// mid-drain FINISH must abort on cancel instead of blocking
+			// shutdown for the full upstream call timeout.
+			tok.runs.FinishAllRuns(ctx)
 		}
 		return
 	}
@@ -1077,7 +1131,7 @@ func (p *Pool) bridgeMaintain(ctx context.Context) {
 	p.bridgeMu.Unlock()
 
 	for _, entry := range toEvict {
-		entry.runs.FinishAllRuns(context.Background())
+		entry.runs.FinishAllRuns(ctx)
 	}
 	for _, entry := range toMaintain {
 		// Same cooldown skip as the fixed-token loop: no heartbeat, no

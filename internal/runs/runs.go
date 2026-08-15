@@ -15,7 +15,6 @@ package runs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -52,6 +51,10 @@ type RunSnapshot struct {
 	CooldownUntil time.Time
 	Requests      int
 	BanError      *upstream.BanError
+	// BannedUntil is the ban window deadline; BanError is only "live"
+	// while now < BannedUntil (mirrors BanError()'s time check). The pool
+	// gates its ban risk label on it so an expired ban is not sticky.
+	BannedUntil time.Time
 }
 
 // RunManager owns the current runs (one per agent) plus the draining list
@@ -103,34 +106,50 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*Run, error) 
 		return nil, err
 	}
 
-	m.mu.Lock()
-	if now := time.Now(); now.Before(m.cooldownUntil) {
-		until := m.cooldownUntil
+	// The re-validation loop converges: an idle FinishAllRuns (or a
+	// concurrent Shutdown) may clear the run map between the initial read
+	// and the re-read below, which would otherwise surface a phantom
+	// "run missing after rotation" failure to the caller. Each pass either
+	// returns a lease or re-creates the current run under the manager
+	// mutex, so a cleared map is re-populated on the next iteration.
+	// FinishAllRuns clears at most once per idle stretch, so production
+	// converges in one retry; ctx cancellation bounds the loop.
+	for {
+		m.mu.Lock()
+		if now := time.Now(); now.Before(m.cooldownUntil) {
+			until := m.cooldownUntil
+			m.mu.Unlock()
+			return nil, fmt.Errorf("token cooling down until %s", until.Format(time.RFC3339))
+		}
+		run := m.runs[agentID]
+		needsRotate := run == nil || time.Since(run.StartedAt) >= m.rotationInterval
 		m.mu.Unlock()
-		return nil, fmt.Errorf("token cooling down until %s", until.Format(time.RFC3339))
-	}
-	run := m.runs[agentID]
-	needsRotate := run == nil || time.Since(run.StartedAt) >= m.rotationInterval
-	m.mu.Unlock()
 
-	if needsRotate {
-		if err := m.rotate(ctx, agentID); err != nil {
+		if needsRotate {
+			if err := m.rotate(ctx, agentID); err != nil {
+				return nil, err
+			}
+		}
+
+		m.mu.Lock()
+		// A concurrent acquire may have rotated again while we were
+		// starting; the lease must always point at the current run.
+		run = m.runs[agentID]
+		if run != nil {
+			run.inflight++
+			run.Requests++
+			m.totalRequests++
+			m.mu.Unlock()
+			return run, nil
+		}
+		m.mu.Unlock()
+
+		// The current run vanished mid-acquire (concurrent FinishAllRuns);
+		// loop and re-validate instead of failing the request.
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// A concurrent acquire may have rotated again while we were starting;
-	// the lease must always point at the current run.
-	run = m.runs[agentID]
-	if run == nil {
-		return nil, errors.New("run missing after rotation")
-	}
-	run.inflight++
-	run.Requests++
-	m.totalRequests++
-	return run, nil
 }
 
 // Release decrements the inflight counter of a leased run. Safe on nil.
@@ -144,6 +163,23 @@ func (m *RunManager) Release(run *Run) {
 		run.inflight--
 	}
 	m.mu.Unlock()
+}
+
+// InflightCount returns the number of outstanding leases across all runs
+// (active and draining). The pool uses it to skip evicting bridge entries
+// whose run is still serving a request: FINISHing such a run would kill the
+// in-flight chat, so those entries are left for the idle sweep instead.
+func (m *RunManager) InflightCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, run := range m.runs {
+		n += run.inflight
+	}
+	for _, run := range m.draining {
+		n += run.inflight
+	}
+	return n
 }
 
 // FinishRun FINISHes the run upstream with the given step accounting and
@@ -208,11 +244,26 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 	}
 
 	m.mu.Lock()
+	// Skip runs with a FINISH already in flight (an async rotate drain
+	// owns them): re-FINISHing the same run id upstream is a duplicate
+	// call the drain goroutine is already completing. Claim the rest by
+	// setting finishing so a concurrently starting finishIfReady cannot
+	// double-FINISH a run we are about to finish here.
 	all := make([]*Run, 0, len(m.runs)+len(m.draining))
 	for _, run := range m.runs {
+		if run.finishing {
+			continue
+		}
+		run.finishing = true
 		all = append(all, run)
 	}
-	all = append(all, m.draining...)
+	for _, run := range m.draining {
+		if run.finishing {
+			continue
+		}
+		run.finishing = true
+		all = append(all, run)
+	}
 	m.runs = make(map[string]*Run)
 	m.draining = nil
 	m.mu.Unlock()
@@ -353,7 +404,7 @@ func (m *RunManager) BanError() *upstream.BanError {
 func (m *RunManager) Snapshot() RunSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s := RunSnapshot{ActiveRuns: len(m.runs), CooldownUntil: m.cooldownUntil, Requests: m.totalRequests, BanError: m.ban}
+	s := RunSnapshot{ActiveRuns: len(m.runs), CooldownUntil: m.cooldownUntil, Requests: m.totalRequests, BanError: m.ban, BannedUntil: m.banUntil}
 	return s
 }
 

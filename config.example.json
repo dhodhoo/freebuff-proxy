@@ -7,6 +7,7 @@
   "SESSION_CALL_TIMEOUT": "30s",
   "REGISTRY_REFRESH": "6h",
   "API_KEYS": [],
+  "ADMIN_TOKEN": "",
   "HTTP_PROXY": "",
   "SOCKS5_PROXY": "",
   "COST_MODE": "free",

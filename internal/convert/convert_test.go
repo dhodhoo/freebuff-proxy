@@ -371,6 +371,103 @@ func TestNormalizeRequestSchemaDepthCap(t *testing.T) {
 	})
 }
 
+func TestNormalizeRequestSchemaNodeBudget(t *testing.T) {
+	// Shrink the per-request node budget so the pathological case below is
+	// small enough to build cheaply; restore for the rest of the package.
+	old := maxSchemaNodes
+	maxSchemaNodes = 32
+	t.Cleanup(func() { maxSchemaNodes = old })
+
+	// Valid output preserved: a small schema (5 nodes) still normalizes
+	// fully under the budget.
+	shortDefs := map[string]any{
+		"D0": map[string]any{"$ref": "#/definitions/D1"},
+		"D1": map[string]any{"$ref": "#/definitions/D2"},
+		"D2": map[string]any{"type": "integer"},
+	}
+	short := map[string]any{
+		"type":        "object",
+		"properties":  map[string]any{"a": map[string]any{"$ref": "#/definitions/D0"}},
+		"definitions": shortDefs,
+	}
+	body := map[string]any{
+		"model":    "m",
+		"messages": []any{},
+		"tools": []any{map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": "f", "parameters": short},
+		}},
+	}
+	out, err := NormalizeRequest(mustJSON(t, body), "")
+	if err != nil {
+		t.Fatalf("NormalizeRequest (small schema): %v", err)
+	}
+	got := decode(t, out)
+	fn := got["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	assertJSONEq(t, mustJSON(t, fn["parameters"]), map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"a": map[string]any{"type": "integer"}},
+	})
+
+	// Pathological schema: a wide tree far exceeding the budget, with a
+	// normalization-triggering key ("nullable", dropped by normalization) on
+	// every leaf. The budget must stop normalization partway (early leaves
+	// normalized, the vast majority returned unchanged) instead of re-copying
+	// the subtree at every ancestor up to maxSchemaDepth.
+	wide := map[string]any{
+		"type":        "object",
+		"definitions": map[string]any{"Unused": map[string]any{"type": "string"}},
+		"properties":  map[string]any{},
+	}
+	for i := 0; i < 100; i++ {
+		child := map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		}
+		for j := 0; j < 100; j++ {
+			child["properties"].(map[string]any)[fmt.Sprintf("p%d_%d", i, j)] =
+				map[string]any{"type": "string", "nullable": true}
+		}
+		wide["properties"].(map[string]any)[fmt.Sprintf("o%d", i)] = child
+	}
+	body["tools"] = []any{map[string]any{
+		"type":     "function",
+		"function": map[string]any{"name": "f", "parameters": wide},
+	}}
+	out, err = NormalizeRequest(mustJSON(t, body), "")
+	if err != nil {
+		t.Fatalf("NormalizeRequest (pathological schema): %v", err)
+	}
+	got = decode(t, out)
+	fn = got["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	// Normalization ran at the root (definitions dropped) and the untouched
+	// remainder is still structurally intact.
+	params := fn["parameters"].(map[string]any)
+	if _, ok := params["definitions"]; ok {
+		t.Error("root definitions survived normalization")
+	}
+	props := params["properties"].(map[string]any)
+	if len(props) != 100 {
+		t.Fatalf("properties = %d entries, want 100 (untouched remainder)", len(props))
+	}
+	total, normalized := 0, 0
+	for _, o := range props {
+		child := o.(map[string]any)
+		for _, p := range child["properties"].(map[string]any) {
+			total++
+			if _, dropped := p.(map[string]any)["nullable"]; !dropped {
+				normalized++
+			}
+		}
+	}
+	if normalized == 0 {
+		t.Error("no leaf was normalized before the budget exhausted")
+	}
+	if normalized == total {
+		t.Error("every leaf was normalized — the node budget did not stop early")
+	}
+}
+
 func TestNormalizeRequestNestedDefinitionsMerge(t *testing.T) {
 	// Definitions carried by a mid-tree node are merged into the table and
 	// resolvable by deeper refs.

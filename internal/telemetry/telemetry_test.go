@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // closeLogFile closes the log file held by a NewLogger result so TempDir
@@ -164,87 +164,6 @@ func TestRedactHeadersNonCanonicalKey(t *testing.T) {
 	}
 }
 
-func TestDumpRequest(t *testing.T) {
-	_ = os.RemoveAll("dump")
-	t.Cleanup(func() { _ = os.RemoveAll("dump") })
-
-	req, err := http.NewRequest(http.MethodPost, "http://example.com/v1/chat/completions", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer secret")
-	req.Header.Set("Content-Type", "application/json")
-	body := strings.Repeat("x", 21000)
-
-	DumpRequest("chat", req, 200, body, true)
-
-	entries, err := filepath.Glob(filepath.Join("dump", "chat-*.dump"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("expected exactly one dump file, got %v", entries)
-	}
-	if !strings.Contains(filepath.Base(entries[0]), "_v1_chat_completions") {
-		t.Errorf("dump name %q missing sanitized path", filepath.Base(entries[0]))
-	}
-
-	data, err := os.ReadFile(entries[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	content := string(data)
-	if !strings.Contains(content, "POST http://example.com/v1/chat/completions") {
-		t.Errorf("dump missing request line: %q", content)
-	}
-	if !strings.Contains(content, "Authorization: [redacted]") {
-		t.Errorf("dump missing redacted Authorization: %q", content)
-	}
-	if !strings.Contains(content, "Content-Type: application/json") {
-		t.Errorf("dump lost non-sensitive header: %q", content)
-	}
-	if !strings.Contains(content, "[status 200]") {
-		t.Errorf("dump missing status block: %q", content)
-	}
-	if !strings.Contains(content, strings.Repeat("x", 20000)) {
-		t.Error("dump missing truncated body")
-	}
-	if strings.Contains(content, strings.Repeat("x", 20001)) {
-		t.Error("dump body not truncated at 20000")
-	}
-
-	// Permission bits are only meaningful off Windows (Go synthesizes 0666
-	// there); CI runs the exact 0600 check on Linux.
-	if runtime.GOOS != "windows" {
-		fi, err := os.Stat(entries[0])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := fi.Mode().Perm(); got != 0o600 {
-			t.Errorf("dump mode = %o, want 600", got)
-		}
-	}
-}
-
-func TestDumpRequestDisabled(t *testing.T) {
-	_ = os.RemoveAll("dump")
-	t.Cleanup(func() { _ = os.RemoveAll("dump") })
-
-	req, err := http.NewRequest(http.MethodGet, "http://example.com/v1/models", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	DumpRequest("chat-disabled", req, 200, "x", false)
-
-	entries, err := filepath.Glob(filepath.Join("dump", "chat-disabled-*.dump"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("dump written while disabled: %v", entries)
-	}
-}
-
 func TestParseLevel(t *testing.T) {
 	if _, ok := ParseLevel(""); ok {
 		t.Error(`ParseLevel("") ok=true, want false`)
@@ -257,5 +176,49 @@ func TestParseLevel(t *testing.T) {
 	}
 	if _, ok := ParseLevel("bogus"); ok {
 		t.Error("ParseLevel(bogus) ok=true, want false")
+	}
+}
+
+func TestSanitizeName(t *testing.T) {
+	input := `a\b:c*d?e"f<g>h|i`
+	got := sanitizeName(input)
+	for _, r := range got {
+		if strings.ContainsRune(`/\:*?"<>|.`, r) {
+			t.Errorf("sanitizeName(%q) = %q, contains invalid file-name char %q", input, got, r)
+		}
+	}
+	if len(got) > 60 {
+		t.Errorf("sanitizeName(%q) length = %d, want <= 60", input, len(got))
+	}
+}
+
+func TestTruncateUTF8Safe(t *testing.T) {
+	// 50 multi-byte runes (100 bytes): byte slicing would split a rune.
+	s := strings.Repeat("é", 50)
+	got := truncate(s, 10)
+	if n := len([]rune(got)); n != 13 {
+		t.Errorf("truncate(50×é, 10) = %d runes, want 13 (10 + ellipsis)", n)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("truncate(50×é, 10) = %q, want ellipsis suffix", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("truncate(50×é, 10) = %q, want valid UTF-8", got)
+	}
+
+	if short := truncate("abc", 5); short != "abc" {
+		t.Errorf("truncate(abc, 5) = %q, want abc (unchanged)", short)
+	}
+}
+
+func TestColorizeWhenLogFileFailsToOpen(t *testing.T) {
+	// A log file in a nonexistent directory cannot be opened; the logger
+	// falls back to stderr-only and must keep its ANSI colors.
+	out := captureStderr(t, func() {
+		logger := NewLogger(true, filepath.Join(t.TempDir(), "no-such-dir", "x.log"))
+		logger.Info("still-colored")
+	})
+	if !strings.Contains(out, "\x1b[32mINFO\x1b[0m") {
+		t.Errorf("stderr lost colors after log file open failure: %q", out)
 	}
 }

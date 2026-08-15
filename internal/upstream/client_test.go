@@ -418,18 +418,30 @@ func TestSessionCallParsesRateLimitsByModel(t *testing.T) {
 	}
 }
 
-func TestGetSession404IsDisabled(t *testing.T) {
+func TestSession404Mapping(t *testing.T) {
+	// A create 404 means no session slot exists upstream → disabled.
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mock.SessionMode = "404"
 
 	client, _ := New("tok", testConfig(mock.URL(), nil))
-	st, err := client.GetSession(context.Background(), "inst-gone")
+	st, err := client.CreateSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Status != "disabled" {
-		t.Errorf("status = %q, want disabled (404 mapping)", st.Status)
+		t.Errorf("create 404 status = %q, want disabled", st.Status)
+	}
+
+	// A poll 404 means the session vanished upstream (expired/evicted) →
+	// ended (recreate path), NOT a permanent disabled (which the session
+	// manager would cache with no expiry, disabling the token forever).
+	polled, err := client.GetSession(context.Background(), "inst-gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polled.Status != "ended" {
+		t.Errorf("poll 404 status = %q, want ended", polled.Status)
 	}
 }
 
@@ -761,6 +773,233 @@ func TestClassifyBan(t *testing.T) {
 	var ue *UpstreamError
 	if !errors.As(err3, &ue) {
 		t.Fatalf("want UpstreamError, got %v", err3)
+	}
+}
+
+// TestClassifyBanUnixMsResumesAt verifies parseBan decodes a unix-ms
+// resumes_at (not just RFC3339): flex-time parsing must recover the unban
+// time so the cooldown ends when the ban actually lifts.
+func TestClassifyBanUnixMsResumesAt(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want time.Time
+	}{
+		{"unix milliseconds", `{"status":"banned","resumes_at":1753075087000}`, time.UnixMilli(1753075087000)},
+		{"unix seconds", `{"status":"banned","resumes_at":1753075087}`, time.Unix(1753075087, 0)},
+		{"rfc3339", `{"status":"banned","resumes_at":"2026-07-21T09:18:07+00:00"}`, time.Date(2026, 7, 21, 9, 18, 7, 0, time.UTC)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := classifyError(403, tc.body, http.Header{})
+			var be *BanError
+			if !errors.As(err, &be) {
+				t.Fatalf("want *BanError, got %v", err)
+			}
+			if !be.ResumesAt.Equal(tc.want) {
+				t.Errorf("ResumesAt = %v, want %v", be.ResumesAt, tc.want)
+			}
+		})
+	}
+}
+
+// TestStealthProfileResolvedOncePerRequest verifies that for TLS_FINGERPRINT
+// auto/random the concrete profile is resolved ONCE per request: newRequest
+// stashes it (and applies its headers), and the dialer reads the same stash
+// for the ClientHello — so headers and TLS fingerprint never mismatch.
+func TestStealthProfileResolvedOncePerRequest(t *testing.T) {
+	client, err := New("tok-a", testConfig("", func(c *config.Config) { c.TLSFingerprint = "auto" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := client.newRequest(context.Background(), http.MethodGet, "/api/v1/freebuff/session", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stashed := stealthProfileFrom(req.Context())
+	if stashed == nil {
+		t.Fatal("no concrete profile stashed in the request context")
+	}
+	if stashed.ID == stealth.ProfileIDAuto || stashed.ID == stealth.ProfileIDRandom {
+		t.Fatalf("stashed profile %s is not concrete (auto must resolve once)", stashed.ID)
+	}
+	// The browser headers were applied from the SAME concrete profile.
+	if got := req.Header.Get("User-Agent"); got != stashed.UserAgent {
+		t.Errorf("request User-Agent %q != stashed profile User-Agent %q", got, stashed.UserAgent)
+	}
+	// The dialer must use the stashed profile for this request's dial.
+	if dial := client.dialProfileFor(req.Context()); dial != stashed {
+		t.Errorf("dialProfileFor(request ctx) = %p (%s), want the stashed profile %p", dial, dial.ID, stashed)
+	}
+	// A bare context (no stash) falls back to the unresolved profile; the
+	// dialer resolves it per connection (pre-fix behavior for dials that
+	// never went through newRequest).
+	if dial := client.dialProfileFor(context.Background()); dial != stealth.ProfileAuto {
+		t.Errorf("dialProfileFor(bare ctx) = %v, want ProfileAuto (dialer resolves per connection)", dial)
+	}
+	// Pinned profiles keep working unchanged.
+	pinned, err := New("tok-a", testConfig("", func(c *config.Config) { c.TLSFingerprint = "chrome126" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dial := pinned.dialProfileFor(context.Background()); dial != stealth.ProfileChrome126 {
+		t.Errorf("pinned dialProfileFor = %s, want chrome126", dial.ID)
+	}
+}
+
+// TestTransientRetriesNotCountedWhenRetryCannotFire verifies the transient
+// retry counter only counts retries that actually fire: no GetBody (GET) and
+// a failed body replay must both leave the counter at 0.
+func TestTransientRetriesNotCountedWhenRetryCannotFire(t *testing.T) {
+	t.Run("nil GetBody never counts", func(t *testing.T) {
+		client, rt := newRetryClient(t, "", 1, "")
+		rt.failN = 1
+		rt.err = errors.New("tls handshake failed")
+
+		req, err := client.newRequest(context.Background(), http.MethodGet, "/api/v1/freebuff/session", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.GetBody != nil {
+			t.Fatal("GET request should have nil GetBody")
+		}
+		req.Body = http.NoBody // GETs carry no body; the transport needs a non-nil reader
+		resp, cancel, err := client.do(req, time.Second)
+		if err == nil {
+			_ = resp.Body.Close()
+			releaseCancel(cancel)
+			t.Fatal("want error (no retry possible for nil GetBody)")
+		}
+		if rt.calls != 1 {
+			t.Errorf("upstream attempts = %d, want 1 (no retry for nil GetBody)", rt.calls)
+		}
+		if got := client.TransientRetries(); got != 0 {
+			t.Errorf("TransientRetries = %d, want 0", got)
+		}
+	})
+
+	t.Run("failed body replay never counts", func(t *testing.T) {
+		client, rt := newRetryClient(t, "", 1, "")
+		rt.failN = 1
+		rt.err = errors.New("tls handshake failed")
+
+		req, err := client.newRequest(context.Background(), http.MethodPost, "/api/v1/freebuff/session", []byte("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.GetBody = func() (io.ReadCloser, error) { return nil, errors.New("replay unavailable") }
+		resp, cancel, err := client.do(req, time.Second)
+		if err == nil {
+			_ = resp.Body.Close()
+			releaseCancel(cancel)
+			t.Fatal("want error when replay fails and no retry fires")
+		}
+		if got := client.TransientRetries(); got != 0 {
+			t.Errorf("TransientRetries = %d, want 0 (counted only after successful replay)", got)
+		}
+	})
+}
+
+// TestPacificMidnightFallback pins the tzdata-less fallback: Pacific is
+// UTC-7 (07:00 UTC midnight) March-November and UTC-8 (08:00 UTC) otherwise.
+func TestPacificMidnightFallback(t *testing.T) {
+	jan := time.Date(2026, time.January, 15, 12, 0, 0, 0, time.UTC)
+	if got := pacificMidnightFallback(jan); got.Hour() != 8 {
+		t.Errorf("January fallback hour = %d, want 8 (PST)", got.Hour())
+	}
+	jul := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	if got := pacificMidnightFallback(jul); got.Hour() != 7 {
+		t.Errorf("July fallback hour = %d, want 7 (PDT)", got.Hour())
+	}
+	if !pacificMidnightFallback(jan).After(jan) || !pacificMidnightFallback(jul).After(jul) {
+		t.Error("fallback must return a time after the reference now")
+	}
+}
+
+func TestProxyRotationRoundRobin(t *testing.T) {
+	client, err := New("tok-a", testConfig("", func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
+		c.ProxyRotation = "round-robin"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.socksProxies) != 2 || len(client.socksDialers) != 2 {
+		t.Fatalf("proxies = %v, dialers = %d, want 2 each", client.socksProxies, len(client.socksDialers))
+	}
+
+	got := make([]int, 0, 5)
+	for i := 0; i < 5; i++ {
+		req, err := client.newRequest(context.Background(), http.MethodGet, "/api/v1/freebuff/session", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		idx, ok := req.Context().Value(proxyIndexKey{}).(int)
+		if !ok {
+			t.Fatal("proxy index not stashed in request context")
+		}
+		got = append(got, idx)
+	}
+	want := []int{0, 1, 0, 1, 0}
+	if len(got) != len(want) {
+		t.Fatalf("rotation sequence = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("rotation sequence = %v, want %v (consecutive requests must alternate)", got, want)
+			break
+		}
+	}
+}
+
+func TestProxyRotationRandom(t *testing.T) {
+	client, err := New("tok-a", testConfig("", func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
+		c.ProxyRotation = "random"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int]int{}
+	for i := 0; i < 40; i++ {
+		req, err := client.newRequest(context.Background(), http.MethodGet, "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		idx, ok := req.Context().Value(proxyIndexKey{}).(int)
+		if !ok {
+			t.Fatal("proxy index not stashed in request context")
+		}
+		seen[idx]++
+	}
+	if len(seen) != 2 {
+		t.Errorf("random rotation used %d proxies across 40 requests, want both", len(seen))
+	}
+}
+
+func TestProxyIndexFor(t *testing.T) {
+	cfg := testConfig("", func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002", "socks5://127.0.0.1:1003"}
+	})
+	// No stash → per-token binding (token tokenIndex → proxy tokenIndex % n).
+	c0, err := New("tok", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c0.proxyIndexFor(context.Background()); got != 0 {
+		t.Errorf("per-token (index 0) = %d, want 0", got)
+	}
+	c2, err := NewWithIndex("tok", 2, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c2.proxyIndexFor(context.Background()); got != 2 {
+		t.Errorf("per-token (index 2) = %d, want 2", got)
+	}
+	// A stashed index wins — the dialer honors the per-request choice.
+	ctx := context.WithValue(context.Background(), proxyIndexKey{}, 1)
+	if got := c0.proxyIndexFor(ctx); got != 1 {
+		t.Errorf("proxyIndexFor(stash=1) = %d, want 1", got)
 	}
 }
 func TestCreateSessionForModelHeaders(t *testing.T) {
@@ -1217,6 +1456,8 @@ func TestIsTransient(t *testing.T) {
 		{"connection reset by peer", errors.New("read tcp 1.2.3.4:443: connection reset by peer"), true},
 		{"EOF", io.EOF, true},
 		{"unexpected EOF", errors.New("unexpected EOF"), true},
+		{"eof substring not retried", errors.New("peer closed with eof marker"), false},
+		{"eof substring wrapped", fmt.Errorf("stealth: tcp dial failed: %w", errors.New("read tcp 1.2.3.4:443: eof reached")), false},
 		{"network unreachable", errors.New(`dial tcp 1.2.3.4:443: connect: network is unreachable`), true},
 		{"no route to host", errors.New(`dial tcp 1.2.3.4:443: connect: no route to host`), true},
 		{"dial i/o timeout", errors.New(`dial tcp 1.2.3.4:443: i/o timeout`), true},

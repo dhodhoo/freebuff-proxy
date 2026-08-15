@@ -103,16 +103,11 @@ func runUpdate() {
 	}
 
 	if checksumURL != "" {
-		checksumBytes, err := downloadURL(ctx, client, checksumURL)
-		if err == nil {
-			computed := sha256.Sum256(assetBytes)
-			computedHex := hex.EncodeToString(computed[:])
-			if !strings.Contains(string(checksumBytes), computedHex) {
-				fmt.Fprintf(os.Stderr, "ERROR: checksum mismatch! Calculated: %s\n", computedHex)
-				os.Exit(1)
-			}
-			fmt.Println("Checksum verified successfully [ok]")
+		if err := verifyChecksum(ctx, client, checksumURL, assetBytes); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
 		}
+		fmt.Println("Checksum verified successfully [ok]")
 	}
 
 	// Extract binary
@@ -237,4 +232,21 @@ func downloadURL(ctx context.Context, client *http.Client, url string) ([]byte, 
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// verifyChecksum downloads checksums.txt and confirms it lists the sha256 of
+// assetBytes. The update must never proceed unverified (see
+// .github/SECURITY.md), so a checksums.txt fetch failure aborts with an
+// error instead of being silently skipped.
+func verifyChecksum(ctx context.Context, client *http.Client, checksumURL string, assetBytes []byte) error {
+	checksumBytes, err := downloadURL(ctx, client, checksumURL)
+	if err != nil {
+		return fmt.Errorf("download checksums.txt: %w", err)
+	}
+	computed := sha256.Sum256(assetBytes)
+	computedHex := hex.EncodeToString(computed[:])
+	if !strings.Contains(string(checksumBytes), computedHex) {
+		return fmt.Errorf("checksum mismatch! Calculated: %s", computedHex)
+	}
+	return nil
 }

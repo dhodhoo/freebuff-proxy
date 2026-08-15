@@ -42,6 +42,16 @@ func main() {
 	autoYes := flag.Bool("yes", false, "auto-confirm prompts during setup")
 	flag.Parse()
 
+	modeFlags := 0
+	for _, set := range []bool{*showDoctor, *showUpdate, *showSetup} {
+		if set {
+			modeFlags++
+		}
+	}
+	if modeFlags > 1 {
+		fmt.Fprintln(os.Stderr, "freebuff-proxy: warning: -doctor, -update and -setup are mutually exclusive; only the first will run")
+	}
+
 	if *showVersion {
 		fmt.Println("freebuff-proxy", version)
 		os.Exit(0)
@@ -134,6 +144,11 @@ func main() {
 		"log_level", level.String(),
 		"verbose", *verbose,
 	)
+	// /admin/reload is open in default deployments (no API_KEYS, or bridge
+	// mode): warn loudly so operators can decide whether to set ADMIN_TOKEN.
+	if cfg.AdminToken == "" && (len(cfg.APIKeys) == 0 || cfg.BridgeMode()) {
+		logger.Warn("/admin/reload is unauthenticated — any client that can reach the proxy can reload its configuration. Set ADMIN_TOKEN to require a bearer token")
+	}
 	logger.Info("listening", "addr", cfg.ListenAddr)
 
 	// Human-readable startup banner for interactive terminals. Suppressed

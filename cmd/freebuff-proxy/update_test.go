@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInstallUnixAtomicSwap(t *testing.T) {
@@ -76,5 +82,43 @@ func TestWindowsUpdateScript(t *testing.T) {
 	// Sprintf escaping must collapse %% -> % (batch variable references).
 	if strings.Contains(script, "%%") {
 		t.Errorf("helper script contains unescaped %% (Sprintf escaping not applied); script:\n%s", script)
+	}
+}
+
+// TestVerifyChecksumFetchFailureAborts guards the supply-chain guarantee
+// (see .github/SECURITY.md): a checksums.txt fetch failure must abort the
+// update, not silently proceed unverified.
+func TestVerifyChecksumFetchFailureAborts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	err := verifyChecksum(context.Background(), &http.Client{Timeout: 5 * time.Second}, srv.URL+"/checksums.txt", []byte("asset-bytes"))
+	if err == nil {
+		t.Fatal("verifyChecksum succeeded, want error when checksums.txt fetch fails")
+	}
+	if !strings.Contains(err.Error(), "checksums.txt") {
+		t.Errorf("verifyChecksum error = %v, want mention of checksums.txt", err)
+	}
+}
+
+func TestVerifyChecksumMatchAndMismatch(t *testing.T) {
+	assetBytes := []byte("asset-bytes")
+	sum := sha256.Sum256(assetBytes)
+	checksums := hex.EncodeToString(sum[:]) + "  freebuff-proxy_linux_amd64.tar.gz\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(checksums))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	url := srv.URL + "/checksums.txt"
+
+	if err := verifyChecksum(context.Background(), client, url, assetBytes); err != nil {
+		t.Fatalf("verifyChecksum(matching) = %v, want nil", err)
+	}
+	if err := verifyChecksum(context.Background(), client, url, []byte("other-bytes")); err == nil {
+		t.Fatal("verifyChecksum(mismatch) = nil, want checksum mismatch error")
 	}
 }

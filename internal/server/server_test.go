@@ -275,12 +275,14 @@ func TestWaitingRoom503ThenRetry(t *testing.T) {
 	}
 
 	// Wait out the queue window, then the session must advance to active.
-	time.Sleep(100 * time.Millisecond)
-
-	resp2, data2 := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("retry status = %d, want 200: %s", resp2.StatusCode, data2)
-	}
+	// Poll the retry instead of sleeping: the queued session only advances
+	// after its pollAt window, so keep retrying until the queue clears.
+	var data2 []byte
+	eventually(t, "waiting room to clear", func() bool {
+		resp2, d2 := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+		data2 = d2
+		return resp2.StatusCode == http.StatusOK
+	})
 	if !strings.HasSuffix(string(data2), "data: [DONE]\n\n") {
 		t.Errorf("retry stream must end with [DONE]: %q", data2)
 	}
@@ -722,6 +724,48 @@ func TestMetricsQuotaLines(t *testing.T) {
 	}
 }
 
+// TestMetricsLabelEscaping verifies Prometheus label values (model id and
+// period, both upstream-derived) are escaped: quotes become \" so the text
+// format stays parseable.
+func TestMetricsLabelEscaping(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.RateLimitsByModel = map[string]any{
+		`weird"model`: map[string]any{
+			"model":       `weird"model`,
+			"limit":       5,
+			"recentCount": 4,
+			"period":      `p"d`,
+			"resetAt":     "2026-08-16T07:00:00.000Z",
+		},
+	}
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-qe1", 100,
+		`"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-qe1", 100,
+			`"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]`))
+	ts, _ := newTestServer(t, nil, mock)
+
+	// A chat admits the session (which carries rateLimitsByModel).
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/metrics", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	body := string(data)
+	for _, want := range []string{
+		`freebuff_proxy_quota_recent{token="1",model="weird\"model",period="p\"d"} 4`,
+		`freebuff_proxy_quota_limit{token="1",model="weird\"model",period="p\"d"} 5`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %s in:\n%s", want, body)
+		}
+	}
+}
+
 type quotaEntry struct {
 	Limit       float64            `json:"limit"`
 	RecentCount float64            `json:"recent_count"`
@@ -741,6 +785,45 @@ func TestAdminReload(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"status":"ok"`) {
 		t.Errorf("reload response missing ok status: %s", data)
+	}
+}
+
+// TestAdminReloadToken verifies ADMIN_TOKEN guards POST /admin/reload: 401
+// without the bearer token, 200 with it; unset keeps the legacy open
+// behavior.
+func TestAdminReloadToken(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServerCfg(t, nil, func(cfg *config.Config) { cfg.AdminToken = "admin-secret" }, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/admin/reload", nil, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("reload without token status = %d, want 401: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodPost, ts.URL+"/admin/reload", nil, map[string]string{"Authorization": "Bearer wrong"})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("reload with wrong token status = %d, want 401: %s", resp.StatusCode, data)
+	}
+
+	// The successful reload executes LAST: it swaps s.cfg for a fresh
+	// config.Load("") (no ADMIN_TOKEN in the test environment), so nothing
+	// after it may rely on the old gate.
+	resp, data = doJSON(t, http.MethodPost, ts.URL+"/admin/reload", nil, map[string]string{"Authorization": "Bearer admin-secret"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reload with token status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), `"status":"ok"`) {
+		t.Errorf("reload response missing ok status: %s", data)
+	}
+
+	// Unset: legacy behavior (open), still works.
+	mockLegacy := testutil.NewMock()
+	defer mockLegacy.Close()
+	tsLegacy, _ := newTestServer(t, nil, mockLegacy)
+	resp, data = doJSON(t, http.MethodPost, tsLegacy.URL+"/admin/reload", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reload without ADMIN_TOKEN status = %d, want 200 (legacy): %s", resp.StatusCode, data)
 	}
 }
 
