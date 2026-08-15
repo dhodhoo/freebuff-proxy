@@ -44,6 +44,7 @@ type Config struct {
 	RequestJitter       time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
 	CLIVersion          string            // upstream CLI version string (default: 0.10.7)
 	ModelAliases        map[string]string // map model alias -> real model ID (#25)
+	TransientRetries    int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
 	DiscoveredSource    string            // auto-discovered credentials file path (if any)
 	DiscoveredEmail     string            // auto-discovered account email (if any)
 }
@@ -79,6 +80,7 @@ type rawConfig struct {
 	RequestJitter       string   `json:"REQUEST_JITTER"`
 	CLIVersion          string   `json:"CLI_VERSION"`
 	ModelAliases        string   `json:"MODEL_ALIASES"`
+	TransientRetries    *int     `json:"TRANSIENT_RETRIES"`
 }
 
 func defaultRawConfig() rawConfig {
@@ -95,6 +97,7 @@ func defaultRawConfig() rawConfig {
 		SafeMode:            true, // anti-ban presets on by default; set SAFE_MODE=false to disable
 		RequestJitter:       "",   // "" = disabled (unset → SAFE_MODE preset may fill)
 		CLIVersion:          "0.10.7",
+		TransientRetries:    nil, // nil = 1 (one retry after a transient transport failure; 0 disables)
 	}
 }
 
@@ -134,6 +137,7 @@ func Load(configPath string) (Config, error) {
 	overrideString(&raw.RequestJitter, "REQUEST_JITTER")
 	overrideString(&raw.CLIVersion, "CLI_VERSION")
 	overrideString(&raw.ModelAliases, "MODEL_ALIASES")
+	overrideInt(&raw.TransientRetries, "TRANSIENT_RETRIES")
 
 	parseDuration := func(raw, name string) (time.Duration, error) {
 		d, err := time.ParseDuration(strings.TrimSpace(raw))
@@ -190,6 +194,13 @@ func Load(configPath string) (Config, error) {
 		maxMessagesPerDay = 150
 	}
 
+	// TRANSIENT_RETRIES: nil defaults to 1 (one additional attempt after a
+	// transient transport failure); an explicit 0 disables retries.
+	transientRetries := 1
+	if raw.TransientRetries != nil {
+		transientRetries = *raw.TransientRetries
+	}
+
 	cfg := Config{
 		ListenAddr:          strings.TrimSpace(raw.ListenAddr),
 		UpstreamBaseURL:     upstreamBaseURL,
@@ -214,6 +225,7 @@ func Load(configPath string) (Config, error) {
 		RequestJitter:       requestJitter,
 		CLIVersion:          strings.TrimSpace(raw.CLIVersion),
 		ModelAliases:        parseMap(raw.ModelAliases),
+		TransientRetries:    transientRetries,
 	}
 
 	// Auto-discover CLI token if no AUTH_TOKENS were explicitly configured
@@ -313,6 +325,8 @@ func (c Config) Validate() error {
 		return errors.New("REGISTRY_REFRESH must be greater than zero")
 	case c.RequestJitter < 0:
 		return errors.New("REQUEST_JITTER cannot be negative")
+	case c.TransientRetries < 0:
+		return errors.New("TRANSIENT_RETRIES cannot be negative")
 	}
 
 	for i, tok := range c.AuthTokens {

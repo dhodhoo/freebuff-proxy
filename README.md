@@ -27,6 +27,7 @@ Your coding tools expect an OpenAI-style endpoint (`/v1/chat/completions`). The 
 - **Subagent-Ready Concurrency**: Single-flight session refresh prevents race conditions during high-volume tool-calling loops.
 - **Safe Mode**: On by default — anti-ban presets (TLS stealth, header sanitization, jitter, idle rotation, daily cap).
 - **Operational Tooling**: `-doctor` diagnostics, `-setup` interactive client configuration, and a SHA-256-verified `-update` self-updater.
+- **Quota Transparency**: Live per-model remaining quota (from the upstream `rateLimitsByModel` admission payload) is surfaced in `GET /healthz` (per-token `quota` map) and `GET /metrics` (`freebuff_proxy_quota_recent` / `freebuff_proxy_quota_limit` gauges).
 
 ## How It Works
 
@@ -185,6 +186,7 @@ All keys can be set via environment variables or a `.env` file (which behaves li
 | `REQUEST_JITTER` | `0s` | Random delay range `[0, REQUEST_JITTER)` before upstream calls (`SAFE_MODE` sets 2s when unset) |
 | `CLI_VERSION` | `0.10.7` | Upstream CLI version string used in the request envelope |
 | `MODEL_ALIASES` | `""` | Map aliases to real model IDs, e.g. `gpt-4o:deepseek/deepseek-v4-flash,glm:z-ai/glm-5.2` |
+| `TRANSIENT_RETRIES` | `1` | Max additional attempts after a transient transport failure; `0` disables |
 
 ### Safe Mode & Zero-Spam Quota Handling
 
@@ -214,8 +216,8 @@ opt out). It enables essential anti-ban protections and presets:
 |---|---|---|
 | `POST /v1/chat/completions` | `API_KEYS` (when set) | OpenAI-compatible chat, streaming and non-streaming |
 | `GET /v1/models` | `API_KEYS` (when set) | Model catalog from the registry (fallback at boot + live refresh) |
-| `GET /healthz` | none | JSON: `status`, `uptime_seconds`, `models`, per-token snapshot, `bridge_tokens` |
-| `GET /metrics` | none | Prometheus text format: uptime, model count, per-token 24h messages / requests / active runs / cooldown |
+| `GET /healthz` | none | JSON: `status`, `uptime_seconds`, `models`, per-token snapshot (incl. per-model `quota` map when the last admission carried it), `bridge_tokens` |
+| `GET /metrics` | none | Prometheus text format: uptime, model count, per-token 24h messages / requests / active runs / cooldown, per-model quota (`freebuff_proxy_quota_recent` / `freebuff_proxy_quota_limit`) |
 | `POST /admin/reload` | `API_KEYS` (when set) | Hot-reload configuration from disk without restart |
 
 ---

@@ -167,8 +167,16 @@ func (m *RunManager) FinishRun(ctx context.Context, run *Run, totalSteps int) {
 
 // Maintain rotates aged runs and FINISHes the draining list. Runs with
 // outstanding inflight leases or an in-flight FINISH are skipped. Best
-// effort: failures are logged, never returned (background job).
+// effort: failures are logged, never returned (background job). While the
+// token is cooling down (auth rejection, rate limit, ban) the pass returns
+// immediately: no rotate attempts, no draining FINISH, no log — retrying
+// upstream work during a cooldown looks like abuse and would log the
+// "token cooling down" rotate failure once per maintain tick (observed in
+// production). The pool logs the skip.
 func (m *RunManager) Maintain(ctx context.Context) {
+	if time.Now().Before(m.CooldownUntil()) {
+		return
+	}
 	m.mu.Lock()
 	var toRotate []string
 	for agentID, run := range m.runs {

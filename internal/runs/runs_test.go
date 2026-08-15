@@ -1,9 +1,11 @@
 package runs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -265,6 +267,53 @@ func TestMaintainDrainsOnlyWhenIdle(t *testing.T) {
 		f, ok := finishedRun(mock, "run-0001")
 		return ok && f.Status == "completed" && f.TotalSteps == 1
 	})
+}
+
+func TestMaintainSkipsDuringCooldown(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, 40*time.Millisecond)
+
+	// A live run aged past rotation would normally make Maintain rotate it
+	// (START) and a draining run would be FINISHed; with the token in
+	// cooldown neither may touch the upstream, and nothing may be logged
+	// (production observed a "maintain rotate failed ... token cooling
+	// down" error once per minute).
+	run, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(run)
+	time.Sleep(80 * time.Millisecond) // age the run past rotation
+
+	mgr.Cooldown(time.Hour)
+
+	restore, logged := captureSlog()
+	defer restore()
+
+	started := len(mock.StartedRunsSnapshot())
+	finished := len(mock.FinishedRunsSnapshot())
+	mgr.Maintain(context.Background())
+
+	if got := len(mock.StartedRunsSnapshot()); got != started {
+		t.Errorf("STARTs during cooldown = %d, want %d (no rotate)", got, started)
+	}
+	if got := len(mock.FinishedRunsSnapshot()); got != finished {
+		t.Errorf("FINISHes during cooldown = %d, want %d (no drain)", got, finished)
+	}
+	if out := logged(); out != "" {
+		t.Errorf("Maintain logged during cooldown:\n%s", out)
+	}
+}
+
+// captureSlog swaps the default slog handler for one recording Debug+
+// messages and returns a restore func plus a snapshot of everything logged
+// since capture. Used to assert that quiet paths emit no log lines.
+func captureSlog() (restore func(), logged func() string) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return func() { slog.SetDefault(prev) }, func() string { return buf.String() }
 }
 
 func TestPrewarmStartsAllAgentsOnce(t *testing.T) {

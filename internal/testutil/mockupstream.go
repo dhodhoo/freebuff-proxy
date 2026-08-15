@@ -41,6 +41,11 @@ type MockUpstream struct {
 	InstanceID string
 	ExpiresIn  time.Duration
 
+	// RateLimitsByModel, when non-empty, is embedded in the active session
+	// body as the rateLimitsByModel map (official CLI wire shape, keyed by
+	// model id) so tests can exercise quota parsing end-to-end.
+	RateLimitsByModel map[string]any
+
 	// RunIDs is the queue of run ids returned by agent-runs START.
 	RunIDs []string
 	runIdx int
@@ -73,6 +78,10 @@ type MockUpstream struct {
 	SessionEnds         int
 	StartedRuns         []string
 	FinishedRuns        []FinishedRun
+	// Requests is the total number of HTTP requests the mock has served
+	// (any route). Tests assert it stays unchanged when a pass must not
+	// touch the upstream at all.
+	Requests int
 }
 
 // NewMock starts the mock server. Call Close when done.
@@ -101,6 +110,9 @@ func (m *MockUpstream) Close() { m.srv.Close() }
 func SSEEvent(data string) string { return "data: " + data + "\n\n" }
 
 func (m *MockUpstream) handle(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	m.Requests++
+	m.mu.Unlock()
 	if m.AuthReject {
 		writeJSON(w, 401, `{"error":{"message":"unauthorized","type":"authentication_error"}}`)
 		return
@@ -185,6 +197,7 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	position, depth, waitMs := m.QueuePosition, m.QueueDepth, m.EstimatedWaitMs
 	instanceID, expiresIn := m.InstanceID, m.ExpiresIn
+	limits := m.RateLimitsByModel
 	m.mu.Unlock()
 
 	switch mode {
@@ -192,11 +205,15 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"error": "session not found"})
 	case "active":
 		expiresAt := time.Now().Add(expiresIn).UTC().Format(rfc3339Millis)
-		writeJSON(w, 200, map[string]any{
+		body := map[string]any{
 			"status":     "active",
 			"instanceId": instanceID,
 			"expiresAt":  expiresAt,
-		})
+		}
+		if len(limits) > 0 {
+			body["rateLimitsByModel"] = limits
+		}
+		writeJSON(w, 200, body)
 	case "queued":
 		pollAt := time.Now().Add(time.Duration(waitMs) * time.Millisecond).UTC().Format(rfc3339Millis)
 		writeJSON(w, 200, map[string]any{

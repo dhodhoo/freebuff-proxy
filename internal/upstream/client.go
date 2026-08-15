@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -170,6 +172,36 @@ type SessionState struct {
 	RetryAfterMs       int64
 	AvailableHours     string
 	Message            string
+	// RateLimitsByModel carries the live per-model session quotas from the
+	// admission/poll response (key = model id). Absent on compact polls and
+	// pre-join (none) responses; never required.
+	RateLimitsByModel map[string]ModelQuota
+}
+
+// ModelQuota is one model's live session quota from the upstream
+// rateLimitsByModel map, per the official CLI wire shape
+// (reference/freebuff/common/src/types/freebuff-session.ts).
+// Entitlement holds the per-period breakdown (base/referral/streak/promo;
+// promo is omitted by default) that sums to Limit when the server emits it.
+type ModelQuota struct {
+	Model       string
+	Limit       float64
+	RecentCount float64
+	ResetAt     time.Time
+	Period      string // "pacific_day" | "pacific_week" (empty when absent)
+	Entitlement map[string]float64
+}
+
+// rawModelQuota mirrors one rateLimitsByModel entry on the wire. resetAt is
+// parsed with parseFlexTime (RFC3339, unix seconds, or unix ms); windowHours
+// (deprecated) is deliberately not surfaced.
+type rawModelQuota struct {
+	Model                string             `json:"model"`
+	Limit                float64            `json:"limit"`
+	RecentCount          float64            `json:"recentCount"`
+	Period               string             `json:"period"`
+	ResetAt              any                `json:"resetAt"`
+	EntitlementBreakdown map[string]float64 `json:"entitlementBreakdown"`
 }
 
 // ChatOptions carries the envelope values for a chat completion request.
@@ -181,9 +213,10 @@ type ChatOptions struct {
 
 // Client speaks the codebuff.com wire protocol for a single token.
 type Client struct {
-	token   string
-	baseURL string
-	http    *http.Client
+	token      string
+	tokenIndex int // 0-based index into the pool's token list (0 for bridge clients)
+	baseURL    string
+	http       *http.Client
 
 	requestTimeout     time.Duration
 	sessionCallTimeout time.Duration
@@ -191,7 +224,27 @@ type Client struct {
 	cliVersion         string
 	costMode           string
 	debugDump          bool
-	stealthProfile     *stealth.Profile // nil when fingerprint unset
+
+	// transientRetriesLimit is TRANSIENT_RETRIES: the maximum number of
+	// additional attempts after a transient transport failure (0 disables
+	// retries entirely). Only transport-level failures (dial/TLS/reset/EOF)
+	// retry; classified upstream errors never do.
+	transientRetriesLimit int
+
+	// stealthProfile is the active TLS fingerprint. profileMu guards swaps
+	// made by the retry loop (rotating the pinned profile before a retry);
+	// newRequest and the dialer read it per request/connection. nil means
+	// the plain Go transport.
+	profileMu      sync.Mutex
+	stealthProfile *stealth.Profile
+
+	// Counters surfaced via the pool snapshot for /metrics.
+	transientRetries     atomic.Int64 // transient transport failures retried
+	fingerprintRotations atomic.Int64 // pinned fingerprint swaps ahead of a retry
+
+	// retryBackoff overrides the randomized 200-600ms pre-retry sleep (test
+	// seam; nil uses the crypto/rand jitter).
+	retryBackoff func() time.Duration
 }
 
 // cliUserAgent mirrors the official CLI / SDK user agent. The upstream
@@ -249,11 +302,6 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		if !ok {
 			return nil, fmt.Errorf("upstream: unknown TLS_FINGERPRINT %q", cfg.TLSFingerprint)
 		}
-		// baseDial is nil when no SOCKS5 proxy is set; Dialer uses its
-		// internal default net.Dialer in that case.
-		// NOTE: for HTTP_PROXY (CONNECT tunnel), Go uses Proxy + DialTLSContext
-		// transparently; the stealth dialer replaces the TLS layer.
-		transport.DialTLSContext = stealth.Dialer(profile, baseDial, false)
 		stealthProf = profile
 	}
 
@@ -262,26 +310,42 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		cliVer = "0.10.7"
 	}
 
-	return &Client{
-		token:              token,
-		baseURL:            cfg.UpstreamBaseURL,
-		requestTimeout:     cfg.RequestTimeout,
-		sessionCallTimeout: cfg.SessionCallTimeout,
-		requestJitter:      cfg.RequestJitter,
-		cliVersion:         cliVer,
-		costMode:           cfg.CostMode,
-		debugDump:          cfg.DebugDump,
-		stealthProfile:     stealthProf,
-		http: &http.Client{
-			Transport: transport,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 3 {
-					return errors.New("too many redirects")
-				}
-				return nil
-			},
+	c := &Client{
+		token:                 token,
+		tokenIndex:            tokenIndex,
+		baseURL:               cfg.UpstreamBaseURL,
+		requestTimeout:        cfg.RequestTimeout,
+		sessionCallTimeout:    cfg.SessionCallTimeout,
+		requestJitter:         cfg.RequestJitter,
+		cliVersion:            cliVer,
+		costMode:              cfg.CostMode,
+		debugDump:             cfg.DebugDump,
+		stealthProfile:        stealthProf,
+		transientRetriesLimit: cfg.TransientRetries,
+	}
+	if stealthProf != nil {
+		// Resolve the profile per connection (instead of capturing it) so a
+		// transient retry can swap the pinned fingerprint without rebuilding
+		// the transport: rotateStealthProfileForRetry swaps c.stealthProfile
+		// and the next dial picks it up.
+		// NOTE: for HTTP_PROXY (CONNECT tunnel), Go uses Proxy + DialTLSContext
+		// transparently; the stealth dialer replaces the TLS layer. baseDial is
+		// nil when no SOCKS5 proxy is set; Dialer uses its internal default
+		// net.Dialer in that case.
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return stealth.Dialer(c.currentStealthProfile(), baseDial, false)(ctx, network, addr)
+		}
+	}
+	c.http = &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("too many redirects")
+			}
+			return nil
 		},
-	}, nil
+	}
+	return c, nil
 }
 
 // ChatCompletions POSTs an OpenAI-shaped request to the upstream chat
@@ -487,31 +551,32 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 	c.dump("session", req, resp.StatusCode, body)
 
 	var raw struct {
-		Status                 string   `json:"status"`
-		InstanceID             string   `json:"instanceId"`
-		Model                  string   `json:"model"`
-		CurrentModel           string   `json:"currentModel"`
-		RequestedModel         string   `json:"requestedModel"`
-		ExpiresAt              any      `json:"expiresAt"`
-		AdmittedAt             any      `json:"admittedAt"`
-		GracePeriodEndsAt      any      `json:"gracePeriodEndsAt"`
-		GracePeriodRemainingMs int64    `json:"gracePeriodRemainingMs"`
-		Position               int      `json:"position"`
-		QueueDepth             int      `json:"queueDepth"`
-		EstimatedWaitMs        int      `json:"estimatedWaitMs"`
-		PollAt                 any      `json:"pollAt"`
-		AccessTier             string   `json:"accessTier"`
-		CountryCode            string   `json:"countryCode"`
-		CountryBlockReason     string   `json:"countryBlockReason"`
-		IpPrivacySignals       []string `json:"ipPrivacySignals"`
-		ActiveUsersForIP       int      `json:"activeUsersForIp"`
-		Limit                  float64  `json:"limit"`
-		RecentCount            float64  `json:"recentCount"`
-		ResetAt                any      `json:"resetAt"`
-		ResumesAt              any      `json:"resumes_at"`
-		RetryAfterMs           int64    `json:"retryAfterMs"`
-		AvailableHours         string   `json:"availableHours"`
-		Message                string   `json:"message"`
+		Status                 string                   `json:"status"`
+		InstanceID             string                   `json:"instanceId"`
+		Model                  string                   `json:"model"`
+		CurrentModel           string                   `json:"currentModel"`
+		RequestedModel         string                   `json:"requestedModel"`
+		ExpiresAt              any                      `json:"expiresAt"`
+		AdmittedAt             any                      `json:"admittedAt"`
+		GracePeriodEndsAt      any                      `json:"gracePeriodEndsAt"`
+		GracePeriodRemainingMs int64                    `json:"gracePeriodRemainingMs"`
+		Position               int                      `json:"position"`
+		QueueDepth             int                      `json:"queueDepth"`
+		EstimatedWaitMs        int                      `json:"estimatedWaitMs"`
+		PollAt                 any                      `json:"pollAt"`
+		AccessTier             string                   `json:"accessTier"`
+		CountryCode            string                   `json:"countryCode"`
+		CountryBlockReason     string                   `json:"countryBlockReason"`
+		IpPrivacySignals       []string                 `json:"ipPrivacySignals"`
+		ActiveUsersForIP       int                      `json:"activeUsersForIp"`
+		Limit                  float64                  `json:"limit"`
+		RecentCount            float64                  `json:"recentCount"`
+		ResetAt                any                      `json:"resetAt"`
+		ResumesAt              any                      `json:"resumes_at"`
+		RetryAfterMs           int64                    `json:"retryAfterMs"`
+		AvailableHours         string                   `json:"availableHours"`
+		Message                string                   `json:"message"`
+		RateLimitsByModel      map[string]rawModelQuota `json:"rateLimitsByModel"`
 	}
 	if err := json.Unmarshal([]byte(body), &raw); err == nil && raw.Status != "" {
 		state := &SessionState{
@@ -553,6 +618,25 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 		if state.ResumesAt, err = parseFlexTime(raw.ResumesAt); err != nil {
 			state.ResumesAt = time.Time{}
 		}
+		if len(raw.RateLimitsByModel) > 0 {
+			state.RateLimitsByModel = make(map[string]ModelQuota, len(raw.RateLimitsByModel))
+			for modelID, q := range raw.RateLimitsByModel {
+				mq := ModelQuota{
+					Model:       q.Model,
+					Limit:       q.Limit,
+					RecentCount: q.RecentCount,
+					Period:      q.Period,
+					Entitlement: q.EntitlementBreakdown,
+				}
+				if mq.Model == "" {
+					mq.Model = modelID
+				}
+				if resetAt, perr := parseFlexTime(q.ResetAt); perr == nil {
+					mq.ResetAt = resetAt
+				}
+				state.RateLimitsByModel[modelID] = mq
+			}
+		}
 		return state, nil
 	}
 
@@ -575,8 +659,8 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("x-codebuff-api-key", c.token)
 	req.Header.Set("Content-Type", "application/json")
-	if c.stealthProfile != nil {
-		connProf := stealth.GetProfileForConnection(c.stealthProfile)
+	if profile := c.currentStealthProfile(); profile != nil {
+		connProf := stealth.GetProfileForConnection(profile)
 		stealth.SanitizeAndApply(req.Header, connProf)
 	} else {
 		ver := c.cliVersion
@@ -593,6 +677,14 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 // done with the response BODY: canceling the request context aborts in-flight
 // body reads, so it must outlive body streaming. cancel is nil when no
 // timeout was applied. Failures are wrapped so errors.Is works both ways.
+//
+// When TRANSIENT_RETRIES > 0, transport-level failures (dial/TLS handshake/
+// reset/EOF) are retried up to that many additional attempts: the body is
+// replayed from GetBody on a fresh connection (req.Close), the pinned TLS
+// fingerprint is rotated, and a randomized 200-600ms backoff precedes each
+// retry. Classified upstream errors (429/403/401, session/run invalids,
+// waiting room), any HTTP status >= 400, context cancellation, and requests
+// whose body cannot be replayed are NEVER retried.
 func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, context.CancelFunc, error) {
 	ctx := req.Context()
 	start := time.Now()
@@ -601,8 +693,61 @@ func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, c
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		req = req.WithContext(ctx)
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
+
+	// Capture the body so a transient failure can replay an identical
+	// request. nil bodies (GETs) and non-replayable bodies never retry.
+	var replayBody func() (io.ReadCloser, error)
+	if req.GetBody != nil {
+		replayBody = req.GetBody
+	}
+
+	for attempt := 1; ; attempt++ {
+		resp, err := c.http.Do(req)
+		if err == nil {
+			if werr := wrapDecompress(resp); werr != nil {
+				_ = resp.Body.Close()
+				if cancel != nil {
+					cancel()
+				}
+				return nil, nil, fmt.Errorf("upstream: %s %s: %w", req.Method, req.URL.Path, werr)
+			}
+			slog.Debug("upstream ok", "method", req.Method, "path", req.URL.Path,
+				"status", resp.StatusCode, "ms", time.Since(start).Milliseconds())
+			return resp, cancel, nil
+		}
+
+		// Transient transport failure with attempts remaining: rotate the
+		// pinned fingerprint, replay the body on a fresh connection, and
+		// retry after a jittered backoff.
+		if c.transientRetriesLimit > 0 && attempt <= c.transientRetriesLimit &&
+			ctx.Err() == nil && replayBody != nil && isTransient(err) {
+			c.rotateStealthProfileForRetry(req)
+			c.transientRetries.Add(1)
+			body, bodyErr := replayBody()
+			if bodyErr != nil {
+				slog.Debug("upstream retry aborted: body replay failed",
+					"token", c.tokenIndex+1, "attempt", attempt, "err", bodyErr)
+			} else {
+				req.Body = body
+				req.Close = true // fresh connection for the retry
+				slog.Debug("upstream transient failure, retrying",
+					"token", c.tokenIndex+1, "attempt", attempt, "reason", err.Error(),
+					"path", req.URL.Path)
+				timer := time.NewTimer(c.retryDelay())
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+				}
+				if ctx.Err() == nil {
+					continue
+				}
+				// Context died during the backoff: a retry would fail
+				// instantly, surface the context error instead.
+				err = ctx.Err()
+			}
+		}
+
 		slog.Debug("upstream error", "method", req.Method, "path", req.URL.Path,
 			"ms", time.Since(start).Milliseconds(), "err", err)
 		if cancel != nil {
@@ -616,16 +761,132 @@ func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, c
 		}
 		return nil, nil, fmt.Errorf("upstream: %s %s: %w", req.Method, req.URL.Path, err)
 	}
-	if err := wrapDecompress(resp); err != nil {
-		_ = resp.Body.Close()
-		if cancel != nil {
-			cancel()
-		}
-		return nil, nil, fmt.Errorf("upstream: %s %s: %w", req.Method, req.URL.Path, err)
+}
+
+// currentStealthProfile returns the active stealth profile (nil = plain Go
+// transport). Guarded by profileMu: the retry loop swaps the pinned profile
+// to rotate the fingerprint, so readers must take the lock.
+func (c *Client) currentStealthProfile() *stealth.Profile {
+	c.profileMu.Lock()
+	defer c.profileMu.Unlock()
+	return c.stealthProfile
+}
+
+// TransientRetries returns how many transient transport failures were
+// retried by this client (pool snapshot /metrics aggregation).
+func (c *Client) TransientRetries() int64 { return c.transientRetries.Load() }
+
+// FingerprintRotations returns how many times the pinned TLS fingerprint was
+// rotated ahead of a retry (pool snapshot /metrics aggregation).
+func (c *Client) FingerprintRotations() int64 { return c.fingerprintRotations.Load() }
+
+// SetTransport replaces the HTTP transport backing the client. Exported as a
+// test seam for retry-injection tests (substituting a flaky RoundTripper);
+// production code never calls it.
+func (c *Client) SetTransport(rt http.RoundTripper) { c.http.Transport = rt }
+
+// transientMarkers are transport-level failure signatures that are safe to
+// retry: the request never reached the application layer, so no upstream
+// quota/credits were burned and nothing was processed. Classified upstream
+// errors (429/403/401, session/run invalids, waiting room) and any HTTP
+// status >= 400 are handled at the response layer and never enter this path.
+// Markers are lowercase: isTransient lowercases the wrapped error messages
+// before matching. "tls: handshake failure" is Go's own alert string;
+// "tls handshake failed" appears in wrapper libraries (e.g. stealth/uTLS).
+var transientMarkers = []string{
+	"tls handshake failed",
+	"tls: handshake failure",
+	"tls: internal error",
+	"connection refused",
+	"connection reset",
+	"unexpected eof",
+	"eof",
+	"network is unreachable",
+	"no route to host",
+	"i/o timeout", // dial timeout
+}
+
+// isTransient reports whether err is a transient transport failure safe to
+// retry. It walks the wrapped error chain and matches message fragments, so
+// stealth-wrapped dial errors ("stealth: tcp dial failed: ...: connection
+// refused") classify the same as the bare dial error.
+func isTransient(err error) bool {
+	if err == nil {
+		return false
 	}
-	slog.Debug("upstream ok", "method", req.Method, "path", req.URL.Path,
-		"status", resp.StatusCode, "ms", time.Since(start).Milliseconds())
-	return resp, cancel, nil
+	for cur := err; cur != nil; cur = errors.Unwrap(cur) {
+		msg := strings.ToLower(cur.Error())
+		for _, marker := range transientMarkers {
+			if strings.Contains(msg, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// retryProfileRotation is the pinned-profile rotation order for transient
+// retries: one entry per distinct ClientHelloID, so a retry presents a
+// genuinely different JA3 (rotating chrome120 -> chrome126 would change only
+// headers, not the TLS fingerprint). ProfileRandom/ProfileAuto are excluded:
+// they already resolve a fresh fingerprint per connection.
+var retryProfileRotation = []struct {
+	ids  []stealth.ProfileID
+	next *stealth.Profile
+}{
+	{ids: []stealth.ProfileID{stealth.ProfileIDChrome120, stealth.ProfileIDChrome126, stealth.ProfileIDEdge126}, next: stealth.ProfileSafari18},
+	{ids: []stealth.ProfileID{stealth.ProfileIDSafari17, stealth.ProfileIDSafari18}, next: stealth.ProfileFirefox128},
+	{ids: []stealth.ProfileID{stealth.ProfileIDFirefox120, stealth.ProfileIDFirefox128}, next: stealth.ProfileChrome126},
+}
+
+// rotateStealthProfileForRetry swaps the pinned TLS fingerprint to a
+// different profile before a retry and re-applies its browser headers to req,
+// so the retried connection does not repeat the fingerprint that just failed.
+// random/auto already rotate per connection and are left alone. No-op when
+// retries are disabled or no fingerprint is pinned.
+func (c *Client) rotateStealthProfileForRetry(req *http.Request) {
+	c.profileMu.Lock()
+	defer c.profileMu.Unlock()
+	if c.transientRetriesLimit <= 0 || c.stealthProfile == nil {
+		return
+	}
+	id := c.stealthProfile.ID
+	if id == stealth.ProfileIDRandom || id == stealth.ProfileIDAuto {
+		return
+	}
+	next := nextStealthProfile(c.stealthProfile)
+	if next.ID == id {
+		return
+	}
+	c.stealthProfile = next
+	c.fingerprintRotations.Add(1)
+	stealth.SanitizeAndApply(req.Header, next)
+}
+
+// nextStealthProfile returns the profile to rotate to after cur: the next
+// entry in the fixed rotation order whose ClientHelloID differs from cur's.
+func nextStealthProfile(cur *stealth.Profile) *stealth.Profile {
+	for _, entry := range retryProfileRotation {
+		for _, id := range entry.ids {
+			if id == cur.ID {
+				return entry.next
+			}
+		}
+	}
+	return retryProfileRotation[0].next
+}
+
+// retryDelay returns the sleep before a transient retry: a randomized
+// 200-600ms backoff using crypto/rand (matching the request-jitter pattern).
+// Tests pin it via Client.retryBackoff.
+func (c *Client) retryDelay() time.Duration {
+	if c.retryBackoff != nil {
+		return c.retryBackoff()
+	}
+	var b [8]byte
+	_, _ = cryptoRand.Read(b[:])
+	u := binary.BigEndian.Uint64(b[:])
+	return 200*time.Millisecond + time.Duration(u%uint64(400*time.Millisecond))
 }
 
 // wrapDecompress replaces resp.Body with a transparent decompressing reader

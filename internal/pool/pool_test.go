@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +33,12 @@ const (
 // newTestPool wires one mock upstream per token through real clients and
 // session managers, backed by the registry fallback map.
 func newTestPool(t *testing.T, mocks ...*testutil.MockUpstream) *Pool {
+	return newTestPoolCfg(t, nil, mocks...)
+}
+
+// newTestPoolCfg is newTestPool with a config mutation hook (e.g. enabling
+// TRANSIENT_RETRIES / TLS_FINGERPRINT for retry tests).
+func newTestPoolCfg(t *testing.T, mut func(*config.Config), mocks ...*testutil.MockUpstream) *Pool {
 	t.Helper()
 	cfg := &config.Config{
 		AuthTokens:         make([]string, len(mocks)),
@@ -40,6 +47,9 @@ func newTestPool(t *testing.T, mocks ...*testutil.MockUpstream) *Pool {
 		SessionCallTimeout: 5 * time.Second,
 		RegistryRefresh:    6 * time.Hour,
 		UpstreamBaseURL:    "https://www.codebuff.com",
+	}
+	if mut != nil {
+		mut(cfg)
 	}
 	clients := make([]*upstream.Client, 0, len(mocks))
 	sessions := make([]*session.Manager, 0, len(mocks))
@@ -77,9 +87,16 @@ func TestRoundRobinDistribution(t *testing.T) {
 	defer mock1.Close()
 	p := newTestPool(t, mock0, mock1)
 
+	// Strict round-robin only applies while no token holds a live session:
+	// hot-session-first selection routes every acquire to a live session
+	// once one exists. Invalidate both cached sessions before each acquire
+	// so the cold path is exercised, and assert the historical order is
+	// unchanged (selection-order change must not regress cold failover).
 	const n = 6
 	got := make([]int, n)
 	for i := 0; i < n; i++ {
+		p.InvalidateSession(0)
+		p.InvalidateSession(1)
 		lease, err := p.Acquire(context.Background(), modelA)
 		if err != nil {
 			t.Fatal(err)
@@ -95,7 +112,8 @@ func TestRoundRobinDistribution(t *testing.T) {
 			t.Errorf("acquire %d token = %d, want %d", i, got[i], want)
 		}
 	}
-	// Both tokens created the run for the agent exactly once.
+	// Both tokens created the run for the agent exactly once (runs survive
+	// session invalidation).
 	for i, mock := range []*testutil.MockUpstream{mock0, mock1} {
 		if len(mock.StartedRuns) != 1 || mock.StartedRuns[0] != agentA {
 			t.Errorf("mock%d started runs = %v, want [%s]", i, mock.StartedRuns, agentA)
@@ -110,9 +128,76 @@ func TestRoundRobinDistribution(t *testing.T) {
 		if snap.ActiveRuns != 1 || snap.Requests != 3 {
 			t.Errorf("token %d snapshot: active=%d requests=%d, want 1/3", i, snap.ActiveRuns, snap.Requests)
 		}
-		if snap.SessionStatus != "active" || snap.SessionInstanceID != "inst-abc-123" {
-			t.Errorf("token %d session snapshot = %q/%q", i, snap.SessionStatus, snap.SessionInstanceID)
+	}
+	// The last acquire (round-robin start 1) re-created token 1's session
+	// fresh; token 0's was invalidated before it and is gone. Every acquire
+	// admitted a fresh session: the cold path never reused a live one (3
+	// creates per token, one per acquire).
+	if snaps[1].SessionStatus != "active" || snaps[1].SessionInstanceID != "inst-abc-123" {
+		t.Errorf("token 1 session snapshot = %q/%q, want active/inst-abc-123", snaps[1].SessionStatus, snaps[1].SessionInstanceID)
+	}
+	if mock0.SessionCreates != 3 || mock1.SessionCreates != 3 {
+		t.Errorf("session creates = %d/%d, want 3/3 (cold path only)", mock0.SessionCreates, mock1.SessionCreates)
+	}
+}
+
+func TestAcquirePrefersTokenWithLiveSession(t *testing.T) {
+	mock1 := testutil.NewMock() // token 1 (index 0): will hold the live session
+	defer mock1.Close()
+	mock2 := testutil.NewMock() // token 2 (index 1): stays fresh
+	defer mock2.Close()
+	p := newTestPool(t, mock1, mock2)
+
+	// First acquire lands on token 1 (round-robin start) and admits its
+	// session; token 2 remains fresh.
+	first, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Token != 0 {
+		t.Fatalf("first lease token = %d, want 0", first.Token)
+	}
+	p.LeaseRelease(first)
+	if mock1.SessionCreates != 1 {
+		t.Fatalf("token 1 session creates = %d, want 1", mock1.SessionCreates)
+	}
+	if mock2.SessionCreates != 0 {
+		t.Fatalf("token 2 session creates = %d, want 0", mock2.SessionCreates)
+	}
+
+	// Successive acquires all land on token 1 (hot-session-first): its live
+	// session is reused and token 2 never gets a session admitted — the
+	// round-robin start alternates back to token 2, but the hot token wins.
+	for i := 0; i < 5; i++ {
+		lease, err := p.Acquire(context.Background(), modelA)
+		if err != nil {
+			t.Fatal(err)
 		}
+		if lease.Token != 0 {
+			t.Errorf("acquire %d token = %d, want 0 (hot-session-first)", i, lease.Token)
+		}
+		p.LeaseRelease(lease)
+	}
+	if mock2.SessionCreates != 0 {
+		t.Errorf("token 2 session creates = %d, want 0 (never admitted)", mock2.SessionCreates)
+	}
+	if got := mock2.StartedRunsSnapshot(); len(got) != 0 {
+		t.Errorf("token 2 started runs = %v, want none", got)
+	}
+
+	// Cool token 1 down: the next acquire falls back to token 2 and admits
+	// its session on demand.
+	p.CooldownToken(0, time.Hour)
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Token != 1 {
+		t.Errorf("lease token = %d, want 1 (cold fallback after cooldown)", lease.Token)
+	}
+	p.LeaseRelease(lease)
+	if mock2.SessionCreates != 1 {
+		t.Errorf("token 2 session creates = %d, want 1 after token 1 cooldown", mock2.SessionCreates)
 	}
 }
 
@@ -283,6 +368,58 @@ func TestSessionInstanceIDOnLease(t *testing.T) {
 		t.Errorf("instance = %q, want inst-abc-123", lease.SessionInstanceID)
 	}
 	p.LeaseRelease(lease)
+}
+
+func TestPoolSnapshotQuotaByModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.RateLimitsByModel = map[string]any{
+		"z-ai/glm-5.2": map[string]any{
+			"model":       "z-ai/glm-5.2",
+			"limit":       5,
+			"recentCount": 4,
+			"period":      "pacific_day",
+			"resetAt":     "2026-08-16T07:00:00.000Z",
+			"entitlementBreakdown": map[string]any{
+				"base":     1,
+				"referral": 1,
+				"streak":   3,
+			},
+		},
+	}
+	p := newTestPool(t, mock)
+
+	// Acquire admits the session (with rateLimitsByModel); the lease is left
+	// unreleased so the session cache stays populated for Snapshot().
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = lease
+
+	snaps := p.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("snapshots = %d, want 1", len(snaps))
+	}
+	q, ok := snaps[0].QuotaByModel["z-ai/glm-5.2"]
+	if !ok {
+		t.Fatalf("QuotaByModel missing z-ai/glm-5.2: %+v", snaps[0].QuotaByModel)
+	}
+	if q.Limit != 5 || q.RecentCount != 4 {
+		t.Errorf("quota limit/recentCount = %v/%v, want 5/4", q.Limit, q.RecentCount)
+	}
+	if q.Period != "pacific_day" {
+		t.Errorf("period = %q, want pacific_day", q.Period)
+	}
+	if q.ResetAt.IsZero() {
+		t.Error("resetAt not surfaced")
+	}
+	if q.Entitlement["referral"] != 1 {
+		t.Errorf("entitlement = %+v, want referral=1", q.Entitlement)
+	}
+	if len(snaps[0].Entitlement) != 0 {
+		t.Errorf("top-level Entitlement = %+v, want empty", snaps[0].Entitlement)
+	}
 }
 
 func TestDisabledSessionLease(t *testing.T) {
@@ -629,6 +766,11 @@ func TestConcurrentAcquireHammer(t *testing.T) {
 	if err := failures.get(); err != nil {
 		t.Fatalf("acquire failed: %v", err)
 	}
+	// Hot-session-first selection concentrates traffic on tokens that
+	// already hold a live session, so the exact per-token distribution is
+	// interleaving-dependent. Assert the deterministic invariants instead:
+	// every acquire was served by a run, and both agents have runs on at
+	// least one token (each token holds at most one run per agent).
 	var totalRequests, activeRuns int
 	for _, snap := range p.Snapshot() {
 		totalRequests += snap.Requests
@@ -637,8 +779,8 @@ func TestConcurrentAcquireHammer(t *testing.T) {
 	if totalRequests != goroutines*perGoroutine {
 		t.Errorf("total requests = %d, want %d", totalRequests, goroutines*perGoroutine)
 	}
-	if activeRuns != len(mocks)*2 {
-		t.Errorf("active runs = %d, want %d (both agents on all tokens)", activeRuns, len(mocks)*2)
+	if activeRuns < 2 || activeRuns > len(mocks)*2 {
+		t.Errorf("active runs = %d, want within [2, %d] (both agents on at least one token)", activeRuns, len(mocks)*2)
 	}
 }
 
@@ -828,6 +970,29 @@ func TestIdleRotationDisabled(t *testing.T) {
 	p.maintainTick(context.Background())
 	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
 		t.Fatalf("finished runs = %v with idle rotation disabled, want none", got)
+	}
+}
+
+func TestMaintainTickSkipsCooldownToken(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// An active session + run: a normal maintain pass would heartbeat the
+	// session (GET) and may rotate the run. With the token cooling down the
+	// pass must not touch the upstream at all.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.LeaseRelease(lease)
+
+	p.CooldownToken(0, time.Hour)
+
+	before := mock.Requests
+	p.maintainTick(context.Background())
+	if got := mock.Requests; got != before {
+		t.Errorf("upstream requests during cooldown maintain = %d, want %d (no heartbeat/rotate)", got, before)
 	}
 }
 func TestBridgeLRUEviction(t *testing.T) {
@@ -1114,5 +1279,116 @@ func TestBridgeAcquireEmptyToken(t *testing.T) {
 	}
 	if got := p.bridgeLen(); got != 0 {
 		t.Errorf("bridge entries = %d, want 0 (no entry for empty token)", got)
+	}
+}
+
+// flakyFirstRT fails the very first request with a transient transport error
+// and delegates everything else to base. It drives a real retry through the
+// full stack deterministically (a live connection teardown surfaces as
+// context.Canceled on some platforms, which must never be retried).
+type flakyFirstRT struct {
+	mu     sync.Mutex
+	failed bool
+	base   http.RoundTripper
+}
+
+func (f *flakyFirstRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	shouldFail := !f.failed
+	if shouldFail {
+		f.failed = true
+	}
+	f.mu.Unlock()
+	if shouldFail {
+		return nil, errors.New("read tcp 127.0.0.1:443: connection reset by peer")
+	}
+	return f.base.RoundTrip(req)
+}
+
+func TestPoolSnapshotTransientRetryCounters(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"` + modelA + `","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`)
+
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		TransientRetries:   1,
+		TLSFingerprint:     "chrome126",
+	}
+	client, err := upstream.New("tok-0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first upstream call (agent-runs START during Acquire) fails at the
+	// transport level once; TRANSIENT_RETRIES replays it and succeeds.
+	client.SetTransport(&flakyFirstRT{base: http.DefaultTransport})
+
+	sess := session.NewManager(client)
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := New(cfg, []*upstream.Client{client}, []*session.Manager{sess}, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatalf("acquire failed after transient retry: %v", err)
+	}
+	defer p.LeaseRelease(lease)
+
+	opts := upstream.ChatOptions{Model: modelA, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID}
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"ping"}]}`)
+	rc, err := p.Chat(context.Background(), lease, opts, body)
+	if err != nil {
+		t.Fatalf("pool chat failed: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if !strings.Contains(string(got), `"content":"hi"`) {
+		t.Errorf("stream = %q, want content chunk", got)
+	}
+
+	// Pool-wide totals and the per-token row both surface the counters.
+	ps := p.PoolSnapshot()
+	if ps.TransientRetries != 1 {
+		t.Errorf("PoolSnapshot.TransientRetries = %d, want 1", ps.TransientRetries)
+	}
+	if ps.FingerprintRotations != 1 {
+		t.Errorf("PoolSnapshot.FingerprintRotations = %d, want 1 (pinned chrome126 rotated on retry)", ps.FingerprintRotations)
+	}
+	if len(ps.Tokens) != 1 {
+		t.Fatalf("PoolSnapshot.Tokens = %d rows, want 1", len(ps.Tokens))
+	}
+	if ps.Tokens[0].TransientRetries != 1 {
+		t.Errorf("TokenSnapshot.TransientRetries = %d, want 1", ps.Tokens[0].TransientRetries)
+	}
+	if ps.Tokens[0].FingerprintRotations != 1 {
+		t.Errorf("TokenSnapshot.FingerprintRotations = %d, want 1", ps.Tokens[0].FingerprintRotations)
+	}
+
+	// Snapshot() (healthz) carries the same per-token counters.
+	snaps := p.Snapshot()
+	if len(snaps) != 1 || snaps[0].TransientRetries != 1 || snaps[0].FingerprintRotations != 1 {
+		t.Errorf("Snapshot() = %+v, want 1/1 retry counters", snaps)
+	}
+}
+
+func TestPoolSnapshotZeroCountersWhenNoRetries(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	ps := p.PoolSnapshot()
+	if ps.TransientRetries != 0 || ps.FingerprintRotations != 0 {
+		t.Errorf("PoolSnapshot = %+v, want zero counters without retries", ps)
+	}
+	if len(ps.Tokens) != 1 || ps.Tokens[0].TransientRetries != 0 {
+		t.Errorf("per-token counters = %+v, want zero", ps.Tokens)
 	}
 }

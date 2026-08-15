@@ -16,6 +16,7 @@ var envKeys = []string{
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "HTTP_PROXY",
 	"SOCKS5_PROXY", "SOCKS5_PROXIES", "COST_MODE", "TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES", "AUTO_DISCOVER_TOKEN",
+	"TRANSIENT_RETRIES",
 }
 
 func clearEnv(t *testing.T) {
@@ -77,6 +78,45 @@ func TestDefaults(t *testing.T) {
 	if cfg.CostMode != "free" {
 		t.Errorf("CostMode = %q, want free (default: omission routes requests as paid -> 402)", cfg.CostMode)
 	}
+}
+
+func TestTransientRetries(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+
+	// default: 1 (one additional attempt after a transient transport failure)
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if cfg.TransientRetries != 1 {
+		t.Errorf("TransientRetries = %d, want 1 (default)", cfg.TransientRetries)
+	}
+
+	// explicit 0 disables retries
+	t.Setenv("TRANSIENT_RETRIES", "0")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (0): %v", err)
+	} else if cfg.TransientRetries != 0 {
+		t.Errorf("TransientRetries = %d, want 0 (disabled)", cfg.TransientRetries)
+	}
+	t.Setenv("TRANSIENT_RETRIES", "")
+
+	// JSON file value
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"TRANSIENT_RETRIES": 2}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (JSON): %v", err)
+	} else if cfg.TransientRetries != 2 {
+		t.Errorf("TransientRetries = %d, want 2 (JSON)", cfg.TransientRetries)
+	}
+
+	// negative fails validation
+	t.Setenv("TRANSIENT_RETRIES", "-1")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "TRANSIENT_RETRIES") {
+		t.Fatalf("Load (negative): err = %v, want error mentioning TRANSIENT_RETRIES", err)
+	}
+	t.Setenv("TRANSIENT_RETRIES", "")
 }
 
 func TestSafeMode(t *testing.T) {

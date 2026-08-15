@@ -95,6 +95,17 @@ type TokenSnapshot struct {
 	DailyLimit           int    // configured MAX_MESSAGES_PER_DAY (0 = unlimited)
 	UsagePct             int    // percentage of daily limit used (0 when unlimited)
 	RiskLevel            string // "low", "moderate", "high", "critical" account safety indicator (#6)
+	// QuotaByModel is the live per-model session quota from the last
+	// admission (key = model id); empty until the session reports it.
+	// Entitlement is a top-level per-token view (empty: the upstream wire
+	// nests entitlement inside each rate-limit entry).
+	QuotaByModel map[string]session.QuotaSnapshot
+	Entitlement  map[string]float64
+	// TransientRetries / FingerprintRotations are this token's upstream
+	// client counters (TRANSIENT_RETRIES): retried transport failures and
+	// pinned TLS fingerprint swaps. Surfaced per-token in /metrics.
+	TransientRetries     int64
+	FingerprintRotations int64
 }
 
 // Pool balances requests across the configured tokens.
@@ -177,17 +188,25 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	}
 
 	start := int(p.rr.Add(1)-1) % len(p.toks)
+	// Hot-session-first selection: tokens that already hold a live session
+	// are tried before any fresh account, so a request reuses the live slot
+	// instead of admitting a new session (never create where one already
+	// exists — the lowest fingerprint/quota-burn path). When at least one
+	// token is hot, the pass iterates only over hot tokens; only when every
+	// hot token fails does it fall back to the remaining eligible tokens
+	// from the round-robin start (cold path), exactly like the historical
+	// linear failover. When no token is hot the order is unchanged.
+	order := p.acquireOrder(start, model)
 	var errs []string
 	var waiting []*session.WaitingRoomError
 	var rateLimited []*upstream.RateLimitError
 	var banned []*upstream.BanError
 	var dailyLimited []*upstream.RateLimitError
 
-	for offset := 0; offset < len(p.toks); offset++ {
+	for _, idx := range order {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		idx := (start + offset) % len(p.toks)
 		tok := p.toks[idx]
 		name := fmt.Sprintf("token-%d", idx+1)
 
@@ -281,6 +300,83 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		return nil, bestDailyLimit(dailyLimited)
 	}
 	return nil, fmt.Errorf("unable to acquire run from any token: %s", strings.Join(errs, "; "))
+}
+
+// acquireOrder computes the token iteration order for one Acquire pass
+// (hot-session-first selection, see Acquire). start is the round-robin
+// start index; model is the requested upstream model, used as a tiebreak to
+// prefer a hot token whose session already serves it (sessions are shared
+// across models in practice, so the match is not a requirement).
+func (p *Pool) acquireOrder(start int, model string) []int {
+	// eligible mirrors the per-token checks the failover loop applies:
+	// not cooling down and (when configured) under the daily message cap.
+	eligible := func(idx int) bool {
+		tok := p.toks[idx]
+		if time.Now().Before(tok.runs.CooldownUntil()) {
+			return false
+		}
+		if p.cfg.MaxMessagesPerDay > 0 && p.usageCount(idx) >= p.cfg.MaxMessagesPerDay {
+			return false
+		}
+		return true
+	}
+
+	var hot []int
+	for offset := 0; offset < len(p.toks); offset++ {
+		idx := (start + offset) % len(p.toks)
+		if !eligible(idx) || !tokenHasLiveSession(p.toks[idx]) {
+			continue
+		}
+		hot = append(hot, idx)
+	}
+	if len(hot) == 0 {
+		// No hot tokens: plain round-robin over every token, exactly like
+		// the historical behavior.
+		order := make([]int, len(p.toks))
+		for i := range order {
+			order[i] = (start + i) % len(p.toks)
+		}
+		return order
+	}
+
+	// Prefer the hot token whose session already serves the requested
+	// model; the rest keep their round-robin order.
+	best := 0
+	for i, idx := range hot {
+		if p.toks[idx].session.Snapshot().Model == model {
+			best = i
+			break
+		}
+	}
+	if best > 0 {
+		hot = append(hot[best:], hot[:best]...)
+	}
+
+	// Cold fallback: the remaining eligible tokens from the round-robin
+	// start, excluding the hot tokens already attempted this pass (each
+	// token is attempted at most once, as in the historical failover).
+	attempted := make(map[int]struct{}, len(hot))
+	for _, idx := range hot {
+		attempted[idx] = struct{}{}
+	}
+	order := hot
+	for offset := 0; offset < len(p.toks); offset++ {
+		idx := (start + offset) % len(p.toks)
+		if _, ok := attempted[idx]; ok || !eligible(idx) {
+			continue
+		}
+		order = append(order, idx)
+	}
+	return order
+}
+
+// tokenHasLiveSession reports whether token's cached session is active and
+// unexpired — i.e. a request can reuse it without admitting a new session.
+// Snapshot reads local state only (no upstream calls), safe to call per
+// token per acquire.
+func tokenHasLiveSession(tok *tokenEntry) bool {
+	snap := tok.session.Snapshot()
+	return snap.Status == "active" && !snap.ExpiresAt.IsZero() && snap.ExpiresAt.After(time.Now())
 }
 
 // AcquireBridge acquires a lease for one client-supplied token in bridge
@@ -587,9 +683,33 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 			SessionInstanceID:    ss.InstanceID,
 			SessionQueuePosition: ss.QueuePosition,
 			SessionQueueDepth:    ss.QueueDepth,
+			QuotaByModel:         ss.QuotaByModel,
+			Entitlement:          ss.Entitlement,
+			TransientRetries:     tok.client.TransientRetries(),
+			FingerprintRotations: tok.client.FingerprintRotations(),
 		})
 	}
 	return out
+}
+
+// PoolSnapshot is the pool-wide metrics view: aggregate transient-retry
+// counters summed across every fixed token's client, plus the per-token rows
+// (same shape as Snapshot). Bridge-mode entries are not counted: they are
+// per-client-token ephemeral slots with no fixed token index.
+type PoolSnapshot struct {
+	TransientRetries     int64
+	FingerprintRotations int64
+	Tokens               []TokenSnapshot
+}
+
+// PoolSnapshot returns the pool-wide snapshot with aggregate counters.
+func (p *Pool) PoolSnapshot() PoolSnapshot {
+	ps := PoolSnapshot{Tokens: p.Snapshot()}
+	for _, tok := range p.toks {
+		ps.TransientRetries += tok.client.TransientRetries()
+		ps.FingerprintRotations += tok.client.FingerprintRotations()
+	}
+	return ps
 }
 
 // --- internals ---
@@ -890,6 +1010,13 @@ func (p *Pool) maintainTick(ctx context.Context) {
 		return
 	}
 	for i, tok := range p.toks {
+		// Cooldown: skip all per-token maintain work (rotate, draining
+		// FINISH, heartbeat, queued-session advance). Upstream calls during
+		// a cooldown look like abuse; the skip is silent — the cooldown
+		// itself is already surfaced elsewhere (Acquire logs the skip).
+		if time.Now().Before(tok.runs.CooldownUntil()) {
+			continue
+		}
 		mCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
 		tok.runs.Maintain(mCtx)
 		// Advance queued sessions (GET poll) and send heartbeats for active sessions.
@@ -937,6 +1064,11 @@ func (p *Pool) bridgeMaintain(ctx context.Context) {
 		entry.runs.FinishAllRuns(context.Background())
 	}
 	for _, entry := range toMaintain {
+		// Same cooldown skip as the fixed-token loop: no heartbeat, no
+		// queued-session EnsureSession, no rotation while cooling down.
+		if time.Now().Before(entry.runs.CooldownUntil()) {
+			continue
+		}
 		mCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
 		entry.runs.Maintain(mCtx)
 		snap := entry.session.Snapshot()

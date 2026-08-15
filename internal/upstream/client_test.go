@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/andybalholm/brotli"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/stealth"
 	"freebuff-proxy/internal/testutil"
 )
 
@@ -361,6 +364,55 @@ func TestSessionControlCalls(t *testing.T) {
 	// end + tolerated 404
 	if err := client.EndSession(context.Background(), "inst-abc-123"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestSessionCallParsesRateLimitsByModel verifies the live per-model quota
+// map from an admission response is parsed into SessionState, including the
+// nested entitlement breakdown and flex-time resetAt.
+func TestSessionCallParsesRateLimitsByModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.RateLimitsByModel = map[string]any{
+		"z-ai/glm-5.2": map[string]any{
+			"model":       "z-ai/glm-5.2",
+			"limit":       5,
+			"recentCount": 4,
+			"period":      "pacific_day",
+			"resetAt":     "2026-08-16T07:00:00.000Z",
+			"entitlementBreakdown": map[string]any{
+				"base":     1,
+				"referral": 1,
+				"streak":   3,
+			},
+		},
+	}
+
+	client, _ := New("tok", testConfig(mock.URL(), nil))
+	st, err := client.CreateSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, ok := st.RateLimitsByModel["z-ai/glm-5.2"]
+	if !ok {
+		t.Fatalf("RateLimitsByModel missing model z-ai/glm-5.2: %+v", st.RateLimitsByModel)
+	}
+	if q.Limit != 5 || q.RecentCount != 4 {
+		t.Errorf("quota limit/recentCount = %v/%v, want 5/4", q.Limit, q.RecentCount)
+	}
+	if q.Period != "pacific_day" {
+		t.Errorf("period = %q, want pacific_day", q.Period)
+	}
+	if q.ResetAt.IsZero() {
+		t.Error("resetAt not parsed")
+	} else if want := "2026-08-16T07:00:00Z"; q.ResetAt.UTC().Format(time.RFC3339) != want {
+		t.Errorf("resetAt = %s, want %s", q.ResetAt.UTC().Format(time.RFC3339), want)
+	}
+	if q.Entitlement["base"] != 1 || q.Entitlement["referral"] != 1 || q.Entitlement["streak"] != 3 {
+		t.Errorf("entitlement = %+v, want base=1 referral=1 streak=3", q.Entitlement)
+	}
+	if q.Model != "z-ai/glm-5.2" {
+		t.Errorf("quota model = %q", q.Model)
 	}
 }
 
@@ -829,5 +881,331 @@ func TestSessionCallStructured4xx(t *testing.T) {
 				t.Errorf("status = %q, want %q", st.Status, tc.wantStatus)
 			}
 		})
+	}
+}
+
+// flakyRT is a RoundTripper that fails the first failN calls with a fixed
+// transport error, then serves a canned 200 SSE response. It records every
+// request body and header so tests can assert GetBody replay and fingerprint
+// rotation.
+type flakyRT struct {
+	failN       int
+	calls       int
+	err         error
+	body        []byte
+	seen        [][]byte
+	header      http.Header
+	seenHeaders []http.Header
+}
+
+func (f *flakyRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.calls++
+	b, _ := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	f.seen = append(f.seen, b)
+	f.seenHeaders = append(f.seenHeaders, req.Header.Clone())
+	if f.calls <= f.failN {
+		return nil, f.err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     f.header,
+		Body:       io.NopCloser(bytes.NewReader(f.body)),
+		Request:    req,
+	}, nil
+}
+
+// newRetryClient builds a client with TRANSIENT_RETRIES enabled and a pinned
+// TLS fingerprint (optional), with the retry backoff pinned to 1ms.
+func newRetryClient(t *testing.T, baseURL string, retries int, fingerprint string) (*Client, *flakyRT) {
+	t.Helper()
+	client, err := New("tok-a", testConfig(baseURL, func(c *config.Config) {
+		c.TransientRetries = retries
+		c.TLSFingerprint = fingerprint
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.retryBackoff = func() time.Duration { return time.Millisecond }
+	rt := &flakyRT{}
+	client.http.Transport = rt
+	return client, rt
+}
+
+func TestChatCompletionsRetriesTransientFailure(t *testing.T) {
+	client, rt := newRetryClient(t, "", 1, "")
+	rt.failN = 1
+	rt.err = errors.New("tls handshake failed")
+	rt.body = []byte(testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`) + "data: [DONE]\n\n")
+
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+	if err != nil {
+		t.Fatalf("ChatCompletions failed after transient retry: %v", err)
+	}
+	_, _ = io.ReadAll(rc)
+	_ = rc.Close()
+
+	if rt.calls != 2 {
+		t.Errorf("upstream attempts = %d, want 2 (1 failure + 1 retry)", rt.calls)
+	}
+	if got := client.TransientRetries(); got != 1 {
+		t.Errorf("TransientRetries = %d, want 1", got)
+	}
+	// GetBody replay must re-send an identical payload.
+	if len(rt.seen) != 2 || string(rt.seen[0]) != string(rt.seen[1]) {
+		t.Errorf("replayed body differs: %q vs %q", rt.seen[0], rt.seen[1])
+	}
+	if !strings.Contains(string(rt.seen[0]), `"run_id":"r"`) {
+		t.Errorf("first attempt body missing envelope: %q", rt.seen[0])
+	}
+}
+
+func TestChatCompletionsRetriesTwiceWhenAllowed(t *testing.T) {
+	client, rt := newRetryClient(t, "", 2, "")
+	rt.failN = 2
+	rt.err = io.EOF
+	rt.body = []byte(testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`) + "data: [DONE]\n\n")
+
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+	if err != nil {
+		t.Fatalf("ChatCompletions failed after 2 retries: %v", err)
+	}
+	_, _ = io.ReadAll(rc)
+	_ = rc.Close()
+
+	if rt.calls != 3 {
+		t.Errorf("upstream attempts = %d, want 3 (2 failures + 2 retries)", rt.calls)
+	}
+	if got := client.TransientRetries(); got != 2 {
+		t.Errorf("TransientRetries = %d, want 2", got)
+	}
+	for i := 1; i < len(rt.seen); i++ {
+		if string(rt.seen[i]) != string(rt.seen[0]) {
+			t.Errorf("attempt %d body differs from attempt 0: %q vs %q", i, rt.seen[i], rt.seen[0])
+		}
+	}
+}
+
+func TestCreateSessionRetriesConnectionReset(t *testing.T) {
+	// A real abrupt connection close surfaces as context.Canceled on some
+	// platforms (Go cancels the request context when the server tears the
+	// connection down mid-request), which MUST NOT be retried. Inject the
+	// transport-level reset at the RoundTripper boundary instead: this is
+	// the same code path a live dial/TLS failure takes.
+	rt := &flakyRT{
+		failN:  1,
+		err:    errors.New("read tcp 127.0.0.1:443: connection reset by peer"),
+		header: http.Header{"Content-Type": []string{"application/json"}},
+		body:   []byte(`{"status":"active","instanceId":"inst-1","expiresAt":"2030-01-01T00:00:00Z"}`),
+	}
+	client, err := New("tok-a", testConfig("", func(c *config.Config) { c.TransientRetries = 1 }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.retryBackoff = func() time.Duration { return time.Millisecond }
+	client.SetTransport(rt)
+
+	st, err := client.CreateSession(context.Background())
+	if err != nil {
+		t.Fatalf("CreateSession failed after retry: %v", err)
+	}
+	if st.Status != "active" || st.InstanceID != "inst-1" {
+		t.Errorf("session = %+v, want active inst-1", st)
+	}
+	if rt.calls != 2 {
+		t.Errorf("upstream attempts = %d, want 2 (1 failure + 1 retry)", rt.calls)
+	}
+	if got := client.TransientRetries(); got != 1 {
+		t.Errorf("TransientRetries = %d, want 1", got)
+	}
+	// The session POST body was replayed identically.
+	if len(rt.seen) != 2 || string(rt.seen[0]) != string(rt.seen[1]) {
+		t.Errorf("replayed session body differs: %q vs %q", rt.seen[0], rt.seen[1])
+	}
+}
+
+func TestRateLimitNeverRetried(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.RateLimit = true
+
+	client, err := New("tok-a", testConfig(mock.URL(), func(c *config.Config) { c.TransientRetries = 3 }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.retryBackoff = func() time.Duration { return time.Millisecond }
+
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	_, err = client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+	if mock.Requests != 1 {
+		t.Errorf("upstream requests = %d, want exactly 1 (429 must never be retried)", mock.Requests)
+	}
+	if got := client.TransientRetries(); got != 0 {
+		t.Errorf("TransientRetries = %d, want 0", got)
+	}
+}
+
+func TestBanNeverRetried(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.Ban = true
+
+	client, err := New("tok-a", testConfig(mock.URL(), func(c *config.Config) { c.TransientRetries = 3 }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.retryBackoff = func() time.Duration { return time.Millisecond }
+
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	_, err = client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+	if !errors.Is(err, ErrBanned) {
+		t.Fatalf("err = %v, want ErrBanned", err)
+	}
+	if mock.Requests != 1 {
+		t.Errorf("upstream requests = %d, want exactly 1 (403 banned must never be retried)", mock.Requests)
+	}
+	if got := client.TransientRetries(); got != 0 {
+		t.Errorf("TransientRetries = %d, want 0", got)
+	}
+}
+
+func TestTransientRetriesDisabledSingleAttempt(t *testing.T) {
+	client, rt := newRetryClient(t, "", 0, "")
+	rt.failN = 100
+	rt.err = errors.New("connection reset by peer")
+	rt.body = []byte(testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`))
+
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	_, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+	if err == nil {
+		t.Fatal("want error when every attempt fails")
+	}
+	if rt.calls != 1 {
+		t.Errorf("upstream attempts = %d, want exactly 1 (TRANSIENT_RETRIES=0)", rt.calls)
+	}
+	if got := client.TransientRetries(); got != 0 {
+		t.Errorf("TransientRetries = %d, want 0", got)
+	}
+}
+
+func TestRetryRotatesPinnedFingerprint(t *testing.T) {
+	client, rt := newRetryClient(t, "", 1, "chrome126")
+	rt.failN = 1
+	rt.err = errors.New("tls handshake failed")
+	rt.body = []byte(testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`))
+
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+	if err != nil {
+		t.Fatalf("ChatCompletions failed after retry: %v", err)
+	}
+	_, _ = io.ReadAll(rc)
+	_ = rc.Close()
+
+	if got := client.FingerprintRotations(); got != 1 {
+		t.Errorf("FingerprintRotations = %d, want 1", got)
+	}
+	client.profileMu.Lock()
+	id := client.stealthProfile.ID
+	client.profileMu.Unlock()
+	if id != stealth.ProfileIDSafari18 {
+		t.Errorf("stealthProfile = %s, want safari18 (chrome126 rotated to a distinct JA3)", id)
+	}
+	// The retried request carried the rotated profile's browser headers:
+	// the first attempt used chrome126, the retry re-applied safari18.
+	if rt.calls != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", rt.calls)
+	}
+	if got := rt.seenHeaders[0].Get("User-Agent"); got != stealth.ProfileChrome126.UserAgent {
+		t.Errorf("attempt 1 User-Agent = %q, want chrome126", got)
+	}
+	if got := rt.seenHeaders[1].Get("User-Agent"); got != stealth.ProfileSafari18.UserAgent {
+		t.Errorf("attempt 2 User-Agent = %q, want safari18 (rotated)", got)
+	}
+}
+
+func TestRetryDoesNotRotateAutoProfile(t *testing.T) {
+	client, rt := newRetryClient(t, "", 1, "auto")
+	rt.failN = 1
+	rt.err = errors.New("tls handshake failed")
+	rt.body = []byte(testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`))
+
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+	if err != nil {
+		t.Fatalf("ChatCompletions failed after retry: %v", err)
+	}
+	_, _ = io.ReadAll(rc)
+	_ = rc.Close()
+
+	if got := client.FingerprintRotations(); got != 0 {
+		t.Errorf("FingerprintRotations = %d, want 0 (auto rotates per connection already)", got)
+	}
+	client.profileMu.Lock()
+	id := client.stealthProfile.ID
+	client.profileMu.Unlock()
+	if id != stealth.ProfileIDAuto {
+		t.Errorf("stealthProfile = %s, want auto (unchanged)", id)
+	}
+}
+
+func TestIsTransient(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"tls handshake failed (wrapper)", errors.New("tls handshake failed: EOF"), true},
+		{"tls handshake failure (Go alert)", errors.New("remote error: tls: handshake failure"), true},
+		{"tls internal error", errors.New("tls: internal error"), true},
+		{"connection refused", errors.New(`dial tcp 127.0.0.1:443: connect: connection refused`), true},
+		{"connection reset by peer", errors.New("read tcp 1.2.3.4:443: connection reset by peer"), true},
+		{"EOF", io.EOF, true},
+		{"unexpected EOF", errors.New("unexpected EOF"), true},
+		{"network unreachable", errors.New(`dial tcp 1.2.3.4:443: connect: network is unreachable`), true},
+		{"no route to host", errors.New(`dial tcp 1.2.3.4:443: connect: no route to host`), true},
+		{"dial i/o timeout", errors.New(`dial tcp 1.2.3.4:443: i/o timeout`), true},
+		{"stealth-wrapped connection reset", fmt.Errorf("stealth: tcp dial failed: %w", errors.New("connection reset by peer")), true},
+		{"url-wrapped EOF", &url.Error{Op: "Post", URL: "https://www.codebuff.com/api/v1/chat/completions", Err: io.EOF}, true},
+		{"context canceled", context.Canceled, false},
+		{"context deadline exceeded", context.DeadlineExceeded, false},
+		{"tls bad certificate", errors.New("tls: failed to verify certificate: x509: certificate signed by unknown authority"), false},
+		{"rate limit body", errors.New("upstream rate limited"), false},
+		{"arbitrary error", errors.New("boom"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTransient(tc.err); got != tc.want {
+				t.Errorf("isTransient(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNextStealthProfile(t *testing.T) {
+	// Deterministic rotation across DISTINCT ClientHelloIDs.
+	cases := []struct {
+		cur  *stealth.Profile
+		want *stealth.Profile
+	}{
+		{stealth.ProfileChrome120, stealth.ProfileSafari18},
+		{stealth.ProfileChrome126, stealth.ProfileSafari18},
+		{stealth.ProfileEdge126, stealth.ProfileSafari18},
+		{stealth.ProfileSafari17, stealth.ProfileFirefox128},
+		{stealth.ProfileSafari18, stealth.ProfileFirefox128},
+		{stealth.ProfileFirefox120, stealth.ProfileChrome126},
+		{stealth.ProfileFirefox128, stealth.ProfileChrome126},
+	}
+	for _, tc := range cases {
+		if got := nextStealthProfile(tc.cur); got != tc.want {
+			t.Errorf("nextStealthProfile(%s) = %s, want %s", tc.cur.ID, got.ID, tc.want.ID)
+		}
 	}
 }

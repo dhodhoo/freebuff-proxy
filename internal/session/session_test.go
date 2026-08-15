@@ -398,6 +398,51 @@ func TestSnapshotModelAndExpiresAt(t *testing.T) {
 	}
 }
 
+func TestSnapshotQuotaByModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.RateLimitsByModel = map[string]any{
+		"z-ai/glm-5.2": map[string]any{
+			"model":       "z-ai/glm-5.2",
+			"limit":       5,
+			"recentCount": 4,
+			"period":      "pacific_day",
+			"resetAt":     "2026-08-16T07:00:00.000Z",
+			"entitlementBreakdown": map[string]any{
+				"base":     1,
+				"referral": 1,
+				"streak":   3,
+			},
+		},
+	}
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := mgr.Snapshot()
+	q, ok := snap.QuotaByModel["z-ai/glm-5.2"]
+	if !ok {
+		t.Fatalf("QuotaByModel missing z-ai/glm-5.2: %+v", snap.QuotaByModel)
+	}
+	if q.Limit != 5 || q.RecentCount != 4 {
+		t.Errorf("quota limit/recentCount = %v/%v, want 5/4", q.Limit, q.RecentCount)
+	}
+	if q.Period != "pacific_day" {
+		t.Errorf("period = %q, want pacific_day", q.Period)
+	}
+	if q.ResetAt.IsZero() {
+		t.Error("resetAt not surfaced")
+	}
+	if q.Entitlement["referral"] != 1 || q.Entitlement["streak"] != 3 {
+		t.Errorf("entitlement = %+v, want referral=1 streak=3", q.Entitlement)
+	}
+	if len(snap.Entitlement) != 0 {
+		t.Errorf("top-level Entitlement = %+v, want empty (nested per model)", snap.Entitlement)
+	}
+}
+
 func TestHeartbeat(t *testing.T) {
 	t.Run("inactive session returns nil", func(t *testing.T) {
 		mock := testutil.NewMock()

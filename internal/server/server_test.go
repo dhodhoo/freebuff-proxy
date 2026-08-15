@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,6 +31,12 @@ const modelA = "z-ai/glm-5.2"
 // clients/session managers, fallback registry, pool, and the server - behind
 // one httptest server.
 func newTestServer(t *testing.T, apiKeys []string, mocks ...*testutil.MockUpstream) (*httptest.Server, *pool.Pool) {
+	return newTestServerCfg(t, apiKeys, nil, mocks...)
+}
+
+// newTestServerCfg is newTestServer with a config mutation hook (e.g.
+// enabling TRANSIENT_RETRIES for retry/metrics tests).
+func newTestServerCfg(t *testing.T, apiKeys []string, mut func(*config.Config), mocks ...*testutil.MockUpstream) (*httptest.Server, *pool.Pool) {
 	t.Helper()
 	cfg := &config.Config{
 		AuthTokens:         make([]string, len(mocks)),
@@ -39,6 +46,9 @@ func newTestServer(t *testing.T, apiKeys []string, mocks ...*testutil.MockUpstre
 		RegistryRefresh:    6 * time.Hour,
 		UpstreamBaseURL:    "https://www.codebuff.com",
 		APIKeys:            apiKeys,
+	}
+	if mut != nil {
+		mut(cfg)
 	}
 	clients := make([]*upstream.Client, 0, len(mocks))
 	sessions := make([]*session.Manager, 0, len(mocks))
@@ -583,6 +593,109 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+// quotaMock wires a mock whose admission response carries rateLimitsByModel
+// for z-ai/glm-5.2, so a chat drives session creation with quota data.
+func quotaMock(t *testing.T) *testutil.MockUpstream {
+	t.Helper()
+	mock := testutil.NewMock()
+	t.Cleanup(mock.Close)
+	mock.RateLimitsByModel = map[string]any{
+		"z-ai/glm-5.2": map[string]any{
+			"model":       "z-ai/glm-5.2",
+			"limit":       5,
+			"recentCount": 4,
+			"period":      "pacific_day",
+			"resetAt":     "2026-08-16T07:00:00.000Z",
+			"entitlementBreakdown": map[string]any{
+				"base":     1,
+				"referral": 1,
+				"streak":   3,
+			},
+		},
+	}
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-q1", 100,
+		`"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-q1", 100,
+			`"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]`))
+	return mock
+}
+
+func TestHealthzQuota(t *testing.T) {
+	mock := quotaMock(t)
+	ts, _ := newTestServer(t, nil, mock)
+
+	// A chat admits the session (which carries rateLimitsByModel).
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Tokens []struct {
+			Quota       map[string]quotaEntry `json:"quota"`
+			Entitlement map[string]float64    `json:"entitlement"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if len(out.Tokens) != 1 {
+		t.Fatalf("tokens = %d, want 1", len(out.Tokens))
+	}
+	q, ok := out.Tokens[0].Quota["z-ai/glm-5.2"]
+	if !ok {
+		t.Fatalf("healthz quota missing z-ai/glm-5.2: %+v", out.Tokens[0].Quota)
+	}
+	if q.Limit != 5 || q.RecentCount != 4 || q.Period != "pacific_day" {
+		t.Errorf("quota = %+v, want limit=5 recent_count=4 period=pacific_day", q)
+	}
+	if q.ResetAt == "" {
+		t.Error("reset_at missing from healthz quota entry")
+	}
+	if q.Entitlement["referral"] != 1 || q.Entitlement["streak"] != 3 {
+		t.Errorf("entitlement = %+v, want referral=1 streak=3", q.Entitlement)
+	}
+	if len(out.Tokens[0].Entitlement) != 0 {
+		t.Errorf("top-level entitlement = %+v, want omitted (empty)", out.Tokens[0].Entitlement)
+	}
+}
+
+func TestMetricsQuotaLines(t *testing.T) {
+	mock := quotaMock(t)
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/metrics", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	body := string(data)
+	for _, want := range []string{
+		`freebuff_proxy_quota_recent{token="1",model="z-ai/glm-5.2",period="pacific_day"} 4`,
+		`freebuff_proxy_quota_limit{token="1",model="z-ai/glm-5.2",period="pacific_day"} 5`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %s in:\n%s", want, body)
+		}
+	}
+}
+
+type quotaEntry struct {
+	Limit       float64            `json:"limit"`
+	RecentCount float64            `json:"recent_count"`
+	Period      string             `json:"period"`
+	ResetAt     string             `json:"reset_at"`
+	Entitlement map[string]float64 `json:"entitlement"`
+}
+
 func TestAdminReload(t *testing.T) {
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
@@ -878,5 +991,80 @@ func TestChatModelAliasesAndReasoningEffort(t *testing.T) {
 	}
 	if gotEffort := upstreamPayload["reasoning_effort"]; gotEffort != "max" {
 		t.Errorf("upstream reasoning_effort = %v, want \"max\"", gotEffort)
+	}
+}
+
+// flakyFirstRT fails the very first request with a transient transport error
+// and delegates everything else to base (mirrors pool_test's helper; drives a
+// real retry deterministically across platforms).
+type flakyFirstRT struct {
+	mu     sync.Mutex
+	failed bool
+	base   http.RoundTripper
+}
+
+func (f *flakyFirstRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	shouldFail := !f.failed
+	if shouldFail {
+		f.failed = true
+	}
+	f.mu.Unlock()
+	if shouldFail {
+		return nil, fmt.Errorf("read tcp 127.0.0.1:443: connection reset by peer")
+	}
+	return f.base.RoundTrip(req)
+}
+
+func TestMetricsTransientRetryCounters(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-r", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]`)) + "data: [DONE]\n\n"
+
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		TransientRetries:   1,
+	}
+	client, err := upstream.New("tok-0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first upstream call (agent-runs START during lease acquisition)
+	// fails once at the transport level; TRANSIENT_RETRIES replays it.
+	client.SetTransport(&flakyFirstRT{base: http.DefaultTransport})
+
+	sess := session.NewManager(client)
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, []*session.Manager{sess}, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(cfg, p, reg, nil)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/metrics", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	body := string(data)
+	if !strings.Contains(body, `freebuff_proxy_transient_retries_total{token="1"} 1`) {
+		t.Errorf("metrics missing transient retry line: %s", body)
+	}
+	// No TLS fingerprint is pinned in this setup, so no rotation happened
+	// and the fingerprint value line must not be emitted (only when > 0).
+	if strings.Contains(body, "freebuff_proxy_fingerprint_rotations_total{token=\"1\"}") {
+		t.Errorf("metrics emitted a fingerprint rotation value with no rotation: %s", body)
 	}
 }

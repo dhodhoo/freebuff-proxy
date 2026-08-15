@@ -73,6 +73,10 @@ type cachedState struct {
 	accessTier         string
 	countryCode        string
 	countryBlockReason string
+	// quotaByModel is the live per-model session quota from the last
+	// admission/poll that carried rateLimitsByModel (key = model id);
+	// nil until such a response is seen.
+	quotaByModel map[string]upstream.ModelQuota
 }
 
 // NewManager builds a session manager for the given upstream client.
@@ -222,6 +226,7 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 				accessTier:         st.AccessTier,
 				countryCode:        st.CountryCode,
 				countryBlockReason: st.CountryBlockReason,
+				quotaByModel:       st.RateLimitsByModel,
 			}
 			m.mu.Unlock()
 			slog.Debug("session created", "status", "active", "instance_id", st.InstanceID,
@@ -322,6 +327,22 @@ type SessionSnapshot struct {
 	TierCountry        string
 	CountryBlockReason string
 	ExpiresAt          time.Time
+	// QuotaByModel carries the live per-model session quotas (key = model id).
+	// Entitlement is a top-level per-token view; it stays empty because the
+	// upstream wire nests entitlement inside each rate-limit entry.
+	QuotaByModel map[string]QuotaSnapshot
+	Entitlement  map[string]float64
+}
+
+// QuotaSnapshot is one model's live session quota for healthz/metrics
+// reporting (pool.TokenSnapshot). Mirrors upstream.ModelQuota.
+type QuotaSnapshot struct {
+	Model       string
+	Limit       float64
+	RecentCount float64
+	ResetAt     time.Time
+	Period      string
+	Entitlement map[string]float64
 }
 
 // Snapshot returns a best-effort view of the cached session state. All
@@ -333,6 +354,17 @@ func (m *Manager) Snapshot() SessionSnapshot {
 	if m.state == nil {
 		return SessionSnapshot{}
 	}
+	quota := make(map[string]QuotaSnapshot, len(m.state.quotaByModel))
+	for modelID, q := range m.state.quotaByModel {
+		quota[modelID] = QuotaSnapshot{
+			Model:       q.Model,
+			Limit:       q.Limit,
+			RecentCount: q.RecentCount,
+			ResetAt:     q.ResetAt,
+			Period:      q.Period,
+			Entitlement: q.Entitlement,
+		}
+	}
 	return SessionSnapshot{
 		Status:             m.state.status,
 		InstanceID:         m.state.instanceID,
@@ -343,6 +375,7 @@ func (m *Manager) Snapshot() SessionSnapshot {
 		TierCountry:        m.state.countryCode,
 		CountryBlockReason: m.state.countryBlockReason,
 		ExpiresAt:          m.state.expiresAt,
+		QuotaByModel:       quota,
 	}
 }
 

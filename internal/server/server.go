@@ -549,11 +549,50 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	snaps := s.pool.Snapshot()
 	w.Header().Set("Content-Type", "application/json")
+	tokens := make([]map[string]any, 0, len(snaps))
+	for _, snap := range snaps {
+		tok := map[string]any{
+			"Token":                snap.Token,
+			"CooldownUntil":        snap.CooldownUntil,
+			"SessionStatus":        snap.SessionStatus,
+			"SessionInstanceID":    snap.SessionInstanceID,
+			"SessionQueuePosition": snap.SessionQueuePosition,
+			"SessionQueueDepth":    snap.SessionQueueDepth,
+			"ActiveRuns":           snap.ActiveRuns,
+			"Requests":             snap.Requests,
+			"Messages24h":          snap.Messages24h,
+			"DailyLimit":           snap.DailyLimit,
+			"UsagePct":             snap.UsagePct,
+			"RiskLevel":            snap.RiskLevel,
+		}
+		if len(snap.QuotaByModel) > 0 {
+			quota := make(map[string]any, len(snap.QuotaByModel))
+			for model, q := range snap.QuotaByModel {
+				entry := map[string]any{
+					"limit":        q.Limit,
+					"recent_count": q.RecentCount,
+					"period":       q.Period,
+				}
+				if !q.ResetAt.IsZero() {
+					entry["reset_at"] = q.ResetAt
+				}
+				if len(q.Entitlement) > 0 {
+					entry["entitlement"] = q.Entitlement
+				}
+				quota[model] = entry
+			}
+			tok["quota"] = quota
+		}
+		if len(snap.Entitlement) > 0 {
+			tok["entitlement"] = snap.Entitlement
+		}
+		tokens = append(tokens, tok)
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":         "ok",
 		"uptime_seconds": time.Since(s.started).Seconds(),
 		"models":         s.reg.ModelCount(),
-		"tokens":         snaps,
+		"tokens":         tokens,
 		"bridge_tokens":  s.pool.BridgeCount(),
 	})
 }
@@ -563,7 +602,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	var sb strings.Builder
 	uptime := time.Since(s.started).Seconds()
-	snaps := s.pool.Snapshot()
+	ps := s.pool.PoolSnapshot()
+	snaps := ps.Tokens
 
 	sb.WriteString("# HELP freebuff_proxy_uptime_seconds Process uptime in seconds\n")
 	sb.WriteString("# TYPE freebuff_proxy_uptime_seconds gauge\n")
@@ -607,6 +647,44 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			cd = 1
 		}
 		fmt.Fprintf(&sb, "freebuff_proxy_token_cooldown_active{token=\"%d\"} %d\n", snap.Token+1, cd)
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("# HELP freebuff_proxy_quota_recent Current usage toward the per-model quota window\n")
+	sb.WriteString("# TYPE freebuff_proxy_quota_recent gauge\n")
+	for _, snap := range snaps {
+		for model, q := range snap.QuotaByModel {
+			fmt.Fprintf(&sb, "freebuff_proxy_quota_recent{token=\"%d\",model=\"%s\",period=\"%s\"} %g\n",
+				snap.Token+1, model, q.Period, q.RecentCount)
+		}
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("# HELP freebuff_proxy_quota_limit Per-model quota limit for the window\n")
+	sb.WriteString("# TYPE freebuff_proxy_quota_limit gauge\n")
+	for _, snap := range snaps {
+		for model, q := range snap.QuotaByModel {
+			fmt.Fprintf(&sb, "freebuff_proxy_quota_limit{token=\"%d\",model=\"%s\",period=\"%s\"} %g\n",
+				snap.Token+1, model, q.Period, q.Limit)
+		}
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("# HELP freebuff_proxy_transient_retries_total Transient transport failures retried per token\n")
+	sb.WriteString("# TYPE freebuff_proxy_transient_retries_total counter\n")
+	for _, snap := range snaps {
+		if snap.TransientRetries > 0 {
+			fmt.Fprintf(&sb, "freebuff_proxy_transient_retries_total{token=\"%d\"} %d\n", snap.Token+1, snap.TransientRetries)
+		}
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("# HELP freebuff_proxy_fingerprint_rotations_total TLS fingerprint rotations per token\n")
+	sb.WriteString("# TYPE freebuff_proxy_fingerprint_rotations_total counter\n")
+	for _, snap := range snaps {
+		if snap.FingerprintRotations > 0 {
+			fmt.Fprintf(&sb, "freebuff_proxy_fingerprint_rotations_total{token=\"%d\"} %d\n", snap.Token+1, snap.FingerprintRotations)
+		}
 	}
 	sb.WriteString("\n")
 
