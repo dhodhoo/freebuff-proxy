@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -125,8 +126,14 @@ func (d *Dashboard) dataFor(name string) any {
 		return d.configData()
 	case "tokens":
 		return d.tokensData()
+	case "models":
+		return d.modelsData()
 	case "logs":
 		return d.logsData()
+	case "traces":
+		return d.tracesData()
+	case "setup":
+		return d.setupData()
 	case "metrics":
 		return d.metricsData()
 	default:
@@ -277,8 +284,11 @@ type quotaRow struct {
 	Recent         string
 	Period         string
 	ResetAt        string
+	ResetsIn       string // e.g. "in 4h 12m" (empty when no reset time)
 	Entitled       string
 	HasEntitlement bool
+	UsagePct       int // recent/limit, clamped to 100 (0 when limit is 0)
+	NearLimit      bool
 }
 
 func (d *Dashboard) tokensData() tokensData {
@@ -300,6 +310,18 @@ func (d *Dashboard) tokensData() tokensData {
 				Period:  q.Period,
 				ResetAt: shortTime(q.ResetAt),
 			}
+			if q.Limit > 0 {
+				row.UsagePct = int(q.RecentCount * 100 / q.Limit)
+				if row.UsagePct > 100 {
+					row.UsagePct = 100
+				}
+				row.NearLimit = row.UsagePct >= 80
+			}
+			if !q.ResetAt.IsZero() {
+				if d := time.Until(q.ResetAt); d > 0 {
+					row.ResetsIn = "in " + humanDuration(d)
+				}
+			}
 			if len(q.Entitlement) > 0 {
 				row.Entitled = formatEntitlement(q.Entitlement)
 				row.HasEntitlement = true
@@ -312,6 +334,132 @@ func (d *Dashboard) tokensData() tokensData {
 	}
 	td.HasTokens = len(td.Tokens) > 0
 	return td
+}
+
+// --- models ---
+
+type modelsData struct {
+	Models     []modelRow
+	Count      int
+	Agents     int
+	Aliases    []aliasRow
+	HasAliases bool
+}
+
+type modelRow struct {
+	ID    string
+	Agent string
+}
+
+type aliasRow struct {
+	Alias string
+	Real  string
+}
+
+func (d *Dashboard) modelsData() modelsData {
+	md := modelsData{Count: d.reg.ModelCount(), Agents: len(d.reg.AgentIDs())}
+	for _, id := range d.reg.Models() {
+		row := modelRow{ID: id}
+		if agent, err := d.reg.AgentForModel(id); err == nil {
+			row.Agent = agent
+		}
+		md.Models = append(md.Models, row)
+	}
+	cfg := d.cfg()
+	for alias, real := range cfg.ModelAliases {
+		md.Aliases = append(md.Aliases, aliasRow{Alias: alias, Real: real})
+	}
+	sort.Slice(md.Aliases, func(i, j int) bool { return md.Aliases[i].Alias < md.Aliases[j].Alias })
+	md.HasAliases = len(md.Aliases) > 0
+	return md
+}
+
+// --- traces ---
+
+// tracesData renders the chat-trace ring: recent chat completions and their
+// routing outcome (token, model, status, duration, error class).
+type tracesData struct {
+	Enabled bool
+	Traces  []traceEntry
+}
+
+type traceEntry struct {
+	Time   string
+	Token  string
+	Model  string
+	Status string
+	Ms     string
+	Error  string
+}
+
+func (d *Dashboard) tracesData() tracesData {
+	td := tracesData{Enabled: d.logs != nil}
+	if d.logs == nil {
+		return td
+	}
+	for _, e := range d.logs.Recent(200) {
+		if e.Message != "chat trace" {
+			continue
+		}
+		entry := traceEntry{Time: e.Time, Status: "ok"}
+		for _, f := range e.Fields {
+			key, value, ok := strings.Cut(f, "=")
+			if !ok {
+				continue
+			}
+			switch key {
+			case "token":
+				entry.Token = value
+			case "model":
+				entry.Model = value
+			case "status":
+				entry.Status = value
+			case "ms":
+				entry.Ms = value + "ms"
+			case "error":
+				entry.Error = value
+			}
+		}
+		if entry.Token == "" {
+			entry.Token = "—"
+		}
+		td.Traces = append(td.Traces, entry)
+	}
+	return td
+}
+
+// --- client setup ---
+
+// setupData renders copy-paste client configuration snippets from the
+// effective config (mirrors the -setup command's shapes).
+type setupData struct {
+	BaseURL string
+	KeyHint string
+	Model   string
+	Models  []string
+	Bridge  bool
+}
+
+func (d *Dashboard) setupData() setupData {
+	cfg := d.cfg()
+	host := "localhost"
+	if h, _, err := net.SplitHostPort(cfg.ListenAddr); err == nil && h != "" && h != "0.0.0.0" && h != "::" {
+		host = h
+	}
+	sd := setupData{
+		BaseURL: "http://" + host + "/v1",
+		Bridge:  cfg.BridgeMode(),
+		Models:  d.reg.Models(),
+	}
+	if len(sd.Models) > 0 {
+		sd.Model = sd.Models[0]
+	}
+	if cfg.BridgeMode() {
+		sd.KeyHint = "your FreeBuff token (bridge mode: the client's Authorization header IS the upstream token)"
+	} else {
+		sd.KeyHint = "sk-any (pooled mode; the proxy picks from AUTH_TOKENS)"
+	}
+	return sd
 }
 
 // cardFromSnapshot maps one pool snapshot into the shared token-card view
@@ -371,6 +519,26 @@ func shortTime(t time.Time) string {
 		return ""
 	}
 	return t.Format("15:04 Jan 2")
+}
+
+// humanDuration renders a duration compactly for countdowns: "4h 12m",
+// "45m", "30s". Sub-minute values round up to "1m" so countdowns never
+// show a false "0s" while a quota is still active.
+func humanDuration(d time.Duration) string {
+	d = d.Round(time.Minute)
+	if d < time.Minute {
+		d = time.Minute
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	switch {
+	case h > 0 && m > 0:
+		return fmt.Sprintf("%dh %dm", h, m)
+	case h > 0:
+		return fmt.Sprintf("%dh", h)
+	default:
+		return fmt.Sprintf("%dm", m)
+	}
 }
 
 // RenderConfigResult renders the htmx response fragment after a config save

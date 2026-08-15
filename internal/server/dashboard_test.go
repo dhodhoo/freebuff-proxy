@@ -270,6 +270,51 @@ func authedCookie(t *testing.T, ts *httptest.Server) string {
 	return cookies[0].Name + "=" + cookies[0].Value
 }
 
+// Token actions: unlock/finish/test endpoints work with a session cookie.
+func TestDashboardTokenActions(t *testing.T) {
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	// Unlock a token that has no lock — the action is idempotent success.
+	resp := doTokenAction(t, ts.URL, cookie, "/admin/tokens/0/unlock")
+	body := bodyOf(t, resp)
+	if !strings.Contains(body, "Token 0 unlocked") {
+		t.Errorf("unlock response = %q, want success message", body)
+	}
+
+	// Out-of-range token fails cleanly.
+	resp = doTokenAction(t, ts.URL, cookie, "/admin/tokens/9/unlock")
+	if !strings.Contains(bodyOf(t, resp), "out of range") {
+		t.Error("out-of-range unlock did not report failure")
+	}
+
+	// Finish runs: succeeds (mock has no runs to finish).
+	resp = doTokenAction(t, ts.URL, cookie, "/admin/tokens/0/finish")
+	if !strings.Contains(bodyOf(t, resp), "runs finished") {
+		t.Error("finish action did not report success")
+	}
+
+	// Test: real session handshake against the mock upstream.
+	resp = doTokenAction(t, ts.URL, cookie, "/admin/tokens/0/test")
+	if !strings.Contains(bodyOf(t, resp), "session handshake succeeded") {
+		t.Error("test action did not report success")
+	}
+}
+
+func doTokenAction(t *testing.T, url, cookie, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Cookie", cookie)
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
 // A valid .env save persists the file and reports success.
 func TestDashboardConfigSave(t *testing.T) {
 	t.Chdir(t.TempDir())

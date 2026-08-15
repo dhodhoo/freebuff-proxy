@@ -330,6 +330,17 @@ func (m *RunManager) Cooldown(d time.Duration) {
 	m.mu.Unlock()
 }
 
+// ClearCooldowns removes any cooldown, rate-limit lock, and ban window so
+// the token is immediately acquirable again (dashboard unlock action).
+func (m *RunManager) ClearCooldowns() {
+	m.mu.Lock()
+	m.cooldownUntil = time.Time{}
+	m.rateLimit = nil
+	m.ban = nil
+	m.banUntil = time.Time{}
+	m.mu.Unlock()
+}
+
 // CooldownUntil returns the cooldown deadline (zero when not cooling down).
 func (m *RunManager) CooldownUntil() time.Time {
 	m.mu.Lock()

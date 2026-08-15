@@ -491,6 +491,41 @@ func (p *Pool) InvalidateRun(token int, agentID string) {
 	p.toks[token].runs.Invalidate(agentID)
 }
 
+// UnlockToken clears any cooldown/rate-limit/ban lock on token so Acquire
+// can use it again (dashboard unlock action).
+func (p *Pool) UnlockToken(token int) error {
+	if token < 0 || token >= len(p.toks) {
+		return fmt.Errorf("pool: token %d out of range", token)
+	}
+	p.toks[token].runs.ClearCooldowns()
+	return nil
+}
+
+// FinishTokenRuns finishes all active runs of token (dashboard action).
+func (p *Pool) FinishTokenRuns(ctx context.Context, token int) error {
+	if token < 0 || token >= len(p.toks) {
+		return fmt.Errorf("pool: token %d out of range", token)
+	}
+	p.toks[token].runs.FinishAllRuns(ctx)
+	return nil
+}
+
+// TestToken verifies token against upstream with a real session handshake
+// (dashboard test action): creates a session for model through the token's
+// client, then ends it. Returns the created instance id on success.
+func (p *Pool) TestToken(ctx context.Context, token int, model string) (string, error) {
+	if token < 0 || token >= len(p.toks) {
+		return "", fmt.Errorf("pool: token %d out of range", token)
+	}
+	c := p.toks[token].client
+	st, err := c.CreateSessionForModel(ctx, model)
+	if err != nil {
+		return "", err
+	}
+	_ = c.EndSession(ctx, st.InstanceID)
+	return st.InstanceID, nil
+}
+
 // CooldownToken puts token in a cooldown window of duration d (auth-reject
 // recovery, e.g. runs.DefaultCooldown). Out-of-range tokens are ignored.
 func (p *Pool) CooldownToken(token int, d time.Duration) {

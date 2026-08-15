@@ -116,10 +116,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
 	mux.Handle("GET /admin/tokens", s.dashboardAuth(s.dash.Page("tokens")))
+	mux.Handle("GET /admin/models", s.dashboardAuth(s.dash.Page("models")))
+	mux.Handle("GET /admin/traces", s.dashboardAuth(s.dash.Page("traces")))
+	mux.Handle("GET /admin/setup", s.dashboardAuth(s.dash.Page("setup")))
 	mux.Handle("GET /admin/config", s.dashboardAuth(s.adminSensitive(s.dash.Page("config"))))
 	mux.Handle("GET /admin/logs", s.dashboardAuth(s.adminSensitive(s.dash.Page("logs"))))
 	mux.Handle("GET /admin/metrics", s.dashboardAuth(s.dash.Page("metrics")))
 	mux.Handle("POST /admin/config", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleConfigSave))))
+	mux.Handle("POST /admin/tokens/{id}/unlock", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenUnlock))))
+	mux.Handle("POST /admin/tokens/{id}/finish", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenFinish))))
+	mux.Handle("POST /admin/tokens/{id}/test", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenTest))))
 	mux.Handle("GET /admin/assets/", http.StripPrefix("/admin/assets/", noDirListing(http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -499,6 +505,73 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 // maxEnvSize caps the .env editor payload (64KB is generous for a config file).
 const maxEnvSize = 64 << 10
 
+// tokenActionID parses the {id} path value into a 0-based token index.
+func tokenActionID(r *http.Request) (int, error) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id < 0 {
+		return 0, errors.New("invalid token id")
+	}
+	return id, nil
+}
+
+// handleTokenUnlock clears a token's cooldown/rate-limit/ban lock. Gated as
+// sensitive: unlocking a banned token lets upstream traffic resume, so it is
+// loopback-only in open mode.
+func (s *Server) handleTokenUnlock(w http.ResponseWriter, r *http.Request) {
+	id, err := tokenActionID(r)
+	if err == nil {
+		err = s.pool.UnlockToken(id)
+	}
+	if err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Unlock failed: "+err.Error())
+		return
+	}
+	s.logger.Info("dashboard token unlocked", "token", id)
+	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" unlocked — no cooldown or ban window remains.")
+}
+
+// handleTokenFinish finishes all active runs of a token.
+func (s *Server) handleTokenFinish(w http.ResponseWriter, r *http.Request) {
+	id, err := tokenActionID(r)
+	if err == nil {
+		err = s.pool.FinishTokenRuns(r.Context(), id)
+	}
+	if err != nil {
+		s.dash.RenderConfigResult(w, r, false, "Finish failed: "+err.Error())
+		return
+	}
+	s.logger.Info("dashboard token runs finished", "token", id)
+	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" runs finished.")
+}
+
+// handleTokenTest probes a token with a real upstream session handshake
+// (create + end) against the first catalog model.
+func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
+	id, err := tokenActionID(r)
+	var model string
+	if err == nil {
+		models := s.reg.Models()
+		if len(models) == 0 {
+			err = errors.New("registry has no models to probe")
+		} else {
+			model = models[0]
+		}
+	}
+	var instanceID string
+	if err == nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		instanceID, err = s.pool.TestToken(ctx, id, model)
+	}
+	if err != nil {
+		s.logger.Warn("dashboard token test failed", "token", id, "err", err)
+		s.dash.RenderConfigResult(w, r, false, "Token "+strconv.Itoa(id)+" test failed: "+err.Error())
+		return
+	}
+	s.logger.Info("dashboard token test ok", "token", id, "model", model, "instance", instanceID)
+	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" OK — session handshake succeeded ("+model+").")
+}
+
 // handleConfigSave persists the submitted .env text and hot-reloads the
 // config. The flow: write the file atomically (temp + rename) → full
 // config.Load("") — the same pipeline used at startup, so every semantic
@@ -682,6 +755,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 	if err != nil {
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err))
 		s.writeError(w, r, err)
 		return
 	}
@@ -705,10 +779,41 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		stats := &relayStats{}
 		s.relayStream(ctx, w, up, stats)
 		s.logger.Info("chat done", chatDoneAttrs(model, lease.AgentID, true, time.Since(start).Milliseconds(), stats.chunks, stats.bytes, reasoningEffort)...)
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "ok", "")
 	} else {
 		stats := &relayStats{}
 		s.relayJSON(ctx, w, up, stats)
 		s.logger.Info("chat done", chatDoneAttrs(model, lease.AgentID, false, time.Since(start).Milliseconds(), 0, stats.bytes, reasoningEffort)...)
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "ok", "")
+	}
+}
+
+// traceChat records a structured "chat trace" entry for the dashboard
+// traces page (the page filters the shared log ring by msg == "chat trace").
+func (s *Server) traceChat(lease *pool.Lease, model string, ms int64, status, errClass string) {
+	attrs := []any{"model", model, "status", status, "ms", ms}
+	if lease != nil {
+		attrs = append(attrs, "token", tokenLabel(lease), "agent", lease.AgentID)
+	}
+	if errClass != "" {
+		attrs = append(attrs, "error", errClass)
+	}
+	s.logger.Info("chat trace", attrs...)
+}
+
+// chatErrClass buckets an upstream error into the trace error column.
+func chatErrClass(err error) string {
+	switch err.(type) {
+	case *upstream.RateLimitError:
+		return "rate_limited"
+	case *upstream.BanError:
+		return "banned"
+	case *upstream.WaitingRoomError, *session.WaitingRoomError:
+		return "waiting_room"
+	case *upstream.UpstreamError:
+		return "upstream"
+	default:
+		return "error"
 	}
 }
 

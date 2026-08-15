@@ -596,3 +596,28 @@ func TestSnapshotBannedUntil(t *testing.T) {
 		t.Errorf("Snapshot.BannedUntil = %v, want %v", snap.BannedUntil, until)
 	}
 }
+
+func TestClearCooldowns(t *testing.T) {
+	m := NewRunManager(nil, nil, time.Hour)
+	now := time.Now()
+	m.Cooldown(time.Hour)
+	m.CooldownRateLimit(&upstream.RateLimitError{RetryAfter: time.Hour})
+	if m.RateLimitError() == nil {
+		t.Fatal("expected rate-limit lock to be active")
+	}
+	// A ban supersedes the rate-limit lock (mutually exclusive by design).
+	m.CooldownBan(&upstream.BanError{ResumesAt: now.Add(2 * time.Hour)})
+	if m.RateLimitError() != nil || m.BanError() == nil {
+		t.Fatal("expected ban to supersede rate-limit lock")
+	}
+	m.ClearCooldowns()
+	if !m.CooldownUntil().IsZero() {
+		t.Errorf("cooldown not cleared: %v", m.CooldownUntil())
+	}
+	if m.RateLimitError() != nil {
+		t.Error("rate-limit lock not cleared")
+	}
+	if m.BanError() != nil {
+		t.Error("ban window not cleared")
+	}
+}

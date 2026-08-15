@@ -123,11 +123,17 @@ func TestLoginPageRendersError(t *testing.T) {
 	}
 }
 
-// newDashboardForPages builds a dashboard with a wired log ring for page tests.
-func newDashboardForPages(t *testing.T, withRing bool) *httptest.Server {
+// newDashboardForPages builds a dashboard with a wired log ring, mounting the
+// given page (defaults to "logs").
+func newDashboardForPages(t *testing.T, withRing bool, page ...string) *httptest.Server {
 	t.Helper()
+	name := "logs"
+	if len(page) > 0 && page[0] != "" {
+		name = page[0]
+	}
 	cfg := &config.Config{
 		AuthTokens:         []string{"tok-0"},
+		ListenAddr:         "127.0.0.1:3457",
 		RotationInterval:   time.Hour,
 		RequestTimeout:     15 * time.Minute,
 		SessionCallTimeout: 5 * time.Second,
@@ -153,7 +159,7 @@ func newDashboardForPages(t *testing.T, withRing bool) *httptest.Server {
 		slog.New(ring).Info("hello ring", "k", "v")
 	}
 	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil, ring)
-	ts := httptest.NewServer(d.Page("logs"))
+	ts := httptest.NewServer(d.Page(name))
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -214,4 +220,52 @@ func mustReadAll(t *testing.T, resp *http.Response) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// The models page renders the catalog with agent mappings.
+func TestModelsPageRenders(t *testing.T) {
+	ts := newDashboardForPages(t, false, "models")
+	resp, err := http.Get(ts.URL + "/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	page := string(mustReadAll(t, resp))
+	for _, want := range []string{"Models", "upstream agent", "z-ai/glm-5.2"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("models page missing %q", want)
+		}
+	}
+}
+
+// The setup page renders the base URL and client snippets.
+func TestSetupPageRenders(t *testing.T) {
+	ts := newDashboardForPages(t, false, "setup")
+	resp, err := http.Get(ts.URL + "/setup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	page := string(mustReadAll(t, resp))
+	for _, want := range []string{"Client setup", "OpenCode", "Continue", "aider", "127.0.0.1", "/v1"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("setup page missing %q", want)
+		}
+	}
+}
+
+// The traces page renders the recorded chat-trace entry (ring holds a
+// non-trace "hello ring" record; the page must not crash and shows the
+// empty state when no traces exist).
+func TestTracesPageRenders(t *testing.T) {
+	ts := newDashboardForPages(t, true, "traces")
+	resp, err := http.Get(ts.URL + "/traces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	page := string(mustReadAll(t, resp))
+	if !strings.Contains(page, "No chat traffic yet") {
+		t.Error("traces page missing empty state")
+	}
 }

@@ -22,7 +22,8 @@
   <p>Add <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a>, then restart the proxy — the token pool is built at startup.</p>
 </article>
 {{else}}
-<p class="muted manage-note">Tokens are configured via <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a>; the pool is built at startup, so add/remove requires a restart.</p>
+<p class="muted manage-note">Tokens are configured via <code>AUTH_TOKENS</code> in <a href="/admin/config">Config</a>; the pool is built at startup, so add/remove requires a restart. Actions below hit the real upstream (Test) or the local pool state (Unlock/Finish).</p>
+<div id="token-result"></div>
 {{range .Tokens}}
 <article class="card token-detail">
   <header class="token-head">
@@ -30,6 +31,11 @@
     <strong class="token-name">Token {{.Index}}</strong>
     <span class="pill risk-{{.RiskLevel}}">{{.RiskLevel}}</span>
     <span class="pill">{{.SessionStatus}}</span>
+    <span class="token-actions">
+      {{if .CooldownActive}}<button class="action-btn" hx-post="/admin/tokens/{{.Index}}/unlock" hx-confirm="Unlock Token {{.Index}}? Only do this if you know the cooldown/ban is stale — upstream locks are usually correct." hx-target="#token-result" hx-swap="innerHTML">Unlock</button>{{end}}
+      <button class="action-btn" hx-post="/admin/tokens/{{.Index}}/test" hx-target="#token-result" hx-swap="innerHTML">Test</button>
+      <button class="action-btn" hx-post="/admin/tokens/{{.Index}}/finish" hx-confirm="Finish all active runs of Token {{.Index}}? In-flight requests are unaffected." hx-target="#token-result" hx-swap="innerHTML">Finish runs</button>
+    </span>
   </header>
   <dl class="kv kv-4">
     <div><dt>session id</dt><dd class="mono">{{.SessionInstance}}</dd></div>
@@ -58,9 +64,14 @@
           <td class="mono">{{.Recent}}</td>
           <td class="mono">{{.Limit}}</td>
           <td class="mono">{{.Period}}</td>
-          <td class="mono">{{.ResetAt}}</td>
+          <td class="mono">{{.ResetAt}}{{if .ResetsIn}} <span class="countdown{{if .NearLimit}} countdown-near{{end}}">{{.ResetsIn}}</span>{{end}}</td>
           <td class="mono">{{if .HasEntitlement}}{{.Entitled}}{{end}}</td>
         </tr>
+        {{if gt .Limit 0}}
+        <tr class="quota-bar-row">
+          <td colspan="6"><div class="usage {{if .NearLimit}}usage-near{{end}}"><div class="usage-bar" style="width: {{.UsagePct}}%"></div></div></td>
+        </tr>
+        {{end}}
       {{end}}
       </tbody>
     </table>

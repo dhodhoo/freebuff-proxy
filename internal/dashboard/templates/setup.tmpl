@@ -1,0 +1,70 @@
+{{define "setup"}}
+<section class="page-head">
+  <div>
+    <h1>Client setup</h1>
+    <p class="muted">copy-paste configuration for connecting your AI client</p>
+  </div>
+  <div class="pills">
+    <span class="pill mono">{{.BaseURL}}</span>
+    <span class="pill">{{if .Bridge}}bridge{{else}}pooled{{end}}</span>
+  </div>
+</section>
+
+<p class="muted setup-hint">Key: <strong>{{.KeyHint}}</strong></p>
+
+<div class="setup-grid">
+  <article class="card setup-card">
+    <h2>OpenCode</h2>
+    <p class="muted">~/.config/opencode/opencode.json — providers block</p>
+    <pre class="mono">"freebuff": {"type": "openai", "options": {"baseURL": "{{.BaseURL}}", "apiKey": "not-needed"}}</pre>
+    <p class="muted">Then use model <code>{{.Model}}</code> with provider <code>freebuff</code>.</p>
+  </article>
+
+  <article class="card setup-card">
+    <h2>Continue</h2>
+    <p class="muted">~/.continue/config.yaml — models block</p>
+    <pre class="mono">models:
+  - title: "FreeBuff"
+    provider: "openai"
+    model: "{{.Model}}"
+    apiBase: "{{.BaseURL}}"
+    apiKey: "not-needed"</pre>
+  </article>
+
+  <article class="card setup-card">
+    <h2>aider</h2>
+    <p class="muted">~/.aider.conf.yml</p>
+    <pre class="mono">openai-api-base: {{.BaseURL}}
+openai-api-key: not-needed
+model: {{.Model}}</pre>
+  </article>
+
+  <article class="card setup-card">
+    <h2>9router</h2>
+    <p class="muted">Dashboard → Providers → Add OpenAI Compatible (see the 9router guide for the full walkthrough)</p>
+    <pre class="mono">Name:    freebuff
+Prefix:  freebuff
+API type: Chat Completions
+Base URL: {{.BaseURL}}
+Model ID: {{.Model}}</pre>
+  </article>
+
+  <article class="card setup-card">
+    <h2>curl smoke test</h2>
+    <pre class="mono">curl -N {{.BaseURL}}/chat/completions \
+  -H "Authorization: Bearer <token-or-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"{{.Model}}","messages":[{"role":"user","content":"hi"}],"stream":true}'</pre>
+  </article>
+</div>
+
+{{if .Models}}
+<section class="card models-card">
+  <h2>Catalog ({{len .Models}} models)</h2>
+  <p class="muted">use any id as the client model:</p>
+  <div class="model-chips">
+  {{range .Models}}<span class="pill mono">{{.}}</span>{{end}}
+  </div>
+</section>
+{{end}}
+{{end}}

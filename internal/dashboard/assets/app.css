@@ -414,6 +414,68 @@ textarea[name="content"] {
   height: 44px;
 }
 
+.countdown {
+  color: var(--fp-muted);
+  font-size: 0.8em;
+  white-space: nowrap;
+}
+
+.countdown-near {
+  color: var(--fp-amber);
+  font-weight: 600;
+}
+
+.quota-bar-row td {
+  padding: 0 0 0.6rem;
+  border-bottom: none;
+}
+
+.usage-near .usage-bar {
+  background: var(--fp-high);
+}
+
+/* --- models page --- */
+
+.model-table {
+  width: 100%;
+  font-size: 0.88rem;
+}
+
+.model-table th {
+  color: var(--fp-muted);
+  font-weight: 400;
+  font-size: 0.78rem;
+  text-align: left;
+  padding: 0.4rem 0.6rem 0.4rem 0;
+  border-bottom: 1px solid var(--fp-border);
+}
+
+.model-table td {
+  padding: 0.4rem 0.6rem 0.4rem 0;
+  border-bottom: 1px solid var(--fp-border);
+}
+
+.aliases-card {
+  margin-top: 1rem;
+}
+
+.aliases-card h2 {
+  font-size: 1rem;
+}
+
+.token-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.action-btn {
+  --pico-font-size: 0.75rem;
+  --pico-padding: 0.2rem 0.6rem;
+  margin: 0;
+  width: auto;
+}
+
 /* --- reduced motion --- */
 
 @media (prefers-reduced-motion: reduce) {
