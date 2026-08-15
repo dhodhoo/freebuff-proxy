@@ -156,7 +156,7 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 						return "", &WaitingRoomError{
 							Position:   s.position,
 							QueueDepth: s.queueDepth,
-							RetryAfter: s.pollAt.Sub(time.Now()),
+							RetryAfter: time.Until(s.pollAt),
 						}
 					}
 					return "", err
