@@ -20,7 +20,7 @@ This guide takes you from zero to a working OpenAI-compatible proxy connected to
 ## Important Safety Warning
 
 Using this proxy conflicts with Codebuff's terms of service. Upstream abuse detection scans for automation patterns and suspends accounts.
-- **Use `SAFE_MODE=true`** (enabled by default in `.env.example`).
+- **Keep `SAFE_MODE=true`** — it is the default and is set explicitly in `.env.example`; it enables anti-ban stealth (TLS fingerprint, header sanitization, request jitter, idle rotation, daily cap).
 - Do **not** run 24/7 on heavy unattended automated tasks.
 - Keep one modest account; do not create spam clusters of accounts.
 
@@ -76,12 +76,16 @@ curl http://localhost:3457/v1/models
 
 `/healthz` returning status `200` means your proxy setup is **100% correct**.
 
+`/healthz` also reports each token's live per-model quota (`quota` map) when the last session admission carried it.
+
 ## Step 3: Connect Your Favorite AI Client
 
 Point your AI tool to:
 - **Base URL:** `http://localhost:3457/v1`
 - **API Key:** `not-needed` (or your token in bridge mode)
 - **Model:** `deepseek/deepseek-v4-flash` (or `z-ai/glm-5.2`)
+
+Fastest path: run `./freebuff-proxy -setup` to write the config for Continue, opencode, or aider automatically.
 
 See the [Client Integration Guide](client-integration.md) for copy-paste config for Continue, Cursor, aider, opencode, and more.
 
@@ -97,3 +101,11 @@ Run `./freebuff-proxy -doctor` to diagnose problems automatically.
 | `502` + `401 Invalid API key` | Token in `.env` is expired or invalid. Re-run `freebuff` to log in and update `AUTH_TOKENS`. |
 | Connection refused | Proxy is not running, or in Docker without `LISTEN_ADDR=:3457`. |
 | `403 account_banned` | Account suspended upstream. Token is dead; use a new established account. |
+
+---
+
+## Related docs
+
+- [Client Integration](client-integration.md) — Continue, Cursor, aider, opencode, SDK configs
+- [9router Integration](9router-integration.md) — wiring the proxy into 9router
+- [README](../../README.md) — overview, config reference, quick start

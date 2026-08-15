@@ -16,6 +16,47 @@ Your coding tools expect an OpenAI-style endpoint (`/v1/chat/completions`). The 
 
 ---
 
+## Table of Contents
+
+- [New here? Start here](#new-here-start-here)
+- [Requirements](#requirements)
+- [Features](#features)
+- [How It Works](#how-it-works)
+- [Key Concepts](#key-concepts)
+- [Quick Start](#quick-start)
+- [Command-Line Interface](#command-line-interface)
+- [Configuration Reference](#configuration-reference)
+- [Deployment](#deployment)
+- [Guides](#guides)
+- [Contributing & Security](#contributing--security)
+- [Contact & Support](#contact--support)
+- [License](#license)
+
+---
+
+## New here? Start here
+
+Freebuff-proxy makes the free AI models behind the FreeBuff/Codebuff CLI available to any OpenAI-compatible tool (opencode, Continue, Cursor, aider, 9router). If you are new:
+
+1. **Get a FreeBuff account + token.** You need a Codebuff/FreeBuff account; the token (`cb_...`) is what the proxy uses upstream. Get one with the official CLI or `scripts/gen-token.*` — see [Obtain an Auth Token](#2-obtain-an-auth-token).
+2. **Install the proxy.** One command, no Go or Docker required — see [Quick Start](#quick-start).
+3. **Connect your AI tool.** Point opencode/Continue/Cursor/aider at `http://127.0.0.1:3457/v1` — see [Client Integration](docs/guides/client-integration.md).
+
+For a guided walkthrough, read [Getting Started](docs/guides/getting-started.md) (5 minutes).
+
+## Requirements
+
+| Requirement | Details |
+|---|---|
+| **A FreeBuff/Codebuff account** | Free account at codebuff.com / freebuff.com. The proxy relays your account's token; each account has its own daily session quota. |
+| **A token (`cb_...`)** | From the official CLI login or `scripts/gen-token.*` — see [Obtain an Auth Token](#2-obtain-an-auth-token). |
+| **OS** | Linux, macOS, or Windows (amd64/arm64). Prebuilt release binaries; no Go toolchain needed. |
+| **Docker** | Optional — only for the container deployment path (`docker compose up -d --build`). |
+| **Network** | Outbound HTTPS to `codebuff.com` (configurable via `UPSTREAM_BASE_URL`); the proxy listens on loopback `127.0.0.1:3457` by default. |
+| **Go 1.26+** | Only if building from source. |
+
+---
+
 ## Features
 
 - **OpenAI-Compatible API**: `POST /v1/chat/completions` (stream + non-stream), `GET /v1/models`, `GET /healthz`, Prometheus `GET /metrics`, and hot config reload via `POST /admin/reload`.
@@ -241,6 +282,12 @@ opt out). It enables essential anti-ban protections and presets:
 
 - [Contributing](CONTRIBUTING.md) — filing issues, opening PRs, what to expect
 - [Security](.github/SECURITY.md) — supported versions and how to report a vulnerability
+
+## Contact & Support
+
+- **Questions, bugs, feature requests**: [GitHub Issues](https://github.com/trefeon/freebuff-proxy/issues)
+- **Security reports**: [SECURITY.md](.github/SECURITY.md)
+- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
 

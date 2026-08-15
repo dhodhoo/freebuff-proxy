@@ -10,7 +10,7 @@ Connect any OpenAI-compatible AI tool or coding assistant to `freebuff-proxy`.
 ## Bridge Mode vs Pooled Mode
 
 + **Pooled Mode (Default):** Set `AUTH_TOKENS=token1,token2` in the proxy's `.env`. The proxy manages token rotation, and clients can use any placeholder API key.
-+ **Bridge Mode (Routers & Multi-User):** Leave `AUTH_TOKENS=` empty in `.env`. The proxy acts as a zero-storage relay. **API Routers (9router, OmniRouter, One API, LiteLLM) send actual FreeBuff tokens in `Authorization: Bearer <freebuff-token>`.** The proxy lazily creates sessions per client token with LRU caching, rate limits, and health tracking.
++ **Bridge Mode (Routers & Multi-User):** Leave `AUTH_TOKENS=` empty in `.env`. The proxy acts as a zero-storage relay. **API Routers ([9router](9router-integration.md), OmniRouter, One API, LiteLLM) send actual FreeBuff tokens in `Authorization: Bearer <freebuff-token>`.** The proxy lazily creates sessions per client token with LRU caching, rate limits, and health tracking; live per-model quota is visible in `GET /healthz`.
 ---
 
 ## 1. Continue (VS Code & JetBrains Extension)
@@ -152,9 +152,26 @@ Query `http://localhost:3457/v1/models` for the full live list.
 
 | Model ID | Provider | Best for |
 |---|---|---|
-| `deepseek/deepseek-v4-flash` | DeepSeek | Fast coding, reasoning, smart agent turns (Unlimited) |
-| `z-ai/glm-5.2` | Zhipu AI | Code explanation, architecture, complex reasoning |
-| `mimo/mimo-v2.5` | Xiaomi | Balanced coding agent turns, multimodal support |
-| `minimax/minimax-m3` | MiniMax | Fast coding turns, multimodal image support |
-| `openai/gpt-5.6-luna` | OpenAI | Deep reasoning, multimodal support |
-| `deepseek/deepseek-v4-pro` | DeepSeek | Deep reasoning, complex problem solving (Premium) |
+| `deepseek/deepseek-v4-flash` | DeepSeek | Fast coding; limited + full tiers |
+| `deepseek/deepseek-v4-pro` | DeepSeek | Deep reasoning; full tier |
+| `openai/gpt-5.6-luna` | OpenAI | Deep reasoning + image; full tier |
+| `minimax/minimax-m3` | MiniMax | Fast + image; full tier |
+| `mimo/mimo-v2.5` | Xiaomi | Balanced; limited + full tiers |
+| `z-ai/glm-5.2` | Zhipu AI | Earned sessions, 5 per 20h (429 rate_limited) |
+| `anthropic/claude-fable-5` | Anthropic | Catalog addition; tier-dependent |
+| `poolside/laguna-s-2.1` | Poolside | Recent catalog addition; tier pending |
+| `openrouter/poolside/laguna-s-2.1` | OpenRouter | Recent catalog addition; tier pending |
+| `inclusionai/ling-3.0-flash:free` | Inclusion AI | Catalog addition; tier pending |
+| `crof/greg-2-ultra` | CROF | Catalog addition; tier pending |
+| `crof/greg-2-super` | CROF | Catalog addition; tier pending |
+| `google/gemini-2.5-flash-lite` | Google | Specialist subagents (file finding/research); not general chat |
+| `google/gemini-3.1-flash-lite` | Google | Specialist subagents (file finding/research); not general chat |
+| `google/gemini-3.5-flash-lite` | Google | Specialist subagents (file finding/research); not general chat |
+
+---
+
+## Related docs
+
+- [Getting Started](getting-started.md) — 5-minute setup walkthrough
+- [9router Integration](9router-integration.md) — wiring the proxy into 9router
+- [README](../../README.md) — overview, config reference, quick start

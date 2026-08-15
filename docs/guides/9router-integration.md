@@ -31,7 +31,7 @@ source code (dashboard modals, API routes, `open-sse/` fallback engine, `.env.ex
 3. Verify before touching 9router:
 
    ```bash
-   curl http://127.0.0.1:3457/healthz     # {"models":15,"tokens":[...],"uptime_seconds":N}
+   curl http://127.0.0.1:3457/healthz     # {"models":15,"tokens":[...],"uptime_seconds":N}; per-token "quota" map appears when the last admission carried rateLimitsByModel
    curl http://127.0.0.1:3457/v1/models   # the model catalog (~15 at boot)
    ```
 
@@ -91,7 +91,7 @@ the client sends:
 Verify with curl before touching 9router (no token needed for models/healthz):
 
 ```bash
-curl http://127.0.0.1:3457/healthz   # {"models":15,"tokens":[],"bridge_tokens":0,...}
+curl http://127.0.0.1:3457/healthz   # {"models":15,"tokens":[],"bridge_tokens":0,...}; per-token "quota" map appears when the last admission carried rateLimitsByModel
 curl -N http://127.0.0.1:3457/v1/chat/completions \
   -H "Authorization: Bearer <your-freebuff-token>" \
   -H "Content-Type: application/json" \
@@ -430,7 +430,7 @@ message.
 | `404 unknown model` (9router) | The model combo is not registered. Re-add the model in the provider config |
 | `503 waiting_room_queued` + Retry-After | FreeBuff waiting room (quota/hourly). Normal; 9router/opencode retry automatically |
 | `429` with `rate_limited` | GLM 5/20h cap, or token daily quota (6 sessions on the limited tier). Switch model or wait; 9router backs off with the proxy's `resetAt` |
-| `502 upstream_unavailable` | Token in 30-min cooldown after a 401, or all tokens failed. Check `healthz` |
+| `502 upstream_unavailable` | Token in 30-min cooldown after a 401, or all tokens failed. Check `healthz`. Transient transport failures (TLS handshake/reset/EOF) are retried once automatically (`TRANSIENT_RETRIES`, default 1; 0 disables) before a 502 |
 | `403` `account_banned` / `{"status":"banned"}` | The FreeBuff account was banned upstream (terminal per official source; see the README **WARNING**). The proxy skips the token during the ban window (upstream `resumes-at`, or 24h) and re-probes once after it; if it still fails, rotate to a new account with an established GitHub login and a clean IP |
 | Model streams `reasoning_content` | By design (CLI-faithful). 9router handles it; don't strip it |
 | 9router shows provider disconnected | Proxy restarted mid-flight; sessions recover transparently on the next request |
@@ -441,7 +441,7 @@ message.
 
 ## 11. References
 
-- This project: README (getting a token, config table), this guide. The PRD, reference
+- This project: README (getting a token, config table incl. `TRANSIENT_RETRIES`), this guide. The PRD, reference
   analysis and quota-research notes are **local-only dev docs** (gitignored).
 - 9router: github.com/decolua/9router (`npm i -g 9router`, dashboard on :20128, data in
   `~/.9router/`; v0.5.50, 2026-08-05). Option inventory in this guide was verified against
@@ -450,3 +450,11 @@ message.
   `src/lib/db/repos/settingsRepo.js`, `.env.example`, CHANGELOG.
 - ToS note: FreeBuff's terms prohibit third-party wrappers/endpoints; educational/personal
   use only, bans possible. Keep usage modest.
+
+---
+
+## Related docs
+
+- [Getting Started](getting-started.md) — 5-minute setup walkthrough
+- [Client Integration](client-integration.md) — Continue, Cursor, aider, opencode, SDK configs
+- [README](../../README.md) — overview, config reference, quick start
