@@ -11,8 +11,13 @@ services:
     ports:
       - "3457:3457"
     restart: unless-stopped
+    # Docker's default 10s stop timeout races the app's 10s drain while
+    # in-flight SSE streams starve the pool FINISH drain — give it room.
+    stop_grace_period: 20s
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3457/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
+      # Slow first start (registry refresh at boot) must not mark unhealthy.
+      start_period: 10s

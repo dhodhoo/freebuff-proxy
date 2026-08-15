@@ -85,13 +85,24 @@ else
   done
 fi
 
-# --- 5. detect the Docker gateways (host IPs as seen from inside containers)
+# --- 5. detect the real Docker gateway (host IP as seen from the container) -
+# The host is reached from inside a container via the gateway of the network
+# that container is on. Inspect the ACTUAL proxy container instead of guessing
+# the network name: compose projects prefix networks with the project name
+# (e.g. freebuff-proxy_default), and this script may run from any directory.
 BRIDGE_GW="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo 172.17.0.1)"
 GATEWAY=""
-for net in $(docker network ls --format '{{.Name}}' | grep -i freebuff | head -3); do
-  GATEWAY="$(docker network inspect "$net" --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
-  [ -n "$GATEWAY" ] && break
-done
+# 1) the compose project we just started (correct even with a project-prefixed
+#    network name); 2) the well-known container name; 3) the image name.
+CONTAINER="$(docker compose ps -q 2>/dev/null | head -1 || true)"
+[ -z "$CONTAINER" ] && CONTAINER="$(docker ps -q --filter name=^/freebuff-proxy$ 2>/dev/null | head -1 || true)"
+[ -z "$CONTAINER" ] && CONTAINER="$(docker ps -q --filter ancestor=freebuff-proxy:latest 2>/dev/null | head -1 || true)"
+if [ -n "$CONTAINER" ]; then
+  GATEWAY="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}' "$CONTAINER" 2>/dev/null | awk '{print $1}' || true)"
+fi
+# Fallback: the classic docker0 bridge gateway (172.17.0.1). Only correct for
+# default-bridge networking; kept so the config below stays printable when the
+# container isn't running (e.g. --no-start).
 [ -z "$GATEWAY" ] && GATEWAY="$BRIDGE_GW"
 
 # --- 6. print the 9router configuration -------------------------------------
