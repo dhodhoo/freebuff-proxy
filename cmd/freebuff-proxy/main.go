@@ -149,10 +149,11 @@ func main() {
 		"log_level", level.String(),
 		"verbose", *verbose,
 	)
-	// /admin/reload is open in default deployments (no API_KEYS, or bridge
-	// mode): warn loudly so operators can decide whether to set ADMIN_TOKEN.
+	// /admin/reload and the admin dashboard are open in default deployments
+	// (no API_KEYS, or bridge mode): warn loudly so operators can decide
+	// whether to set ADMIN_TOKEN.
 	if cfg.AdminToken == "" && (len(cfg.APIKeys) == 0 || cfg.BridgeMode()) {
-		logger.Warn("/admin/reload is unauthenticated — any client that can reach the proxy can reload its configuration. Set ADMIN_TOKEN to require a bearer token")
+		logger.Warn("/admin/reload and the /admin dashboard are unauthenticated — any client that can reach the proxy can reload configuration and view its state. Set ADMIN_TOKEN to require a bearer token")
 	}
 	logger.Info("listening", "addr", cfg.ListenAddr)
 

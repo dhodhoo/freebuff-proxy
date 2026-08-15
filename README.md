@@ -60,6 +60,7 @@ For a guided walkthrough, read [Getting Started](docs/guides/getting-started.md)
 ## Features
 
 - **OpenAI-Compatible API**: `POST /v1/chat/completions` (stream + non-stream), `GET /v1/models`, `GET /healthz`, Prometheus `GET /metrics`, and hot config reload via `POST /admin/reload`.
+- **Admin Dashboard**: embedded single-binary web UI at `http://<host>:3457/admin` — live overview (per-token ban/429 risk, usage), per-token session + quota tables, a `.env` config editor with validation and hot-reload, a log viewer, and metrics sparklines. Login via `ADMIN_TOKEN`; htmx-driven, zero build step.
 - **Dynamic Reasoning Effort**: OpenAI `reasoning_effort` (`low`/`medium`/`high`/`max`) and Codex/Anthropic `reasoning.effort` are normalized and mapped to upstream reasoning engines.
 - **Session & Run Lifecycle**: Upstream session handshakes, model-lock recovery (`DELETE` → re-`POST`), grace draining, and idle-run finishing, all automatic.
 - **Token Pooling & Bridge Mode**: Hot-session-first pooling with round-robin start and failover across `AUTH_TOKENS`, or zero-storage relay when clients bring their own token — see [Key Concepts](#key-concepts).
@@ -208,7 +209,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `AUTH_TOKENS` | `""` | Comma-separated upstream tokens (empty = bridge mode) |
 | `AUTO_DISCOVER_TOKEN` | `true` | When `AUTH_TOKENS` is empty, read credentials from the official CLI login files (`false` disables) |
 | `API_KEYS` | `""` | Comma-separated client keys required for `/v1/*` (empty = open; ignored in bridge mode) |
-| `ADMIN_TOKEN` | `""` | Bearer token that `POST /admin/reload` requires when set (empty = unauthenticated in default deployments; a startup warning is logged) |
+| `ADMIN_TOKEN` | `""` | Bearer token that `POST /admin/reload` requires when set (empty = unauthenticated in default deployments; a startup warning is logged). Also the login credential for the [admin dashboard](#admin-dashboard) |
 | `ROTATION_INTERVAL` | `6h` | Agent-run rotation interval |
 | `REQUEST_TIMEOUT` | `15m` | Upstream request timeout |
 | `SESSION_CALL_TIMEOUT` | `30s` | Session call timeout |
@@ -274,6 +275,22 @@ opt out). It enables essential anti-ban protections and presets:
 | `GET /healthz` | none | JSON: `status`, `uptime_seconds`, `models`, per-token snapshot (incl. per-model `quota` map when the last admission carried it), `bridge_tokens` |
 | `GET /metrics` | none | Prometheus text format: uptime, model count, per-token 24h messages / requests / active runs / cooldown, per-model quota (`freebuff_proxy_quota_recent` / `freebuff_proxy_quota_limit`) |
 | `POST /admin/reload` | `ADMIN_TOKEN` (when set) | Hot-reload configuration from disk without restart |
+| `GET /admin` | session cookie (login via `ADMIN_TOKEN`) | Admin dashboard — overview, tokens, config, logs, metrics (see [Admin Dashboard](#admin-dashboard)) |
+| `GET/POST /admin/login` | — | Dashboard login: constant-time `ADMIN_TOKEN` check, per-IP rate limit, `HttpOnly` + `SameSite=Strict` session cookie |
+| `POST /admin/config` | session cookie | Validate and persist the `.env` file, then hot-reload the config (rolls back on rejection) |
+
+## Admin Dashboard
+
+The proxy ships with an embedded web dashboard — same single binary, no extra process, no build step (htmx + Pico are vendored into the binary). Open `http://127.0.0.1:3457/admin` (or your `LISTEN_ADDR`).
+
+- **Login**: enter the `ADMIN_TOKEN` from your config. Without `ADMIN_TOKEN` the dashboard is open (matching `/admin/reload`'s legacy behavior; a startup warning is logged). Failed logins are rate-limited per IP (5 fails → 1 minute lockout), and the session cookie is `HttpOnly` + `SameSite=Strict`.
+- **Overview**: live relay state (pooled/bridge mode, model count, uptime, safe mode) with per-token cards — session status, ban/429 risk level, usage vs `MAX_MESSAGES_PER_DAY`, transient-retry counters. Polls every 5s.
+- **Tokens**: per-token session detail and the live per-model session quota table (limit/recent/period/reset/entitlement).
+- **Config**: edit the proxy's `.env` file in place. Save runs the same validation as startup (durations, URLs, `Validate`) and hot-reloads; invalid input is rejected with the file rolled back. The effective-value table shows secrets redacted to set/unset + counts.
+- **Logs**: the last 200 records from an in-memory ring (no log file or docker needed), level-colored, polling every 3s.
+- **Metrics**: sampled counter trends as server-rendered sparklines; the full Prometheus exposition stays at `/metrics`.
+
+See [Dashboard Guide](docs/guides/dashboard.md) for access, Docker caveats, and hardening.
 
 ---
 
@@ -289,6 +306,7 @@ opt out). It enables essential anti-ban protections and presets:
 - [Getting Started](docs/guides/getting-started.md) — 5-minute setup walkthrough
 - [Client Integration](docs/guides/client-integration.md) — OpenCode, 9router, Continue, Cursor, aider, OpenAI SDKs
 - [9router Integration](docs/guides/9router-integration.md) — router dashboard setup in bridge mode
+- [Dashboard Guide](docs/guides/dashboard.md) — the admin web UI: access, pages, Docker caveats, hardening
 
 ---
 
