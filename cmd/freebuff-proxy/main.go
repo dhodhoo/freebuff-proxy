@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -80,6 +81,7 @@ func main() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "freebuff-proxy: invalid config:", err)
+		holdForExitIfConsole()
 		os.Exit(1)
 	}
 
@@ -101,12 +103,32 @@ func main() {
 	// through our logger so the configured level and log file cover them too.
 	slog.SetDefault(logger)
 
+	// The proxy reads ./.env from the working directory, which on Windows
+	// launchers (Task Scheduler, shortcuts, services) is often not the
+	// executable's directory. Log the absolute path used, and warn when a
+	// .env sitting next to the executable is silently ignored — that is the
+	// usual reason config "seems to vanish" under a non-interactive launcher.
+	envFile, _ := filepath.Abs(".env")
+	logger.Info("config loaded", "env_file", envFile, "config_file", *configPath)
+	if cwd, err := os.Getwd(); err == nil {
+		exe, exeErr := os.Executable()
+		if exeErr == nil {
+			exeDir := filepath.Dir(exe)
+			if filepath.Clean(cwd) != exeDir {
+				if _, statErr := os.Stat(filepath.Join(exeDir, ".env")); statErr == nil {
+					logger.Warn("found .env next to the executable, but .env is read from the working directory — that file is NOT applied",
+						"cwd", cwd, "exe_dir", exeDir, "env_file", envFile)
+				}
+			}
+		}
+	}
+
 	// Load the hardcoded fallback immediately so the registry is usable
 	// offline; the first background refresh replaces it on success.
 	reg := registry.New(&cfg, &http.Client{Timeout: 30 * time.Second})
 	reg.LoadFallback()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer stop()
 
 	go refreshLoop(ctx, logger, reg, cfg.RegistryRefresh)
@@ -119,6 +141,7 @@ func main() {
 		client, err := upstream.NewWithIndex(token, i, &cfg)
 		if err != nil {
 			logger.Error("failed to build upstream client", "err", err)
+			holdForExitIfConsole()
 			os.Exit(1)
 		}
 		clients = append(clients, client)
@@ -130,6 +153,7 @@ func main() {
 	p, err := pool.New(&cfg, clients, sessions, reg)
 	if err != nil {
 		logger.Error("failed to build pool", "err", err)
+		holdForExitIfConsole()
 		os.Exit(1)
 	}
 
@@ -170,7 +194,7 @@ func main() {
 	// Human-readable startup banner for interactive terminals. Suppressed
 	// when stderr is piped (containers, log files, systemd) -- detected by
 	// checking if the output is a character device (terminal).
-	if fileInfo, _ := os.Stderr.Stat(); fileInfo != nil && fileInfo.Mode()&os.ModeCharDevice != 0 {
+	if stderrIsCharDevice() {
 		mode := fmt.Sprintf("pooled (%d tokens)", len(cfg.AuthTokens))
 		if cfg.BridgeMode() {
 			mode = "bridge (clients send their own token)"
@@ -230,6 +254,37 @@ func main() {
 	if exitCode != 0 {
 		os.Exit(exitCode)
 	}
+}
+
+// stderrIsCharDevice reports whether stderr is a character device (an
+// interactive console). Piped or redirected stderr (containers, log files,
+// services, Task Scheduler) is not, so interactive-only behavior is skipped.
+func stderrIsCharDevice() bool {
+	fi, err := os.Stderr.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// shutdownSignals are the OS signals that trigger graceful drain. On Windows
+// the Go runtime delivers BOTH Ctrl+C and Ctrl+Break as os.Interrupt (see
+// runtime/os_windows.go ctrlHandler: CTRL_C_EVENT and CTRL_BREAK_EVENT map
+// to SIGINT), so registering os.Interrupt already makes Ctrl+Break drain
+// instead of killing the process instantly. There is no separate
+// syscall.SIGBREAK constant in Go; TestCtrlBreakDrainsGracefully pins the
+// behavior end to end on Windows.
+func shutdownSignals() []os.Signal {
+	return []os.Signal{os.Interrupt, syscall.SIGTERM}
+}
+
+// holdForExitIfConsole prints "Press Enter to exit." and waits for input when
+// stderr is an interactive console, so a double-clicked EXE does not flash
+// its window shut before the error above it is readable. No-op when stderr is
+// piped, so scripts and containers never hang on shutdown.
+func holdForExitIfConsole() {
+	if !stderrIsCharDevice() {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "Press Enter to exit.")
+	_, _ = fmt.Scanln()
 }
 
 // refreshLoop refreshes the registry immediately, then every interval.

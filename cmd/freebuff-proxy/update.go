@@ -210,7 +210,11 @@ func runUpdate() {
 		os.Exit(1)
 	}
 	if deferredMsg != "" {
+		// The swap is deferred: the helper runs after this process exits and
+		// records the outcome in the result marker. Do not print a SUCCESS
+		// line until that marker reads OK.
 		fmt.Println(deferredMsg)
+		os.Exit(0)
 	}
 
 	fmt.Printf("\nSUCCESS: freebuff-proxy updated to %s!\n", rel.TagName)

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // replaceExecutable installs the freshly downloaded binary (tempPath, in the
@@ -40,10 +42,21 @@ func installUnix(execPath, tempPath string) error {
 	return nil
 }
 
+// updateResultMarker is the file the Windows helper writes after the deferred
+// swap: "OK" once the new binary replaced the old, or "FAILED: ..." plus
+// manual-install instructions. The parent must not claim the update succeeded
+// until this marker says OK.
+func updateResultMarker(execPath string) string {
+	return execPath + ".update.result"
+}
+
 // installWindows writes a small .bat helper next to the executable that waits
 // for the current process (pid) to exit, then moves the downloaded temp file
-// into place and deletes itself. The helper is launched detached via
-// `cmd /c start`, so it survives this process exiting.
+// into place (retrying while AV/Defender briefly holds the lock) and writes a
+// result marker. The helper is launched detached via `cmd /c start /b`, so it
+// survives this process exiting without flashing a console window. /b (not
+// plain start) is required: without it, start blocks trying to create a new
+// console window in non-interactive contexts (Task Scheduler, services).
 func installWindows(execPath, tempPath string) (string, error) {
 	batPath := execPath + ".update.bat"
 	script := windowsUpdateScript(execPath, tempPath, os.Getpid())
@@ -51,24 +64,38 @@ func installWindows(execPath, tempPath string) (string, error) {
 		return "", fmt.Errorf("write update helper script: %w", err)
 	}
 
-	cmd := exec.Command("cmd", "/c", "start", "", batPath)
+	cmd := exec.Command("cmd", "/c", "start", "/b", "", batPath)
 	if err := cmd.Start(); err != nil {
 		_ = os.Remove(batPath)
 		return "", fmt.Errorf("launch update helper script: %w", err)
 	}
 
-	return fmt.Sprintf("The new binary will be installed automatically after this process (PID %d) exits.", os.Getpid()), nil
+	marker := updateResultMarker(execPath)
+	return fmt.Sprintf("The new binary will be installed automatically after this process (PID %d) exits.\n"+
+		"Result marker: %s (OK once the swap finished; FAILED means it did not).\n"+
+		"If it fails, finish manually: move %s over %s.",
+		os.Getpid(), marker, tempPath, execPath), nil
 }
 
 // windowsUpdateScript returns the content of the .bat helper used to install
 // the updated binary on Windows. It polls tasklist until the updating process
-// (pid) is gone, moves tempPath over execPath, and then deletes itself.
+// (pid) is gone, then moves tempPath over execPath, retrying while
+// AV/Defender briefly locks the running exe, and writes a result marker.
+// Only ASCII values are interpolated: the pid and the file basenames. The
+// directory comes from %~dp0 (the helper's own location), which cmd resolves
+// from the real path — correct even for non-ASCII directories and with no
+// console/codepage dependency. This keeps the .bat pure ASCII: cmd reads
+// batch files with the console codepage, which would mangle non-ASCII paths
+// embedded verbatim. The helper does not delete itself (self-deletion races
+// cmd's incremental file reads); the marker is the source of truth and the
+// inert .bat is overwritten on the next run.
 func windowsUpdateScript(execPath, tempPath string, pid int) string {
-	return fmt.Sprintf(`@echo off
+	markerBase := filepath.Base(updateResultMarker(execPath))
+	script := fmt.Sprintf(`@echo off
 setlocal
 set "TARGET_PID=%d"
-set "TEMP_FILE=%s"
-set "EXE_FILE=%s"
+set "TEMP_FILE=%%~dp0%s"
+set "EXE_FILE=%%~dp0%s"
 
 :waitloop
 tasklist /FI "PID eq %%TARGET_PID%%" 2>nul | findstr "%%TARGET_PID%%" >nul
@@ -77,9 +104,30 @@ timeout /t 1 /nobreak >nul
 goto waitloop
 
 :install
-move /y "%%TEMP_FILE%%" "%%EXE_FILE%%" >nul
-if errorlevel 1 echo ERROR: failed to install updated binary: %%EXE_FILE%% > "%%EXE_FILE%%.update.log"
-del "%%~f0"
+set /a tries=0
+:retry
+move /y "%%TEMP_FILE%%" "%%EXE_FILE%%" >nul 2>&1
+if not errorlevel 1 goto installed
+set /a tries+=1
+if %%tries%% geq 5 goto failed
+timeout /t 2 /nobreak >nul
+goto retry
+
+:installed
+echo OK> "%%~dp0%s"
+goto cleanup
+
+:failed
+echo FAILED: could not replace the running binary after 5 attempts.> "%%~dp0%s"
+echo Install manually: move "%%TEMP_FILE%%" over "%%EXE_FILE%%".>> "%%~dp0%s"
+goto cleanup
+
+:cleanup
 endlocal
-`, pid, tempPath, execPath)
+`, pid,
+		filepath.Base(tempPath), filepath.Base(execPath),
+		markerBase, markerBase, markerBase)
+	// Batch files must use CRLF line endings: cmd misparses LF-only files
+	// (goto labels and multi-line constructs break with "cannot be found").
+	return strings.ReplaceAll(script, "\n", "\r\n")
 }

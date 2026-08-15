@@ -185,8 +185,7 @@ func printPortInUseHint(addr string, err error) {
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "  Then start freebuff-proxy again.")
 	fmt.Fprintln(os.Stderr)
-	if fi, _ := os.Stderr.Stat(); fi != nil && fi.Mode()&os.ModeCharDevice != 0 {
-		fmt.Fprintln(os.Stderr, "Press Enter to exit.")
-		_, _ = fmt.Scanln()
-	}
+	// Shared with the other fatal startup errors: hold the window open on an
+	// interactive console, no-op when stderr is piped.
+	holdForExitIfConsole()
 }
