@@ -16,7 +16,11 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,11 +31,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/convert"
+	"freebuff-proxy/internal/dashboard"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
@@ -55,6 +61,12 @@ type Server struct {
 	reg     *registry.Registry
 	logger  *slog.Logger
 	started time.Time
+
+	// dash is the embedded admin UI (htmx + vendored assets).
+	dash *dashboard.Dashboard
+	// adminAuth guards the dashboard: a stateless HMAC-signed session cookie
+	// issued against ADMIN_TOKEN, plus a per-IP login rate limiter.
+	adminAuth *adminAuth
 }
 
 // New builds the server over the configured pool and registry. A nil logger
@@ -66,6 +78,8 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 	}
 	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now()}
 	s.cfg.Store(cfg)
+	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger)
+	s.adminAuth = newAdminAuth()
 	return s
 }
 
@@ -78,6 +92,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("POST /admin/reload", s.requireAdminToken(s.requireAuth(s.handleReload)))
+	// Admin dashboard: cookie-authenticated browser UI (assets are static
+	// and public; every data route redirects to the login page when the
+	// session cookie is missing or invalid).
+	mux.HandleFunc("GET /admin/login", s.handleAdminLogin)
+	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
+	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
+	mux.Handle("GET /admin/assets/", s.dashboardAuth(http.StripPrefix("/admin/", http.FileServerFS(dashboard.AssetsFS()))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -206,6 +227,154 @@ func (s *Server) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// --- dashboard auth ---
+
+// adminCookieName is the HttpOnly session cookie set after a successful
+// ADMIN_TOKEN login. The value is stateless: unix expiry + HMAC-SHA256 over
+// the expiry, keyed by a per-process random secret. No server-side session
+// store; restart invalidates all sessions, which is the safe default for an
+// admin UI.
+const (
+	adminCookieName = "fb_admin"
+	adminCookieTTL  = 24 * time.Hour
+	maxLoginFails   = 5
+	loginLockout    = time.Minute
+)
+
+// adminAuth issues and validates dashboard session cookies and rate-limits
+// login attempts per remote IP.
+type adminAuth struct {
+	key   [32]byte
+	mu    sync.Mutex
+	fails map[string]failEntry
+}
+
+// failEntry tracks consecutive failed logins from one IP.
+type failEntry struct {
+	count int
+	until time.Time
+}
+
+func newAdminAuth() *adminAuth {
+	a := &adminAuth{fails: make(map[string]failEntry)}
+	_, _ = rand.Read(a.key[:])
+	return a
+}
+
+// cookieValue builds "expiry.hmac" for the given expiry.
+func (a *adminAuth) cookieValue(expiry time.Time) string {
+	mac := hmac.New(sha256.New, a.key[:])
+	_, _ = mac.Write([]byte(strconv.FormatInt(expiry.Unix(), 10)))
+	return strconv.FormatInt(expiry.Unix(), 10) + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+// valid reports whether the cookie value carries a not-yet-expired HMAC
+// signature. Constant-time comparison via hmac.Equal.
+func (a *adminAuth) valid(value string) bool {
+	dot := strings.IndexByte(value, '.')
+	if dot < 0 {
+		return false
+	}
+	exp, err := strconv.ParseInt(value[:dot], 10, 64)
+	if err != nil || time.Now().Unix() >= exp {
+		return false
+	}
+	mac := hmac.New(sha256.New, a.key[:])
+	_, _ = mac.Write([]byte(value[:dot]))
+	got, err := hex.DecodeString(value[dot+1:])
+	if err != nil || !hmac.Equal(got, mac.Sum(nil)) {
+		return false
+	}
+	return true
+}
+
+func (a *adminAuth) setCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminCookieName,
+		Value:    a.cookieValue(time.Now().Add(adminCookieTTL)),
+		Path:     "/admin",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int(adminCookieTTL.Seconds()),
+	})
+}
+
+// allow reports whether ip may attempt a login right now.
+func (a *adminAuth) allow(ip string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, ok := a.fails[ip]
+	return !ok || time.Now().After(e.until)
+}
+
+// recordFail counts a failed login, locking ip out after maxLoginFails.
+func (a *adminAuth) recordFail(ip string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e := a.fails[ip]
+	e.count++
+	if e.count >= maxLoginFails {
+		e.until = time.Now().Add(loginLockout)
+		e.count = 0
+	}
+	a.fails[ip] = e
+}
+
+func (a *adminAuth) clearFails(ip string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.fails, ip)
+}
+
+// dashboardAuth guards the browser UI. With ADMIN_TOKEN unset the dashboard
+// is open (legacy behavior, matching /admin/reload; main.go warns at startup).
+// Otherwise the request must carry a valid fb_admin cookie; missing/invalid
+// sessions are redirected to the login page.
+func (s *Server) dashboardAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.cfg.Load()
+		if cfg.AdminToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if c, err := r.Cookie(adminCookieName); err == nil && s.adminAuth.valid(c.Value) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.Redirect(w, r, "/admin/login", http.StatusFound)
+	})
+}
+
+// handleAdminLogin renders the login page and processes the token form:
+// constant-time ADMIN_TOKEN comparison, per-IP rate limiting, and a signed
+// session cookie on success. With ADMIN_TOKEN unset it redirects straight to
+// the dashboard.
+func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfg.Load()
+	if cfg.AdminToken == "" {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	ip := remoteHost(r)
+	if r.Method == http.MethodPost {
+		if !s.adminAuth.allow(ip) {
+			s.dash.RenderLogin(w, r, "Too many failed attempts — try again in a minute.")
+			return
+		}
+		token := r.FormValue("token")
+		if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.AdminToken)) == 1 {
+			s.adminAuth.clearFails(ip)
+			s.adminAuth.setCookie(w)
+			http.Redirect(w, r, "/admin", http.StatusFound)
+			return
+		}
+		s.adminAuth.recordFail(ip)
+		s.dash.RenderLogin(w, r, "Invalid admin token.")
+		return
+	}
+	s.dash.RenderLogin(w, r, "")
 }
 
 // clientToken returns the request's bearer token (Authorization: Bearer or

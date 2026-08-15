@@ -1,0 +1,32 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="htmx-config" content='{"selfRequestsOnly":true,"allowScriptTags":false}'>
+<title>freebuff-proxy · admin</title>
+<link rel="stylesheet" href="/admin/assets/pico.min.css">
+<link rel="stylesheet" href="/admin/assets/app.css">
+<script src="/admin/assets/htmx.min.js" defer></script>
+</head>
+<body>
+<header class="site">
+  <nav class="container">
+    <ul>
+      <li><a href="/admin" class="brand">freebuff-proxy <span class="brand-sub">admin</span></a></li>
+    </ul>
+    <ul>
+      <li><a href="/admin" class="nav-link">Overview</a></li>
+    </ul>
+  </nav>
+</header>
+<main class="container">
+  <div id="overview-root">{{.Body}}</div>
+</main>
+<div hx-get="/admin" hx-trigger="every 5s" hx-target="#overview-root" hx-swap="innerHTML" hidden></div>
+<footer class="container muted">
+  <p>single binary · htmx driven · <a href="/healthz">healthz</a> · <a href="/metrics">metrics</a></p>
+</footer>
+</body>
+</html>
+{{end}}
