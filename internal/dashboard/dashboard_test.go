@@ -222,6 +222,31 @@ func mustReadAll(t *testing.T, resp *http.Response) []byte {
 	return b
 }
 
+// The restricted page renders the themed gate (not a bare error line).
+func TestRestrictedPageRenders(t *testing.T) {
+	cfg := &config.Config{
+		UpstreamBaseURL: "https://www.codebuff.com",
+		AuthTokens:      []string{},
+	}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, nil, nil, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil, nil)
+	rec := httptest.NewRecorder()
+	d.RenderRestricted(rec, httptest.NewRequest(http.MethodGet, "/admin/config", nil), "blocked")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	for _, want := range []string{"Restricted", "ADMIN_TOKEN", "blocked"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("restricted page missing %q", want)
+		}
+	}
+}
+
 // The models page renders the catalog with agent mappings.
 func TestModelsPageRenders(t *testing.T) {
 	ts := newDashboardForPages(t, false, "models")
