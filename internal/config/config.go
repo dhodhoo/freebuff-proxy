@@ -188,11 +188,13 @@ func Load(configPath string) (Config, error) {
 		return Config{}, err
 	}
 
+	// MAX_MESSAGES_PER_DAY defaults to 0 (unlimited): the upstream 429 lock
+	// is the real quota enforcement — rate-limited tokens are locked in
+	// memory until the reset window, so no local cap is needed to prevent
+	// spam traffic. Explicit values always win.
 	maxMessagesPerDay := 0
 	if raw.MaxMessagesPerDay != nil {
 		maxMessagesPerDay = *raw.MaxMessagesPerDay
-	} else if raw.SafeMode {
-		maxMessagesPerDay = 150
 	}
 
 	// TRANSIENT_RETRIES: nil defaults to 1 (one additional attempt after a
@@ -246,7 +248,8 @@ func Load(configPath string) (Config, error) {
 	// SafeMode presets: when SAFE_MODE=true, apply recommended defaults for
 	// account-safety knobs that were NOT explicitly configured. Explicit
 	// "0"/disabled values always win (IDLE_ROTATION_TIMEOUT=0 or
-	// REQUEST_JITTER=0 stay disabled; MAX_MESSAGES_PER_DAY=0 stays unlimited).
+	// REQUEST_JITTER=0 stay disabled). MAX_MESSAGES_PER_DAY is never preset:
+	// it defaults to 0 (unlimited); the upstream 429 lock enforces quotas.
 	if cfg.SafeMode {
 		if !idleRotationSet && cfg.IdleRotationTimeout == 0 {
 			cfg.IdleRotationTimeout = 30 * time.Minute

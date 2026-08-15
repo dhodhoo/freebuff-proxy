@@ -130,8 +130,8 @@ func TestSafeMode(t *testing.T) {
 			t.Fatalf("Load: %v", err)
 		}
 
-		if cfg.MaxMessagesPerDay != 150 {
-			t.Errorf("MaxMessagesPerDay = %d, want 150 under SafeMode", cfg.MaxMessagesPerDay)
+		if cfg.MaxMessagesPerDay != 0 {
+			t.Errorf("MaxMessagesPerDay = %d, want 0 (unlimited default, no SafeMode preset)", cfg.MaxMessagesPerDay)
 		}
 		if cfg.IdleRotationTimeout != 30*time.Minute {
 			t.Errorf("IdleRotationTimeout = %v, want 30m under SafeMode", cfg.IdleRotationTimeout)
@@ -178,9 +178,9 @@ func TestSafeMode(t *testing.T) {
 		if cfg.RequestJitter != 0 {
 			t.Errorf("RequestJitter = %v, want 0 (explicit 0 beats the preset)", cfg.RequestJitter)
 		}
-		// Unset knobs still get the presets.
-		if cfg.MaxMessagesPerDay != 150 {
-			t.Errorf("MaxMessagesPerDay = %d, want 150 under SafeMode", cfg.MaxMessagesPerDay)
+		// Unset knobs still get the presets; the daily cap stays unlimited.
+		if cfg.MaxMessagesPerDay != 0 {
+			t.Errorf("MaxMessagesPerDay = %d, want 0 (unlimited default, no SafeMode preset)", cfg.MaxMessagesPerDay)
 		}
 		if cfg.TLSFingerprint != "auto" {
 			t.Errorf("TLSFingerprint = %q, want auto under SafeMode", cfg.TLSFingerprint)
@@ -710,11 +710,11 @@ func TestMaxMessagesPerDay(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("AUTH_TOKENS", "tok")
 
-	// default: 150 via the SAFE_MODE preset (unset)
+	// default: 0 (unlimited; no SafeMode preset)
 	if cfg, err := Load(""); err != nil {
 		t.Fatalf("Load: %v", err)
-	} else if cfg.MaxMessagesPerDay != 150 {
-		t.Errorf("MaxMessagesPerDay = %d, want 150 (SAFE_MODE default preset)", cfg.MaxMessagesPerDay)
+	} else if cfg.MaxMessagesPerDay != 0 {
+		t.Errorf("MaxMessagesPerDay = %d, want 0 (unlimited default)", cfg.MaxMessagesPerDay)
 	}
 
 	// SAFE_MODE=false restores unlimited
