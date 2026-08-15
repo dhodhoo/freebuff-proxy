@@ -88,6 +88,16 @@ the client sends:
   with LRU eviction and ~2h idle eviction. Ban/quota errors stay per account (403/429/503).
 - Want several FreeBuff accounts? Add several 9router keys — each carries its own token.
 
+> **Connection strategy — do NOT use round-robin.** With multiple keys, set 9router's
+> connection strategy to **fallback / priority (fill the first)**. Round-robin spreads
+> traffic across every account at once: all accounts burn their daily quota together and
+> expose the same rotated access pattern, which is a high-risk signal for account bans.
+> Fallback keeps one account active at a time and only moves to the next when the active
+> one is rate-limited (429) or unavailable — the same drain order the proxy uses in pooled
+> mode. Expect the active account to surface a 429 (`reset at <next 00:00 PT>`) once its
+> daily quota is exhausted; that is the normal end-of-quota signal, not a ban, and 9router
+> auto-falls back to the next key.
+
 Verify with curl before touching 9router (no token needed for models/healthz):
 
 ```bash
