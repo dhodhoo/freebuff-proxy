@@ -89,16 +89,46 @@ func windowsPortPIDFromOutput(out, port string) string {
 	return ""
 }
 
-// unixPortPID returns the first LISTENING PID for port via lsof -ti.
+// unixPortPID returns the first LISTENING PID for port. Tool availability
+// varies by distro: lsof (most full installs), ss (iproute2), or netstat
+// (busybox in minimal alpine containers) — try them in order.
 func unixPortPID(port string) string {
-	out, err := exec.Command("lsof", "-ti", ":"+port, "-sTCP:LISTEN").Output()
+	if pid := execFirstOutput("lsof", "-ti", ":"+port, "-sTCP:LISTEN"); pid != "" {
+		return pid
+	}
+	if pid := execFirstOutput("ss", "-ltnp", "sport = :"+port); pid != "" {
+		// ss output: "LISTEN 0 128 0.0.0.0:3457 0.0.0.0:* users:(("proc",pid=1234,fd=5))"
+		for _, line := range strings.Split(pid, "\n") {
+			if i := strings.Index(line, "pid="); i >= 0 {
+				rest := line[i+4:]
+				if j := strings.IndexAny(rest, ",)"); j >= 0 {
+					rest = rest[:j]
+				}
+				if rest != "" {
+					return rest
+				}
+			}
+		}
+		return ""
+	}
+	// busybox netstat -ltnp prints PIDs in the last field of LISTEN lines.
+	for _, line := range strings.Split(execFirstOutput("netstat", "-ltnp"), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 7 && strings.Contains(f[0], "LISTEN") && strings.HasSuffix(f[3], ":"+port) {
+			return f[len(f)-1]
+		}
+	}
+	return ""
+}
+
+// execFirstOutput runs a command and returns its stdout, or "" on any error
+// (missing binary, non-zero exit).
+func execFirstOutput(name string, args ...string) string {
+	out, err := exec.Command(name, args...).Output()
 	if err != nil {
 		return ""
 	}
-	if f := strings.Fields(string(out)); len(f) > 0 {
-		return f[0]
-	}
-	return ""
+	return string(out)
 }
 
 // processName resolves a PID to a process name: tasklist CSV on Windows,

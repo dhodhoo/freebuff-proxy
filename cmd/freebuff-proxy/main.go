@@ -19,6 +19,12 @@ import (
 	"syscall"
 	"time"
 
+	// Embed the IANA tzdata so NextPacificMidnight keeps exact DST math on
+	// minimal images (alpine:3.20 has no /usr/share/zoneinfo) and Windows
+	// hosts without the timezone registry entries. Without this, Pacific
+	// resets fall back to a month-based approximation.
+	_ "time/tzdata"
+
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/pool"
