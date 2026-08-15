@@ -7,6 +7,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -302,6 +303,9 @@ func discoverCLIToken() (string, string, string, bool) {
 		if err != nil {
 			continue
 		}
+		// Strip a leading UTF-8 BOM (Windows credential writers can add one)
+		// or json.Unmarshal fails and auto-discovery silently skips the file.
+		data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 		var parsed map[string]any
 		if err := json.Unmarshal(data, &parsed); err != nil {
 			continue
@@ -510,6 +514,10 @@ func readDotenv(path string) (map[string]string, error) {
 // quotes stripped, unquoted trailing # comments trimmed.
 func parseDotenv(data []byte) map[string]string {
 	out := make(map[string]string)
+	// Strip a leading UTF-8 BOM: PowerShell WriteAllText with a BOM-less
+	// encoding must not be the only safe writer — a BOM on the first line
+	// would corrupt the first key into "\ufeffKEY".
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {

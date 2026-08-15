@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,6 +61,13 @@ func New(level slog.Level, logFile string) *slog.Logger {
 	w := io.Writer(os.Stderr)
 	var file *os.File
 	if logFile != "" {
+		// Create the parent directory so LOG_FILE may point into a nested
+		// path (e.g. ./logs/proxy.log) without a pre-existing tree. Errors
+		// are ignored here: OpenFile below fails with its own report and the
+		// stderr-only fallback keeps logging.
+		if dir := filepath.Dir(logFile); dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0o755)
+		}
 		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "freebuff-proxy: warning: cannot open log file %s: %v\n", logFile, err)

@@ -155,7 +155,7 @@ if ($Save) {
             fingerprintHash = $fingerprintHash
         }
     } | ConvertTo-Json -Depth 5
-    Set-Content -LiteralPath $credPath -Value $credData -Encoding utf8
+    [System.IO.File]::WriteAllText($credPath, $credData, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "  Saved to: $credPath" -ForegroundColor DarkGray
 }
 
@@ -182,7 +182,7 @@ if ($Append) {
         } else {
             $content += "`nAUTH_TOKENS=$authToken`n"
         }
-        Set-Content -LiteralPath $targetEnv -Value $content -Encoding utf8 -NoNewline
+        [System.IO.File]::WriteAllText($targetEnv, $content, (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "  Appended to: $targetEnv" -ForegroundColor Green
     } else {
         Write-Host "  .env not found at $targetEnv (create it first)" -ForegroundColor Yellow

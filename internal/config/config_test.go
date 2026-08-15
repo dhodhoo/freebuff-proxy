@@ -556,6 +556,25 @@ func TestDotenv(t *testing.T) {
 	}
 }
 
+func TestDotenvStripsBOM(t *testing.T) {
+	clearEnv(t)
+
+	// A UTF-8 BOM on the first line would corrupt the first key into
+	// "\ufeffAUTH_TOKENS" and the token would silently drop out of the pool;
+	// PowerShell writers with a UTF-8-with-BOM default produce this shape.
+	if err := os.WriteFile(".env", []byte("\xef\xbb\xbfAUTH_TOKENS=tok-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "tok-1" {
+		t.Errorf("AuthTokens = %v, want [tok-1] (BOM must not corrupt the first key)", got)
+	}
+}
+
 func TestDotenvEnvWins(t *testing.T) {
 	clearEnv(t)
 
@@ -1037,6 +1056,37 @@ func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	}
 	if cfg.ProxyRotation != "random" {
 		t.Errorf("ProxyRotation = %q, want random (env wins)", cfg.ProxyRotation)
+	}
+}
+
+// TestAutoDiscoverStripsCredentialsBOM verifies that a UTF-8 BOM at the
+// start of the CLI credentials file (a Windows writer artifact) does not
+// break json.Unmarshal and silently disable auto-discovery.
+func TestAutoDiscoverStripsCredentialsBOM(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := "\xef\xbb\xbf" + `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "cb_discovered" {
+		t.Fatalf("AuthTokens = %v, want [cb_discovered] (BOM must not break credentials parsing)", got)
+	}
+	if cfg.DiscoveredSource == "" {
+		t.Fatal("DiscoveredSource = empty, want the credentials file path")
 	}
 }
 

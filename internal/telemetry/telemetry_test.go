@@ -211,11 +211,33 @@ func TestTruncateUTF8Safe(t *testing.T) {
 	}
 }
 
+// TestNewLoggerCreatesNestedLogDir verifies that LOG_FILE may point into a
+// fresh nested directory: the parent is created before the file is opened.
+func TestNewLoggerCreatesNestedLogDir(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "logs", "proxy.log")
+	logger := NewLogger(true, path)
+	logger.Info("nested-dir line")
+	closeLogFile(t, logger)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (parent dir was not created)", path, err)
+	}
+	if !strings.Contains(string(data), `msg="nested-dir line"`) {
+		t.Errorf("line missing from log file in nested dir: %q", data)
+	}
+}
+
 func TestColorizeWhenLogFileFailsToOpen(t *testing.T) {
-	// A log file in a nonexistent directory cannot be opened; the logger
+	// A log file whose parent cannot be created (a regular file occupies the
+	// directory position, so MkdirAll fails) cannot be opened; the logger
 	// falls back to stderr-only and must keep its ANSI colors.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	out := captureStderr(t, func() {
-		logger := NewLogger(true, filepath.Join(t.TempDir(), "no-such-dir", "x.log"))
+		logger := NewLogger(true, filepath.Join(blocker, "x.log"))
 		logger.Info("still-colored")
 	})
 	if !strings.Contains(out, "\x1b[32mINFO\x1b[0m") {

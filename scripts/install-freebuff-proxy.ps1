@@ -212,7 +212,7 @@ if (-not $NoEnv) {
         Invoke-WebRequest -Uri $exampleUrl -OutFile $envPath
         Write-Host ".env downloaded from the documented .env.example" -ForegroundColor Green
       } catch {
-        Set-Content -LiteralPath $envPath -Value "AUTH_TOKENS=`nLISTEN_ADDR=127.0.0.1:3457`nCOST_MODE=free`nMAX_MESSAGES_PER_DAY=0`nIDLE_ROTATION_TIMEOUT=0`n" -Encoding utf8
+        [System.IO.File]::WriteAllText($envPath, "AUTH_TOKENS=`nLISTEN_ADDR=127.0.0.1:3457`nCOST_MODE=free`nMAX_MESSAGES_PER_DAY=0`nIDLE_ROTATION_TIMEOUT=0`n", (New-Object System.Text.UTF8Encoding($false)))
         Write-Host ".env created (minimal fallback)" -ForegroundColor Yellow
       }
     }
@@ -229,7 +229,7 @@ function Set-EnvValue([string]$key, [string]$value) {
   } else {
     $content = $content.TrimEnd() + "`n$key=$value`n"
   }
-  Set-Content -LiteralPath $envPath -Value $content -NoNewline -Encoding utf8
+  [System.IO.File]::WriteAllText($envPath, $content, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 if (-not $NoEnv) {
