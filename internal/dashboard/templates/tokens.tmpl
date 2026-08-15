@@ -59,7 +59,7 @@
           <td class="mono">{{.Limit}}</td>
           <td class="mono">{{.Period}}</td>
           <td class="mono">{{.ResetAt}}</td>
-          {{if .HasEntitlement}}<td class="mono">{{.Entitled}}</td>{{end}}
+          <td class="mono">{{if .HasEntitlement}}{{.Entitled}}{{end}}</td>
         </tr>
       {{end}}
       </tbody>

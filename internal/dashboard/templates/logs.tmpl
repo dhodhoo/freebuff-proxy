@@ -22,6 +22,14 @@
 {{else}}
 <div class="table-wrap">
   <table class="log-table">
+    <thead class="visually-hidden">
+      <tr>
+        <th scope="col">time</th>
+        <th scope="col">level</th>
+        <th scope="col">message</th>
+        <th scope="col">fields</th>
+      </tr>
+    </thead>
     <tbody>
     {{range .Entries}}
       <tr class="log-{{.Level}}">

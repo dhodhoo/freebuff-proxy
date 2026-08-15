@@ -153,10 +153,53 @@ func TestDashboardRejectsTamperedCookie(t *testing.T) {
 	}
 }
 
-// Five failed logins lock the IP out for a minute, even with the right token.
+// lockoutBound matches server.maxLoginFails (5), pinned by
+// TestAdminAuthLockoutBound in auth_internal_test.go; this test drives the
+// HTTP surface with one more attempt than the bound.
+const lockoutBound = 5
+
+// Assets are public (the login page loads them without a cookie).
+func TestDashboardAssetsPublic(t *testing.T) {
+	ts := dashboardServer(t, "secret", nil)
+	resp := get(t, ts.URL+"/admin/assets/pico.min.css", "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("asset status = %d, want 200 without a cookie", resp.StatusCode)
+	}
+}
+
+// With ADMIN_TOKEN unset, secret-bearing routes (config) require a loopback
+// client; a remote client gets 403, not the .env.
+func TestDashboardConfigLoopbackGate(t *testing.T) {
+	ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.AdminToken = "" }, testutil.NewMock())
+	// httptest.NewRequest defaults RemoteAddr to a non-loopback address.
+	req := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+	rec := httptest.NewRecorder()
+	ts.Config.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("remote config status = %d, want 403", rec.Code)
+	}
+}
+
+// htmx polls get 401 + HX-Redirect on an expired/missing session, not a 302
+// that would swap a login fragment into the dashboard.
+func TestDashboardHXAuthRedirect(t *testing.T) {
+	ts := dashboardServer(t, "secret", nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.Header.Set("HX-Request", "true")
+	rec := httptest.NewRecorder()
+	ts.Config.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("hx status = %d, want 401", rec.Code)
+	}
+	if got := rec.Header().Get("HX-Redirect"); got != "/admin/login" {
+		t.Fatalf("HX-Redirect = %q, want /admin/login", got)
+	}
+}
+
 func TestDashboardLoginRateLimit(t *testing.T) {
 	ts := dashboardServer(t, "secret", nil)
-	for range maxLoginFailsForTest {
+	for range lockoutBound + 1 {
 		resp := postLogin(t, ts.URL+"/admin/login", "wrong")
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
@@ -167,9 +210,6 @@ func TestDashboardLoginRateLimit(t *testing.T) {
 		t.Error("rate-limited login did not show lockout message")
 	}
 }
-
-// maxLoginFailsForTest mirrors the server's maxLoginFails constant.
-const maxLoginFailsForTest = 5
 
 // --- config editor ---
 
@@ -218,7 +258,7 @@ func TestDashboardConfigSave(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("save status = %d, want 200", resp.StatusCode)
 	}
-	if !strings.Contains(bodyOf(t, resp), "result-ok") {
+	if !strings.Contains(bodyOf(t, resp), "Saved and reloaded") {
 		t.Error("save response missing success class")
 	}
 	got, err := os.ReadFile(".env")
@@ -244,7 +284,7 @@ func TestDashboardConfigSaveRejectedRollsBack(t *testing.T) {
 	// and the file restored.
 	resp := postConfig(t, ts.URL, cookie, "LISTEN_ADDR=127.0.0.1\n")
 	defer func() { _ = resp.Body.Close() }()
-	if !strings.Contains(bodyOf(t, resp), "result-err") {
+	if !strings.Contains(bodyOf(t, resp), "Configuration rejected") {
 		t.Error("rejected save missing error class")
 	}
 	got, err := os.ReadFile(".env")

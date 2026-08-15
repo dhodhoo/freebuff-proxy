@@ -8,6 +8,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -84,13 +85,14 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *Handler) Handle(ctx context.Context, rec slog.Record) error {
+	prefix := strings.Join(h.groups, ".")
 	fields := make([]string, 0, len(h.attrs)+4)
 	for _, a := range h.attrs {
-		fields = append(fields, flatten("", a)...)
+		fields = append(fields, flatten(prefix, a)...)
 	}
 	var flat []string
 	rec.Attrs(func(a slog.Attr) bool {
-		flat = append(flat, flatten("", a)...)
+		flat = append(flat, flatten(prefix, a)...)
 		return true
 	})
 	fields = append(fields, flat...)
@@ -98,15 +100,21 @@ func (h *Handler) Handle(ctx context.Context, rec slog.Record) error {
 	return h.next.Handle(ctx, rec)
 }
 
+// WithAttrs clones the handler, folding the attrs into the retained fields
+// and forwarding them to the wrapped sink (matching slog's contract).
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	c := *h
 	c.attrs = append(append([]slog.Attr{}, h.attrs...), attrs...)
+	c.next = h.next.WithAttrs(attrs)
 	return &c
 }
 
+// WithGroup clones the handler, tracking the group for retained-field
+// prefixes and forwarding it to the wrapped sink.
 func (h *Handler) WithGroup(name string) slog.Handler {
 	c := *h
 	c.groups = append(append([]string{}, h.groups...), name)
+	c.next = h.next.WithGroup(name)
 	return &c
 }
 

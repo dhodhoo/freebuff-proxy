@@ -27,7 +27,7 @@
 
   <article class="card">
     <h2>Editor</h2>
-    <form hx-post="/admin/config" hx-target="#config-result" hx-swap="innerHTML">
+    <form method="post" action="/admin/config" hx-post="/admin/config" hx-target="#config-result" hx-swap="innerHTML">
       <label for="env-content">.env content</label>
       <textarea id="env-content" name="content" rows="24" class="mono" spellcheck="false" required>{{.EnvContent}}</textarea>
       <div class="form-actions">

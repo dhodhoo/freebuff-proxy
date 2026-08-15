@@ -126,7 +126,7 @@ func main() {
 	// Prewarm + the 60s maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)
 
-	srv := server.New(&cfg, p, reg, logger, logringHandler)
+	srv := server.New(&cfg, p, reg, logger, logringHandler, *configPath)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),

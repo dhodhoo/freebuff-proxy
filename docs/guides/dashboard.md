@@ -12,8 +12,8 @@ page unless `ADMIN_TOKEN` is unset.
 
 | Setting | Behavior |
 |---|---|
-| `ADMIN_TOKEN` set | Login required. Enter the token; a signed `HttpOnly` + `SameSite=Strict` cookie unlocks the dashboard for 24h. Failed logins are rate-limited per IP (5 fails → 1 minute lockout). |
-| `ADMIN_TOKEN` unset | Dashboard is open (legacy behavior, matching `/admin/reload`). A startup warning reminds you to set it if the proxy is reachable beyond loopback. |
+| `ADMIN_TOKEN` set | Login required. Enter the token; a signed `HttpOnly` + `SameSite=Strict` cookie unlocks the dashboard for 24h (`Secure` is added automatically when the proxy listens beyond loopback). Failed logins are rate-limited per IP (5 fails → 1 minute lockout). |
+| `ADMIN_TOKEN` unset | Dashboard is open (legacy behavior, matching `/admin/reload`). A startup warning reminds you to set it if the proxy is reachable beyond loopback. **Config and Logs pages additionally require a loopback client** in this mode — a remotely reachable proxy cannot read or rewrite its `.env`, or view logs, without the token. |
 
 The session cookie is stateless (HMAC-signed expiry, per-process random key):
 restarting the proxy signs everyone out, which is the safe default.
@@ -58,7 +58,10 @@ The Overview/Tokens/Logs/Metrics pages work fine in Docker.
    proxy; if you expose it, put TLS in front (reverse proxy) — the cookie and
    admin traffic would otherwise cross the wire in the clear.
 3. The dashboard never renders token values: `AUTH_TOKENS`, `API_KEYS`,
-   `SOCKS5_PROXY(S)`, and `ADMIN_TOKEN` show only set/unset + counts.
+   `SOCKS5_PROXY(S)`, and `ADMIN_TOKEN` show only set/unset + counts. The
+   `.env` file is written atomically with mode `0600`.
+4. Saves (and `/admin/reload`) re-apply the JSON config file the proxy was
+   started with (`-config`), so JSON overrides survive a dashboard save.
 
 ## What is deliberately not in v1
 

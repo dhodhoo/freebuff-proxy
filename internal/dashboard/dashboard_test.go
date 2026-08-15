@@ -68,9 +68,7 @@ func TestPageOverviewFull(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	body := make([]byte, 4096)
-	n, _ := resp.Body.Read(body)
-	page := string(body[:n])
+	page := string(mustReadAll(t, resp))
 	for _, want := range []string{"<html", "Overview", "Bridge mode", "models"} {
 		if !strings.Contains(page, want) {
 			t.Errorf("page missing %q", want)
@@ -90,9 +88,7 @@ func TestPageOverviewFragment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body := make([]byte, 4096)
-	n, _ := resp.Body.Read(body)
-	frag := string(body[:n])
+	frag := string(mustReadAll(t, resp))
 	if strings.Contains(frag, "<html") {
 		t.Error("htmx request rendered a full page, want bare fragment")
 	}

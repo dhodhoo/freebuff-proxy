@@ -283,7 +283,7 @@ opt out). It enables essential anti-ban protections and presets:
 
 The proxy ships with an embedded web dashboard — same single binary, no extra process, no build step (htmx + Pico are vendored into the binary). Open `http://127.0.0.1:3457/admin` (or your `LISTEN_ADDR`).
 
-- **Login**: enter the `ADMIN_TOKEN` from your config. Without `ADMIN_TOKEN` the dashboard is open (matching `/admin/reload`'s legacy behavior; a startup warning is logged). Failed logins are rate-limited per IP (5 fails → 1 minute lockout), and the session cookie is `HttpOnly` + `SameSite=Strict`.
+- **Login**: enter the `ADMIN_TOKEN` from your config. Without `ADMIN_TOKEN` the dashboard is open (matching `/admin/reload`'s legacy behavior; a startup warning is logged) — but the secret-bearing **Config and Logs pages require a loopback client** in that mode, so a remotely reachable proxy cannot leak or rewrite its `.env`. Failed logins are rate-limited per IP (5 fails → 1 minute lockout), and the session cookie is `HttpOnly` + `SameSite=Strict` (+ `Secure` when the proxy listens beyond loopback).
 - **Overview**: live relay state (pooled/bridge mode, model count, uptime, safe mode) with per-token cards — session status, ban/429 risk level, usage vs `MAX_MESSAGES_PER_DAY`, transient-retry counters. Polls every 5s.
 - **Tokens**: per-token session detail and the live per-model session quota table (limit/recent/period/reset/entitlement).
 - **Config**: edit the proxy's `.env` file in place. Save runs the same validation as startup (durations, URLs, `Validate`) and hot-reloads; invalid input is rejected with the file rolled back. The effective-value table shows secrets redacted to set/unset + counts.

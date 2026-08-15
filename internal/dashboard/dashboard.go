@@ -46,6 +46,12 @@ type Dashboard struct {
 	logs    *logring.Handler // dashboard log viewer source (nil = disabled)
 	started time.Time
 	tpl     *template.Template
+
+	// metricHist is the rolling counter history sampled by the metrics page
+	// (UI-poll-driven, not a background goroutine). Per-instance so multiple
+	// dashboards never share one window.
+	metricsMu  sync.Mutex
+	metricHist []metricSample
 }
 
 // New builds the dashboard. cfg must return the current configuration — the
@@ -181,12 +187,6 @@ type metricsData struct {
 	RetriesSpark         template.HTML
 }
 
-// metricsMu guards the rolling sample history.
-var (
-	metricsMu  sync.Mutex
-	metricHist []metricSample
-)
-
 func (d *Dashboard) metricsData() metricsData {
 	ps := d.pool.PoolSnapshot()
 	md := metricsData{
@@ -197,14 +197,14 @@ func (d *Dashboard) metricsData() metricsData {
 	for _, t := range ps.Tokens {
 		md.RequestsTotal += int64(t.Requests)
 	}
-	metricsMu.Lock()
-	metricHist = append(metricHist, metricSample{Requests: md.RequestsTotal, Retries: ps.TransientRetries, Rotation: ps.FingerprintRotations})
-	if len(metricHist) > maxMetricSamples {
-		metricHist = metricHist[len(metricHist)-maxMetricSamples:]
+	d.metricsMu.Lock()
+	d.metricHist = append(d.metricHist, metricSample{Requests: md.RequestsTotal, Retries: ps.TransientRetries, Rotation: ps.FingerprintRotations})
+	if len(d.metricHist) > maxMetricSamples {
+		d.metricHist = d.metricHist[len(d.metricHist)-maxMetricSamples:]
 	}
-	hist := make([]metricSample, len(metricHist))
-	copy(hist, metricHist)
-	metricsMu.Unlock()
+	hist := make([]metricSample, len(d.metricHist))
+	copy(hist, d.metricHist)
+	d.metricsMu.Unlock()
 	md.SampleCount = len(hist)
 
 	requests := make([]float64, len(hist))
@@ -213,17 +213,18 @@ func (d *Dashboard) metricsData() metricsData {
 		requests[i] = float64(s.Requests)
 		retries[i] = float64(s.Retries)
 	}
-	md.RequestsSpark = sparklineSVG(requests, "var(--fp-amber)")
-	md.RetriesSpark = sparklineSVG(retries, "var(--fp-teal)")
+	md.RequestsSpark = sparklineSVG(requests, "var(--fp-amber)", "requests served over time")
+	md.RetriesSpark = sparklineSVG(retries, "var(--fp-teal)", "transient retries over time")
 	return md
 }
 
 // sparklineSVG renders a normalized polyline sparkline. Values are scaled to
-// the chart height (flat when constant or empty).
-func sparklineSVG(values []float64, color string) template.HTML {
+// the chart height (flat when constant or empty). color is an internal CSS
+// variable literal; label is the accessible name.
+func sparklineSVG(values []float64, color, label string) template.HTML {
 	const w, h = 260, 44
 	if len(values) < 2 {
-		return template.HTML(`<svg viewBox="0 0 ` + strconv.Itoa(w) + ` ` + strconv.Itoa(h) + `" role="img" aria-label="no data yet"><polyline points="0,` + strconv.Itoa(h-2) + ` ` + strconv.Itoa(w) + `,` + strconv.Itoa(h-2) + `" fill="none" stroke="` + color + `" stroke-width="1.5"/></svg>`)
+		return template.HTML(`<svg viewBox="0 0 ` + strconv.Itoa(w) + ` ` + strconv.Itoa(h) + `" role="img" aria-label="` + label + `"><polyline points="0,` + strconv.Itoa(h-2) + ` ` + strconv.Itoa(w) + `,` + strconv.Itoa(h-2) + `" fill="none" stroke="` + color + `" stroke-width="1.5"/></svg>`)
 	}
 	min, max := values[0], values[0]
 	for _, v := range values[1:] {
@@ -239,7 +240,7 @@ func sparklineSVG(values []float64, color string) template.HTML {
 		span = 1
 	}
 	var sb strings.Builder
-	sb.WriteString(`<svg viewBox="0 0 ` + strconv.Itoa(w) + ` ` + strconv.Itoa(h) + `" role="img" preserveAspectRatio="none"><polyline points="`)
+	sb.WriteString(`<svg viewBox="0 0 ` + strconv.Itoa(w) + ` ` + strconv.Itoa(h) + `" role="img" aria-label="` + label + `" preserveAspectRatio="none"><polyline points="`)
 	for i, v := range values {
 		x := float64(i) * float64(w) / float64(len(values)-1)
 		y := float64(h-2) - (v-min)/span*float64(h-4)
@@ -264,22 +265,10 @@ type tokensData struct {
 // tokenDetail is the full per-token view: the overview card fields plus the
 // live per-model session quota table.
 type tokenDetail struct {
-	Index            int
-	SessionStatus    string
-	SessionInstance  string
-	QueuePosition    int
-	QueueDepth       int
-	ActiveRuns       int
-	Requests         int
-	Messages24h      int
-	DailyLimit       int
-	UsagePct         int
-	RiskLevel        string
-	CooldownActive   bool
-	CooldownUntil    string
-	TransientRetries int64
-	Quota            []quotaRow
-	HasQuota         bool
+	tokenCard
+	SessionInstance string
+	Quota           []quotaRow
+	HasQuota        bool
 }
 
 type quotaRow struct {
@@ -300,22 +289,8 @@ func (d *Dashboard) tokensData() tokensData {
 	}
 	for _, t := range d.pool.Snapshot() {
 		detail := tokenDetail{
-			Index:            t.Token,
-			SessionStatus:    t.SessionStatus,
-			SessionInstance:  shortID(t.SessionInstanceID),
-			QueuePosition:    t.SessionQueuePosition,
-			QueueDepth:       t.SessionQueueDepth,
-			ActiveRuns:       t.ActiveRuns,
-			Requests:         t.Requests,
-			Messages24h:      t.Messages24h,
-			DailyLimit:       t.DailyLimit,
-			UsagePct:         t.UsagePct,
-			RiskLevel:        t.RiskLevel,
-			TransientRetries: t.TransientRetries,
-		}
-		if !t.CooldownUntil.IsZero() && time.Now().Before(t.CooldownUntil) {
-			detail.CooldownActive = true
-			detail.CooldownUntil = t.CooldownUntil.Format(time.RFC3339)
+			tokenCard:       cardFromSnapshot(t),
+			SessionInstance: shortID(t.SessionInstanceID),
 		}
 		for model, q := range t.QuotaByModel {
 			row := quotaRow{
@@ -337,6 +312,29 @@ func (d *Dashboard) tokensData() tokensData {
 	}
 	td.HasTokens = len(td.Tokens) > 0
 	return td
+}
+
+// cardFromSnapshot maps one pool snapshot into the shared token-card view
+// (overview cards and the tokens-detail header use the same fields).
+func cardFromSnapshot(t pool.TokenSnapshot) tokenCard {
+	card := tokenCard{
+		Index:            t.Token,
+		SessionStatus:    t.SessionStatus,
+		QueuePosition:    t.SessionQueuePosition,
+		QueueDepth:       t.SessionQueueDepth,
+		ActiveRuns:       t.ActiveRuns,
+		Requests:         t.Requests,
+		Messages24h:      t.Messages24h,
+		DailyLimit:       t.DailyLimit,
+		UsagePct:         t.UsagePct,
+		RiskLevel:        t.RiskLevel,
+		TransientRetries: t.TransientRetries,
+	}
+	if !t.CooldownUntil.IsZero() && time.Now().Before(t.CooldownUntil) {
+		card.CooldownActive = true
+		card.CooldownUntil = t.CooldownUntil.Format(time.RFC3339)
+	}
+	return card
 }
 
 // shortID renders a session instance id's first 8 chars for identification.
@@ -494,9 +492,9 @@ const defaultEnvTemplate = `# freebuff-proxy configuration (.env)
 #AUTH_TOKENS=token1,token2
 #API_KEYS=sk-local-...
 #ADMIN_TOKEN=change-me
-#ROTATION_INTERVAL=24h
+#ROTATION_INTERVAL=6h
 #REQUEST_TIMEOUT=15m
-#SESSION_CALL_TIMEOUT=5s
+#SESSION_CALL_TIMEOUT=30s
 #PROXY_ROTATION=per-token
 #COST_MODE=free
 #TLS_FINGERPRINT=chrome120
@@ -535,24 +533,7 @@ func (d *Dashboard) overviewData() overviewData {
 		od.InBridge = true
 	}
 	for _, t := range ps.Tokens {
-		card := tokenCard{
-			Index:            t.Token,
-			SessionStatus:    t.SessionStatus,
-			QueuePosition:    t.SessionQueuePosition,
-			QueueDepth:       t.SessionQueueDepth,
-			ActiveRuns:       t.ActiveRuns,
-			Requests:         t.Requests,
-			Messages24h:      t.Messages24h,
-			DailyLimit:       t.DailyLimit,
-			UsagePct:         t.UsagePct,
-			RiskLevel:        t.RiskLevel,
-			TransientRetries: t.TransientRetries,
-		}
-		if !t.CooldownUntil.IsZero() && time.Now().Before(t.CooldownUntil) {
-			card.CooldownActive = true
-			card.CooldownUntil = t.CooldownUntil.Format(time.RFC3339)
-		}
-		od.Tokens = append(od.Tokens, card)
+		od.Tokens = append(od.Tokens, cardFromSnapshot(t))
 	}
 	od.HasTokens = len(od.Tokens) > 0
 	return od

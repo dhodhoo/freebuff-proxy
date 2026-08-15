@@ -25,11 +25,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,17 +72,25 @@ type Server struct {
 	// adminAuth guards the dashboard: a stateless HMAC-signed session cookie
 	// issued against ADMIN_TOKEN, plus a per-IP login rate limiter.
 	adminAuth *adminAuth
+	// adminSaveMu serializes .env saves (config editor) so a rejected save
+	// cannot clobber a newer accepted one.
+	adminSaveMu sync.Mutex
+	// configPath is the -config JSON path ("" when none); reloads re-apply it
+	// so JSON overrides survive dashboard saves and /admin/reload.
+	configPath string
 }
 
 // New builds the server over the configured pool and registry. A nil logger
 // falls back to slog.Default(). The started timestamp pins /v1/models
 // "created" and /healthz uptime. logs is the optional dashboard log viewer
-// ring (nil disables the /admin/logs page data).
-func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler) *Server {
+// ring (nil disables the /admin/logs page data). configPath is the -config
+// JSON path the process was started with ("" = none), used by reloads so a
+// dashboard save or /admin/reload re-applies the JSON overrides.
+func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler, configPath string) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now()}
+	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath}
 	s.cfg.Store(cfg)
 	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger, logs)
 	s.adminAuth = newAdminAuth()
@@ -95,18 +106,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("POST /admin/reload", s.requireAdminToken(s.requireAuth(s.handleReload)))
-	// Admin dashboard: cookie-authenticated browser UI (assets are static
-	// and public; every data route redirects to the login page when the
-	// session cookie is missing or invalid).
+	// Admin dashboard: cookie-authenticated browser UI. Assets are static
+	// and public — the login page (served without a cookie) references them,
+	// so they must NOT sit behind dashboardAuth. Overview/tokens/metrics are
+	// read-only status and stay open when ADMIN_TOKEN is unset (legacy).
+	// Config (read + write) and logs expose secrets and are gated further:
+	// with ADMIN_TOKEN unset they require a loopback client.
 	mux.HandleFunc("GET /admin/login", s.handleAdminLogin)
 	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
 	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
 	mux.Handle("GET /admin/tokens", s.dashboardAuth(s.dash.Page("tokens")))
-	mux.Handle("GET /admin/config", s.dashboardAuth(s.dash.Page("config")))
-	mux.Handle("GET /admin/logs", s.dashboardAuth(s.dash.Page("logs")))
+	mux.Handle("GET /admin/config", s.dashboardAuth(s.adminSensitive(s.dash.Page("config"))))
+	mux.Handle("GET /admin/logs", s.dashboardAuth(s.adminSensitive(s.dash.Page("logs"))))
 	mux.Handle("GET /admin/metrics", s.dashboardAuth(s.dash.Page("metrics")))
-	mux.Handle("POST /admin/config", s.dashboardAuth(http.HandlerFunc(s.handleConfigSave)))
-	mux.Handle("GET /admin/assets/", s.dashboardAuth(http.StripPrefix("/admin/", http.FileServerFS(dashboard.AssetsFS()))))
+	mux.Handle("POST /admin/config", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleConfigSave))))
+	mux.Handle("GET /admin/assets/", http.StripPrefix("/admin/assets/", noDirListing(http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -156,6 +170,29 @@ func (w *statusWriter) Push(target string, opts *http.PushOptions) error {
 		return p.Push(target, opts)
 	}
 	return http.ErrNotSupported
+}
+
+// mustSubFS returns the named subtree of an embed.FS. The directory is
+// embedded at compile time, so a missing subtree is an invariant violation,
+// not a runtime condition.
+func mustSubFS(fsys fs.FS, dir string) fs.FS {
+	sub, err := fs.Sub(fsys, dir)
+	if err != nil {
+		panic("dashboard: embedded subtree missing: " + err.Error())
+	}
+	return sub
+}
+
+// noDirListing rejects directory requests so FileServerFS never renders an
+// index listing of the embedded assets.
+func noDirListing(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // remoteHost returns the client host without the port.
@@ -247,8 +284,6 @@ func (s *Server) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 const (
 	adminCookieName = "fb_admin"
 	adminCookieTTL  = 24 * time.Hour
-	maxLoginFails   = 5
-	loginLockout    = time.Minute
 )
 
 // adminAuth issues and validates dashboard session cookies and rate-limits
@@ -298,26 +333,50 @@ func (a *adminAuth) valid(value string) bool {
 	return true
 }
 
-func (a *adminAuth) setCookie(w http.ResponseWriter) {
+// maxLoginFails caps consecutive failed logins from one IP before lockout;
+// loginFailsCap bounds the fails map so distinct IP scans cannot grow it
+// without bound (expired entries are dropped on access).
+const (
+	maxLoginFails = 5
+	loginLockout  = time.Minute
+	loginFailsCap = 1024
+)
+
+func (a *adminAuth) setCookie(w http.ResponseWriter, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminCookieName,
 		Value:    a.cookieValue(time.Now().Add(adminCookieTTL)),
 		Path:     "/admin",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
+		Secure:   secure,
 		MaxAge:   int(adminCookieTTL.Seconds()),
 	})
 }
 
-// allow reports whether ip may attempt a login right now.
+// allow reports whether ip may attempt a login right now. Entries track the
+// running failure count until a lockout is set (until non-zero); an expired
+// lockout is dropped so the map does not grow without bound.
 func (a *adminAuth) allow(ip string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	e, ok := a.fails[ip]
-	return !ok || time.Now().After(e.until)
+	if !ok {
+		return true
+	}
+	if !e.until.IsZero() {
+		if time.Now().Before(e.until) {
+			return false
+		}
+		delete(a.fails, ip)
+	}
+	return true
 }
 
-// recordFail counts a failed login, locking ip out after maxLoginFails.
+// recordFail counts a failed login, locking ip out after maxLoginFails. The
+// map is capped: when a new IP arrives at the cap, expired entries are swept
+// first, then the oldest remaining lockout is dropped (a brute-force scan
+// rotating fresh IPs cannot grow the map without bound).
 func (a *adminAuth) recordFail(ip string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -326,6 +385,22 @@ func (a *adminAuth) recordFail(ip string) {
 	if e.count >= maxLoginFails {
 		e.until = time.Now().Add(loginLockout)
 		e.count = 0
+	}
+	if _, exists := a.fails[ip]; !exists && len(a.fails) >= loginFailsCap {
+		now := time.Now()
+		for k, v := range a.fails {
+			if now.After(v.until) {
+				delete(a.fails, k)
+			}
+		}
+		if len(a.fails) >= loginFailsCap {
+			// No expired entries to reclaim — drop one lockout (map
+			// iteration order is fine; the bound is what matters).
+			for k := range a.fails {
+				delete(a.fails, k)
+				break
+			}
+		}
 	}
 	a.fails[ip] = e
 }
@@ -339,7 +414,8 @@ func (a *adminAuth) clearFails(ip string) {
 // dashboardAuth guards the browser UI. With ADMIN_TOKEN unset the dashboard
 // is open (legacy behavior, matching /admin/reload; main.go warns at startup).
 // Otherwise the request must carry a valid fb_admin cookie; missing/invalid
-// sessions are redirected to the login page.
+// sessions are redirected to the login page. htmx polls get 401 + HX-Redirect
+// so the login page replaces the swapped region instead of a bare fragment.
 func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfg.Load()
@@ -351,8 +427,57 @@ func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if r.Header.Get("HX-Request") == "true" {
+			w.Header().Set("HX-Redirect", "/admin/login")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		http.Redirect(w, r, "/admin/login", http.StatusFound)
 	})
+}
+
+// adminSensitive gates the secret-bearing admin routes (config read/write,
+// logs) in the default-open mode: when ADMIN_TOKEN is unset, only loopback
+// clients may access them, so a remotely reachable proxy cannot leak or let
+// anyone rewrite the .env. With ADMIN_TOKEN set the cookie gate already ran
+// (this middleware is wrapped inside dashboardAuth).
+func (s *Server) adminSensitive(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.cfg.Load()
+		if cfg.AdminToken == "" && !isLoopback(r) {
+			http.Error(w, "admin config/logs require loopback access or ADMIN_TOKEN", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopback reports whether the request came from a loopback address.
+func isLoopback(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// listenOnLoopback reports whether the listen address is loopback-only
+// ("127.0.0.1:port", "localhost:port", "[::1]:port") as opposed to
+// wildcard/container binds (":3457", "0.0.0.0:3457").
+func listenOnLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // handleAdminLogin renders the login page and processes the token form:
@@ -374,7 +499,9 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		token := r.FormValue("token")
 		if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.AdminToken)) == 1 {
 			s.adminAuth.clearFails(ip)
-			s.adminAuth.setCookie(w)
+			// Secure only when the proxy listens beyond loopback: the cookie
+			// would otherwise be rejected over the plain-HTTP localhost case.
+			s.adminAuth.setCookie(w, !listenOnLoopback(cfg.ListenAddr))
 			http.Redirect(w, r, "/admin", http.StatusFound)
 			return
 		}
@@ -389,10 +516,12 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 const maxEnvSize = 64 << 10
 
 // handleConfigSave persists the submitted .env text and hot-reloads the
-// config. The flow: lenient parse (syntax check) → write the file → full
+// config. The flow: write the file atomically (temp + rename) → full
 // config.Load("") — the same pipeline used at startup, so every semantic
 // validation (durations, URLs, fingerprints, Validate) runs — and swap the
-// atomic pointer. Any failure restores the previous .env content.
+// atomic pointer. Any failure restores the previous .env content. adminSaveMu
+// serializes concurrent saves so a rejected save can never clobber a newer
+// accepted one.
 func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	const envPath = ".env"
 	r.Body = http.MaxBytesReader(w, r.Body, maxEnvSize)
@@ -401,26 +530,22 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		s.dash.RenderConfigResult(w, r, false, "Failed to read request body.")
 		return
 	}
-	text := string(content)
-	// Lenient parse rejects nothing today (unknown lines are skipped), but
-	// keeps the editor's intent explicit and future-proofs strict checks.
-	_ = config.ParseDotenv(text)
+
+	s.adminSaveMu.Lock()
+	defer s.adminSaveMu.Unlock()
 
 	old, oldErr := os.ReadFile(envPath)
-	if err := os.WriteFile(envPath, content, 0o644); err != nil {
+	if err := writeFileAtomic(envPath, content); err != nil {
 		s.dash.RenderConfigResult(w, r, false, "Failed to write .env: "+err.Error())
 		return
 	}
-	restore := func() {
+	newCfg, err := config.Load(s.configPath)
+	if err != nil {
 		if oldErr == nil {
-			_ = os.WriteFile(envPath, old, 0o644)
+			_ = writeFileAtomic(envPath, old)
 		} else {
 			_ = os.Remove(envPath)
 		}
-	}
-	newCfg, err := config.Load("")
-	if err != nil {
-		restore()
 		s.logger.Warn("dashboard config save rejected", "err", err)
 		s.dash.RenderConfigResult(w, r, false, "Configuration rejected: "+err.Error())
 		return
@@ -429,6 +554,35 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("dashboard config saved and reloaded",
 		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	s.dash.RenderConfigResult(w, r, true, "Saved and reloaded — effective configuration updated.")
+}
+
+// writeFileAtomic writes data to path via a temp file + rename: readers never
+// observe a truncated file, and a crash mid-write leaves the previous content
+// intact. Windows rename-over-existing is not atomic, so the target is removed
+// first there (a tiny non-atomic window, acceptable for an admin action).
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(path)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // clientToken returns the request's bearer token (Authorization: Bearer or
@@ -980,7 +1134,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // handleReload handles POST /admin/reload for hot configuration reloads (#26).
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("admin reload requested")
-	newCfg, err := config.Load("")
+	newCfg, err := config.Load(s.configPath)
 	if err != nil {
 		s.writeJSONError(w, http.StatusInternalServerError, "failed to reload config: "+err.Error(), "internal_error", "reload_failed", 0)
 		return

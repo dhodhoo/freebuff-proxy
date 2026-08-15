@@ -69,7 +69,7 @@ func newTestServerCfg(t *testing.T, apiKeys []string, mut func(*config.Config), 
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.New(cfg, p, reg, nil, nil)
+	srv := server.New(cfg, p, reg, nil, nil, "")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, p
@@ -961,7 +961,7 @@ func newBridgeTestServer(t *testing.T, mock *testutil.MockUpstream) (*httptest.S
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.New(cfg, p, reg, nil, nil)
+	srv := server.New(cfg, p, reg, nil, nil, "")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, p
@@ -1136,7 +1136,7 @@ func TestChatModelAliasesAndReasoningEffort(t *testing.T) {
 		ModelAliases: map[string]string{
 			"gpt-4o": modelA,
 		},
-	}, p, reg, nil, nil)
+	}, p, reg, nil, nil, "")
 	tsAlias := httptest.NewServer(srv.Handler())
 	t.Cleanup(tsAlias.Close)
 
@@ -1218,7 +1218,7 @@ func TestMetricsTransientRetryCounters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.New(cfg, p, reg, nil, nil)
+	srv := server.New(cfg, p, reg, nil, nil, "")
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 

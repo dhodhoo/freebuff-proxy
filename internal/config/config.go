@@ -524,12 +524,6 @@ func parseDotenv(data []byte) map[string]string {
 	return out
 }
 
-// ParseDotenv parses .env text (for the dashboard config editor's pre-write
-// syntax check) with the same rules the loader applies at startup.
-func ParseDotenv(content string) map[string]string {
-	return parseDotenv([]byte(content))
-}
-
 func overrideString(target *string, envName string) {
 	overrideStringFrom(target, os.Getenv, envName)
 }
