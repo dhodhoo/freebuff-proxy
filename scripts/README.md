@@ -18,6 +18,31 @@ first.
 > Codebuff terms of service. Accounts may be suspended or banned. You
 > accept this risk.
 
+## Run the proxy — right-click → Open in Terminal
+
+The extracted folder contains `freebuff-proxy` (Linux/macOS) or
+`freebuff-proxy.exe` (Windows) plus this guide and the token scripts.
+
+**Windows:** unzip, right-click the extracted folder → **Open in
+Terminal**, then:
+
+```powershell
+.\start-proxy.ps1
+```
+
+**Linux:** unzip, right-click the extracted folder → **Open in
+Terminal** (GNOME/KDE file managers), then:
+
+```bash
+./start-proxy.sh
+```
+
+`start-proxy.*` launches the proxy from the extracted folder: it uses
+the `.env` in that folder (auto-creating it from `.env.example` when
+missing) and runs in the foreground so logs are visible — press Ctrl+C
+to stop. You can also run the binary directly (`./freebuff-proxy` /
+`.\freebuff-proxy.exe`) from that terminal.
+
 ## Quick start — just run it
 
 Run the script with no arguments. It shows recommended options and the

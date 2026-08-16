@@ -27,11 +27,20 @@ archives:
       - goos: windows
         formats: [zip]
     files:
-      - LICENSE
-      - .env.example
-      - scripts/gen-freebuff-token.sh
-      - scripts/gen-freebuff-token.ps1
-      - scripts/README.md
+      - src: LICENSE
+        dst: LICENSE
+      - src: .env.example
+        dst: .env.example
+      - src: scripts/gen-freebuff-token.sh
+        dst: gen-freebuff-token.sh
+      - src: scripts/gen-freebuff-token.ps1
+        dst: gen-freebuff-token.ps1
+      - src: scripts/start-proxy.sh
+        dst: start-proxy.sh
+      - src: scripts/start-proxy.ps1
+        dst: start-proxy.ps1
+      - src: scripts/README.md
+        dst: README.md
 checksum:
   name_template: "checksums.txt"
 
