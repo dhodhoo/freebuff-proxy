@@ -1,11 +1,18 @@
-# start-proxy.ps1 - Launch freebuff-proxy from the extracted folder.
+# start-proxy.ps1 - Launch freebuff-proxy from the extracted folder or repo.
 # Right-click this folder -> "Open in Terminal" -> .\start-proxy.cmd
 # (or double-click start-proxy.cmd - it bypasses the execution policy)
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $root
 $exe = Join-Path $root "freebuff-proxy.exe"
+if (-not (Test-Path $exe)) {
+    $parentExe = Join-Path (Split-Path -Parent $root) "freebuff-proxy.exe"
+    if (Test-Path $parentExe) {
+        $root = Split-Path -Parent $root
+        $exe = $parentExe
+    }
+}
+Set-Location $root
 
 if (-not (Test-Path $exe)) {
     Write-Host "freebuff-proxy.exe not found next to this script." -ForegroundColor Red
@@ -25,15 +32,21 @@ if (-not (Test-Path $envFile)) {
 if (Test-Path $envFile) {
     $envText = [System.IO.File]::ReadAllText($envFile, [System.Text.Encoding]::UTF8)
     if ($envText -notmatch '(?m)^AUTH_TOKENS=\S') {
-        if ([Console]::IsInputRedirected) {
-            Write-Host "  No token in AUTH_TOKENS - running in bridge mode (clients send their own token)." -ForegroundColor Yellow
-        } else {
-            Write-Host "No token found in .env" -ForegroundColor Yellow
-            $ans = Read-Host "Generate one now? [Y/n]"
-            if ($ans -notmatch '^(n|no)$') {
-                & (Join-Path $root "gen-freebuff-token.ps1") -Append -EnvFile $envFile
+        $genScript = Join-Path $root "gen-freebuff-token.ps1"
+        if (-not (Test-Path $genScript)) {
+            $genScript = Join-Path (Join-Path $root "scripts") "gen-freebuff-token.ps1"
+        }
+        if (Test-Path $genScript) {
+            if ([Console]::IsInputRedirected) {
+                Write-Host "  No token in AUTH_TOKENS - running in bridge mode (clients send their own token)." -ForegroundColor Yellow
             } else {
-                Write-Host "  Skipped; running in bridge mode (clients send their own token)." -ForegroundColor Yellow
+                Write-Host "No token found in .env" -ForegroundColor Yellow
+                $ans = Read-Host "Generate one now via browser login? [Y/n]"
+                if ($ans -notmatch '^(n|no)$') {
+                    & $genScript -Append -EnvFile $envFile
+                } else {
+                    Write-Host "  Skipped; running in bridge mode (clients send their own token)." -ForegroundColor Yellow
+                }
             }
         }
     }
@@ -58,5 +71,5 @@ Write-Host ""
 $code = $LASTEXITCODE
 if ($code -ne 0) {
     Write-Host "freebuff-proxy exited with code $code" -ForegroundColor Red
+    exit $code
 }
-exit $code

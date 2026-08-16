@@ -50,9 +50,11 @@ cd "$REPO_DIR"
 
 # --- 2. token ---------------------------------------------------------------
 if [ "$SKIP_TOKEN" = "0" ] && ! grep -q '^AUTH_TOKENS=' .env 2>/dev/null; then
-  c "No AUTH_TOKENS in .env — running the token helper (install CLI, login, extract)..."
-  if [ -x scripts/get-freebuff-token.sh ]; then
-    ./scripts/get-freebuff-token.sh
+  c "No AUTH_TOKENS in .env — running the token helper..."
+  if [ -x scripts/gen-freebuff-token.sh ]; then
+    ./scripts/gen-freebuff-token.sh --append
+  elif [ -x scripts/gen-token.sh ]; then
+    ./scripts/gen-token.sh --append
   else
     cp .env.example .env
     warn "Set AUTH_TOKENS in .env manually (see README → Getting a token), then re-run."

@@ -80,49 +80,80 @@ $token = $null
 $creds = Find-CredentialsFile
 if ($creds) { $token = Get-AuthToken $creds }
 
-if (-not $SkipToken -and (-not $token -or $token.Length -le 12)) {
-  Write-Host "Step 1/3: FreeBuff token (required before installing the proxy)" -ForegroundColor Cyan
-  $haveWinget = (Get-Command winget -ErrorAction SilentlyContinue) -ne $null
-  $haveNpm = (Get-Command npm -ErrorAction SilentlyContinue) -ne $null
-  $haveFreebuff = (Get-Command freebuff -ErrorAction SilentlyContinue) -ne $null
+function Get-HeadlessToken {
+  Write-Host "Requesting login URL for browser authentication..." -ForegroundColor Cyan
+  $bytes = New-Object byte[] 32
+  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  $hash = [Convert]::ToBase64String($bytes) -replace '[+/=]', ''
+  $fingerprintId = "enhanced-$($hash.Substring(0, [Math]::Min(43, $hash.Length)))"
 
-  if (-not $haveFreebuff) {
-    Write-Host "The official freebuff CLI is NOT installed." -ForegroundColor Yellow
-    Write-Host "The installer needs it to mint/read your token. It will run:" -ForegroundColor Yellow
-    Write-Host "  npm install -g freebuff" -ForegroundColor White
-    $ans = Read-Host "Install the freebuff CLI now? [Y/n]"
-    if ($ans -ne "n" -and $ans -ne "N") {
-      if (-not $haveNpm) {
-        if (-not $haveWinget) {
-          Write-Host "ERROR: npm and winget are unavailable. Install Node.js 20+ from https://nodejs.org, then re-run." -ForegroundColor Red
-          exit 1
-        }
-        Write-Host "Installing Node.js LTS via winget..." -ForegroundColor Cyan
-        winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements --silent
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-      }
-      Write-Host "Installing the freebuff CLI (npm install -g freebuff)..." -ForegroundColor Cyan
-      npm install -g freebuff
-      if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: npm install -g freebuff failed." -ForegroundColor Red; exit 1 }
-      $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-      $haveFreebuff = (Get-Command freebuff -ErrorAction SilentlyContinue) -ne $null
-      if (-not $haveFreebuff) { Write-Host "ERROR: freebuff installed but is not on PATH. Open a new terminal and re-run." -ForegroundColor Red; exit 1 }
-    }
-  } else {
-    Write-Host "freebuff CLI detected: $((Get-Command freebuff).Source)" -ForegroundColor Green
+  try {
+    $codeBody = @{ fingerprintId = $fingerprintId } | ConvertTo-Json
+    $codeResp = Invoke-RestMethod -Uri "https://www.codebuff.com/api/auth/cli/code" `
+      -Method POST -ContentType "application/json" -Body $codeBody
+  } catch {
+    Write-Host "Failed to get login URL: $_" -ForegroundColor Red
+    return $null
   }
 
-  if ($haveFreebuff) {
-    Write-Host "No login token found. Starting 'freebuff' now." -ForegroundColor Yellow
-    Write-Host "Complete the browser login, then quit the CLI (Ctrl+C or /exit) to continue." -ForegroundColor Yellow
-    & freebuff
-    $creds = Find-CredentialsFile
-    if ($creds) { $token = Get-AuthToken $creds }
-    if (-not $token -or $token.Length -le 12) {
-      Write-Host "No authToken found after login. Open another terminal, run 'freebuff', finish login, then press Enter here." -ForegroundColor Yellow
-      Read-Host | Out-Null
-      $creds = Find-CredentialsFile
-      if ($creds) { $token = Get-AuthToken $creds }
+  $loginUrl = $codeResp.loginUrl
+  $fingerprintHash = $codeResp.fingerprintHash
+  $expiresAt = $codeResp.expiresAt
+  if (-not $loginUrl) {
+    Write-Host "No login URL in response. Server may be down." -ForegroundColor Red
+    return $null
+  }
+
+  Write-Host ""
+  Write-Host "Opening browser for FreeBuff GitHub login..." -ForegroundColor Green
+  Write-Host "URL: $loginUrl" -ForegroundColor DarkGray
+  Write-Host "  -> Log in with the GitHub account you want a token for." -ForegroundColor Yellow
+  Write-Host ""
+  Start-Process $loginUrl
+
+  Write-Host "Waiting for authentication in browser (timeout: 300s)..." -ForegroundColor Cyan
+  $start = Get-Date
+  while (((Get-Date) - $start).TotalSeconds -lt 300) {
+    Start-Sleep -Seconds 4
+    try {
+      $statusUri = "https://www.codebuff.com/api/auth/cli/status?fingerprintId=$fingerprintId&fingerprintHash=$fingerprintHash&expiresAt=$expiresAt"
+      $statusResp = Invoke-RestMethod -Uri $statusUri -Method GET
+      if ($statusResp.user -and $statusResp.user.authToken) {
+        Write-Host "Authentication successful! Token acquired." -ForegroundColor Green
+        return [string]$statusResp.user.authToken
+      }
+    } catch {}
+  }
+  Write-Host "Login timed out after 300s." -ForegroundColor Red
+  return $null
+}
+
+if (-not $SkipToken -and (-not $token -or $token.Length -le 12)) {
+  Write-Host "Step 1/3: FreeBuff auth token" -ForegroundColor Cyan
+  Write-Host "  1) Generate token now via browser login (recommended, zero extra dependencies)" -ForegroundColor Green
+  Write-Host "  2) Paste an existing FreeBuff authToken" -ForegroundColor Gray
+  Write-Host "  3) Bridge mode (skip token; clients supply their own per request)" -ForegroundColor Gray
+  $ans = Read-Host "Choose [1]"
+  switch ($ans.Trim().ToLower()) {
+    "2" {
+      $pasted = Read-Host "Paste your authToken"
+      if ($pasted -and $pasted.Trim().Length -gt 8) {
+        $token = $pasted.Trim()
+      }
+    }
+    "3" {
+      Write-Host "Bridge mode: proxy will run with empty AUTH_TOKENS." -ForegroundColor Yellow
+      $token = ""
+      $SkipToken = $true
+    }
+    default {
+      $token = Get-HeadlessToken
+      if (-not $token) {
+        $pasted = Read-Host "Paste your authToken manually (or Enter to skip)"
+        if ($pasted -and $pasted.Trim().Length -gt 8) {
+          $token = $pasted.Trim()
+        }
+      }
     }
   }
 }
