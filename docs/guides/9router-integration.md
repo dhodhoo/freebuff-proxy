@@ -400,7 +400,7 @@ fallback at boot). Register any subset in 9router:
 > The live catalog refreshes every 6h and can differ slightly from this boot fallback;
 > always trust `GET /v1/models` for the current list.
 
-Quota reality (local dev note: `docs/research/freebuff-limitations.md`, gitignored):
+Quota reality (full rules: README → [Key Hygiene & Ban Avoidance](../../README.md#key-hygiene--ban-avoidance)):
 - **Limited mode** (some regions / VPN / datacenter IPs): DeepSeek V4 Flash + MiMo 2.5 only,
   6 one-hour sessions/day.
 - **Full mode**: all models; ~5 one-hour sessions/day for premium models (MiniMax unlimited,
