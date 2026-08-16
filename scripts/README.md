@@ -18,10 +18,11 @@ first.
 > Codebuff terms of service. Accounts may be suspended or banned. You
 > accept this risk.
 
-## Run the proxy — right-click → Open in Terminal
+## Run the proxy — one command
 
 The extracted folder contains `freebuff-proxy` (Linux/macOS) or
 `freebuff-proxy.exe` (Windows) plus this guide and the token scripts.
+**One command starts everything:**
 
 **Windows:** unzip, right-click the extracted folder → **Open in
 Terminal**, then:
@@ -37,22 +38,30 @@ Terminal** (GNOME/KDE file managers), then:
 ./start-proxy.sh
 ```
 
-`start-proxy.*` launches the proxy from the extracted folder: it uses
-the `.env` in that folder (auto-creating it from `.env.example` when
-missing) and runs in the foreground so logs are visible — press Ctrl+C
-to stop. You can also run the binary directly (`./freebuff-proxy` /
-`.\freebuff-proxy.exe`) from that terminal.
+`start-proxy.*` handles the whole setup automatically:
+
+1. Creates `.env` from `.env.example` if it is missing.
+2. If `AUTH_TOKENS` is empty, asks whether you want to generate a token
+   now (recommended) — it opens the token generator, which appends the
+   token to `.env`.
+3. Starts the proxy and prints its address — point your AI client at
+   `http://127.0.0.1:3457/v1`, model `deepseek/deepseek-v4-flash`.
+
+The proxy runs in the foreground so logs are visible — press Ctrl+C to
+stop. You can also run the binary directly (`./freebuff-proxy` /
+`.\freebuff-proxy.exe`).
 
 > **Windows execution policy:** if PowerShell blocks a `.ps1` with "not
 > digitally signed", use the `.cmd` wrappers instead — `.\start-proxy.cmd`
 > and `.\gen-token.cmd` run with `-ExecutionPolicy Bypass` and are not
 > subject to the policy.
 
-## Quick start — just run it
+## Quick start — token generator
 
-Run the script with no arguments. It shows recommended options and the
-default (Enter) appends the token to `.env` in the current directory —
-auto-creating it from `.env.example` if it doesn't exist yet.
+Run the token generator on its own (no flags) for an interactive menu —
+the recommended default (Enter) appends the token to `.env` in the
+current directory, auto-creating it from `.env.example` if it doesn't
+exist yet:
 
 ## Requirements
 

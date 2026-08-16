@@ -24,7 +24,7 @@ param(
     [switch]$ToClipboard,
     [switch]$Append,
     [string]$EnvFile = "",
-    [string]$BaseUrl = "https://www.codebuff.com",
+    [string]$BaseUrl = $(if ($env:FREEBUFF_BASE_URL) { $env:FREEBUFF_BASE_URL } else { "https://www.codebuff.com" }),
     [int]$TimeoutSeconds = 300,
     [int]$PollIntervalMs = 5000
 )

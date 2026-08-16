@@ -43,7 +43,7 @@ Freebuff-proxy makes the free AI models behind the FreeBuff/Codebuff CLI availab
 1. **Get a FreeBuff account + token (`cb_...`).** You need a Codebuff/FreeBuff account; the token is what the proxy uses upstream. See [Obtain an Auth Token](#2-obtain-an-auth-token).
 2. **Install the proxy.** One command, no Go or Docker required. See [Quick Start](#quick-start).
 3. **Choose your mode.** One user with your own account(s) → **pooled** (`AUTH_TOKENS=cb_...`); a router serving many users → **bridge** (leave `AUTH_TOKENS=` empty). See [Key Concepts](#key-concepts).
-4. **Run and verify.** `./freebuff-proxy`, then `curl http://127.0.0.1:3457/healthz`.
+4. **Run and verify.** From the extracted folder, one command starts everything — creates `.env`, offers to generate a token if missing, then runs the proxy: `./start-proxy.sh` (Windows: `.\start-proxy.cmd`). Or run the binary directly: `./freebuff-proxy`, then `curl http://127.0.0.1:3457/healthz`.
 5. **Connect your AI tool.** Point OpenCode, pi, 9router, or LiteLLM at `http://127.0.0.1:3457/v1`, model `deepseek/deepseek-v4-flash`. See [Client Integration](docs/guides/client-integration.md).
 
 **Before you start — the rules (what you should / shouldn't do):**
