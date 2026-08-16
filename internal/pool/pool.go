@@ -160,6 +160,11 @@ type Pool struct {
 	bridgeMu    sync.Mutex
 	bridge      map[string]*bridgeEntry
 	bridgeOrder []string
+
+	// store persists session state across restarts (SESSION_PERSIST); nil
+	// disables. Injected by the caller (main) via SetSessionStore so there
+	// is exactly one store shared by pooled and bridge entries.
+	store *session.Store
 }
 
 type tokenEntry struct {
@@ -218,7 +223,7 @@ func (p *Pool) AddToken(token string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("pool: add token: %w", err)
 	}
-	sess := session.NewManager(client)
+	sess := session.NewManagerWithStore(client, p.store)
 	entry := &tokenEntry{
 		session: sess,
 		runs:    runs.NewRunManager(client, sess, p.cfg.Load().RotationInterval),
@@ -279,6 +284,14 @@ func (p *Pool) RemoveAllTokens(ctx context.Context) {
 // TokenCount returns the current fixed-token count.
 func (p *Pool) TokenCount() int {
 	return len(*p.toks.Load())
+}
+
+// SetSessionStore injects the shared session-state store used by runtime
+// token additions (AddToken) and bridge entries. Call before the pool
+// starts serving requests; the fixed-token session managers are built by the
+// caller and must use the same store instance.
+func (p *Pool) SetSessionStore(store *session.Store) {
+	p.store = store
 }
 
 // Acquire resolves the model's agent, picks a start token round-robin, and
@@ -871,8 +884,8 @@ func (p *Pool) Shutdown(ctx context.Context) {
 		if snap := entry.runs.Snapshot(); snap.ActiveRuns > 0 {
 			errs = append(errs, fmt.Sprintf("bridge %s: %d runs left after shutdown", entry.token, snap.ActiveRuns))
 		}
-		if err := entry.session.EndSession(entryCtx); err != nil {
-			errs = append(errs, fmt.Sprintf("bridge %s: end session: %v", entry.token, err))
+		if err := entry.session.Shutdown(entryCtx); err != nil {
+			errs = append(errs, fmt.Sprintf("bridge %s: shutdown session: %v", entry.token, err))
 		}
 		cancel()
 	}
@@ -1101,7 +1114,7 @@ func (p *Pool) bridgeEntryFor(clientToken string) (*bridgeEntry, error) {
 		return nil, fmt.Errorf("bridge: %w", err)
 	}
 	entry := &bridgeEntry{token: clientToken, client: client}
-	entry.session = session.NewManager(client)
+	entry.session = session.NewManagerWithStore(client, p.store)
 	entry.runs = runs.NewRunManager(client, entry.session, p.cfg.Load().RotationInterval)
 	entry.lastUsed = time.Now()
 
