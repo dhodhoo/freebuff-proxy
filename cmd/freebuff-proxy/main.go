@@ -52,14 +52,8 @@ func main() {
 	autoYes := flag.Bool("yes", false, "auto-confirm prompts during setup")
 	flag.Parse()
 
-	modeFlags := 0
-	for _, set := range []bool{*showDoctor, *showUpdate, *showSetup, *testToken} {
-		if set {
-			modeFlags++
-		}
-	}
-	if modeFlags > 1 {
-		fmt.Fprintln(os.Stderr, "freebuff-proxy: warning: -doctor, -update, -setup and -test-token are mutually exclusive; only the first will run")
+	if w := modeFlagsExclusiveWarning(*showDoctor, *showUpdate, *showSetup, *testToken); w != "" {
+		fmt.Fprintln(os.Stderr, w)
 	}
 
 	if *showVersion {
@@ -87,14 +81,7 @@ func main() {
 	}
 
 	// Effective log level: LOG_LEVEL config wins, else -v → debug, else info.
-	level, _ := telemetry.ParseLevel(cfg.LogLevel)
-	if cfg.LogLevel == "" {
-		if *verbose {
-			level = slog.LevelDebug
-		} else {
-			level = slog.LevelInfo
-		}
-	}
+	level := resolveLogLevel(cfg.LogLevel, *verbose)
 	logger := telemetry.New(level, cfg.LogFile)
 	// The dashboard log viewer reads from an in-memory ring that mirrors
 	// every record the process logger emits (no log file or docker needed).
@@ -114,12 +101,9 @@ func main() {
 	if cwd, err := os.Getwd(); err == nil {
 		exe, exeErr := os.Executable()
 		if exeErr == nil {
-			exeDir := filepath.Dir(exe)
-			if filepath.Clean(cwd) != exeDir {
-				if _, statErr := os.Stat(filepath.Join(exeDir, ".env")); statErr == nil {
-					logger.Warn("found .env next to the executable, but .env is read from the working directory — that file is NOT applied",
-						"cwd", cwd, "exe_dir", exeDir, "env_file", envFile)
-				}
+			if p := ignoredExeAdjacentEnv(cwd, exe); p != "" {
+				logger.Warn("found .env next to the executable, but .env is read from the working directory — that file is NOT applied",
+					"cwd", cwd, "exe_dir", filepath.Dir(exe), "env_file", envFile)
 			}
 		}
 	}
@@ -342,6 +326,58 @@ func holdForExitIfConsole() {
 	}
 	fmt.Fprintln(os.Stderr, "Press Enter to exit.")
 	_, _ = fmt.Scanln()
+}
+
+// modeFlagsExclusiveWarning returns the warning printed when 2+ of the
+// mutually-exclusive mode flags (-doctor/-update/-setup/-test-token) are
+// set; "" when at most one is set (only the first flag then runs).
+func modeFlagsExclusiveWarning(doctor, update, setup, testToken bool) string {
+	n := 0
+	for _, set := range []bool{doctor, update, setup, testToken} {
+		if set {
+			n++
+		}
+	}
+	if n <= 1 {
+		return ""
+	}
+	return "freebuff-proxy: warning: -doctor, -update, -setup and -test-token are mutually exclusive; only the first will run"
+}
+
+// resolveLogLevel applies the effective log-level precedence: a set
+// LOG_LEVEL config wins, -v → debug, else info. An unparseable LOG_LEVEL
+// silently falls back to info (ParseLevel returns level 0, which is Info).
+func resolveLogLevel(cfgLogLevel string, verbose bool) slog.Level {
+	if cfgLogLevel != "" {
+		if lv, ok := telemetry.ParseLevel(cfgLogLevel); ok {
+			return lv
+		}
+		return slog.LevelInfo
+	}
+	if verbose {
+		return slog.LevelDebug
+	}
+	return slog.LevelInfo
+}
+
+// ignoredExeAdjacentEnv returns the path of a .env that sits next to the
+// executable while the process reads ./.env from the working directory —
+// the usual reason config "seems to vanish" under a non-interactive
+// launcher (Task Scheduler, shortcuts, services). Empty when the working
+// directory IS the executable's directory, or no .env exists next to it.
+func ignoredExeAdjacentEnv(cwd, exePath string) string {
+	if cwd == "" || exePath == "" {
+		return ""
+	}
+	exeDir := filepath.Dir(exePath)
+	if filepath.Clean(cwd) == exeDir {
+		return ""
+	}
+	p := filepath.Join(exeDir, ".env")
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
 }
 
 // egressPaths returns the probe paths for the configured outbound routes:

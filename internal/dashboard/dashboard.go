@@ -310,6 +310,10 @@ type quotaRow struct {
 	HasEntitlement bool
 	UsagePct       int // recent/limit, clamped to 100 (0 when limit is 0)
 	NearLimit      bool
+	// HasBar reports whether the quota usage bar should render. Limit/Recent
+	// are pre-formatted strings (formatQuota), so templates cannot compare
+	// them numerically — the numeric decision lives here.
+	HasBar bool
 }
 
 func (d *Dashboard) tokensData() tokensData {
@@ -335,6 +339,7 @@ func (d *Dashboard) tokensData() tokensData {
 					row.UsagePct = 100
 				}
 				row.NearLimit = row.UsagePct >= 80
+				row.HasBar = true
 			}
 			if !q.ResetAt.IsZero() {
 				if d := time.Until(q.ResetAt); d > 0 {

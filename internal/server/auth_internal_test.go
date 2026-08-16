@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/upstream"
 )
 
@@ -76,6 +77,40 @@ func TestAdminCookieSecureFlag(t *testing.T) {
 	c = rec.Result().Cookies()[0]
 	if c.Secure {
 		t.Error("cookie Secure flag set for plain-HTTP loopback")
+	}
+}
+
+// TestAdminCookieExpiredRedirects pins the expired-but-valid-HMAC cookie
+// path: a correctly signed cookie whose expiry is in the past must fail
+// validation and redirect to login, while the same signing with a future
+// expiry is accepted — proving the expiry check, not the HMAC, is the gate.
+func TestAdminCookieExpiredRedirects(t *testing.T) {
+	s := &Server{adminAuth: newAdminAuth(), logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s.cfg.Store(&config.Config{AdminToken: "secret"})
+	h := s.dashboardAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	expired := s.adminAuth.cookieValue(time.Now().Add(-time.Hour))
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.AddCookie(&http.Cookie{Name: adminCookieName, Value: expired})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expired-valid cookie status = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/admin/login" {
+		t.Errorf("redirect location = %q, want /admin/login", loc)
+	}
+
+	// Same signature machinery, future expiry → accepted.
+	future := s.adminAuth.cookieValue(time.Now().Add(time.Hour))
+	req2 := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req2.AddCookie(&http.Cookie{Name: adminCookieName, Value: future})
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Errorf("future-valid cookie status = %d, want 200 (HMAC + expiry both valid)", rec2.Code)
 	}
 }
 

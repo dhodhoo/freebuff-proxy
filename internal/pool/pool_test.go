@@ -571,14 +571,19 @@ func TestAcquireRateLimitCooldowns(t *testing.T) {
 }
 
 func TestAcquireRateLimitBestWindow(t *testing.T) {
-	// Both tokens rate-limited with different windows: the pool surfaces the
-	// longest one (the token that unblocks last bounds the wait).
+	// Both tokens rate-limited with DIFFERENT windows (per-mock
+	// retryAfterMs): the pool surfaces the longest one — the token that
+	// unblocks last bounds the wait. The previous version served the same
+	// fixed body to both tokens, so the assertion never exercised the
+	// bestRateLimit comparison.
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
 	mock0.RateLimit = true
+	mock0.RateLimitRetryAfterMs = 60000 // 1m window
 	mock1 := testutil.NewMock()
 	defer mock1.Close()
 	mock1.RateLimit = true
+	mock1.RateLimitRetryAfterMs = 300000 // 5m window
 	p := newTestPool(t, mock0, mock1)
 
 	_, err := p.Acquire(context.Background(), modelA)
@@ -586,8 +591,8 @@ func TestAcquireRateLimitBestWindow(t *testing.T) {
 	if !errors.As(err, &rle) {
 		t.Fatalf("want *upstream.RateLimitError, got %v", err)
 	}
-	if rle.RetryAfter != 48549499*time.Millisecond {
-		t.Errorf("RetryAfter = %s, want 48549499ms (best window)", rle.RetryAfter)
+	if rle.RetryAfter != 5*time.Minute {
+		t.Errorf("RetryAfter = %s, want 5m (longest window wins)", rle.RetryAfter)
 	}
 	if err.Error() == "" || !strings.Contains(err.Error(), "upstream rate limited") {
 		t.Errorf("error = %q, want rate-limit message", err)
@@ -1046,8 +1051,12 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 		t.Fatalf("finished runs = %v before idle, want none", got)
 	}
 
-	// Past the idle threshold: one pass FINISHes all runs...
-	time.Sleep(30 * time.Millisecond)
+	// Past the idle threshold: one pass FINISHes all runs. The threshold is
+	// crossed by mutating lastActive (deterministic; a fixed sleep would
+	// race the 10ms threshold on slow CI).
+	p.lastActiveMu.Lock()
+	p.lastActive = time.Now().Add(-time.Second)
+	p.lastActiveMu.Unlock()
 	p.maintainTick(context.Background())
 	finished := mock.FinishedRunsSnapshot()
 	if len(finished) != 1 || finished[0].Status != "completed" {
@@ -1100,7 +1109,11 @@ func TestIdleRotationSkipsInflight(t *testing.T) {
 	}
 
 	// Past the idle threshold: an idle pass must NOT FINISH the held run.
-	time.Sleep(30 * time.Millisecond)
+	// The threshold is crossed by mutating lastActive (deterministic; a
+	// fixed sleep would race the 10ms threshold on slow CI).
+	p.lastActiveMu.Lock()
+	p.lastActive = time.Now().Add(-time.Second)
+	p.lastActiveMu.Unlock()
 	p.maintainTick(context.Background())
 	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
 		t.Fatalf("finished runs = %v, want none (in-flight lease held)", got)
@@ -1203,8 +1216,8 @@ func TestPoolCooldownRateLimitAndBan(t *testing.T) {
 	p.CooldownTokenBan(0, be)
 
 	snap := p.Snapshot()[0]
-	if snap.RiskLevel != "critical" && snap.RiskLevel != "high" {
-		t.Errorf("RiskLevel = %q, want high or critical", snap.RiskLevel)
+	if snap.RiskLevel != "critical" {
+		t.Errorf("RiskLevel = %q, want critical (active ban outranks the cooldown label)", snap.RiskLevel)
 	}
 }
 
@@ -1831,7 +1844,11 @@ func TestIdleFinishAllRunsHonorsMaintainCtx(t *testing.T) {
 	}
 	p.LeaseRelease(lease)
 
-	time.Sleep(20 * time.Millisecond) // past the idle threshold
+	// Cross the idle threshold by mutating lastActive (deterministic; a
+	// fixed sleep would race the 1ms threshold on slow CI).
+	p.lastActiveMu.Lock()
+	p.lastActive = time.Now().Add(-time.Second)
+	p.lastActiveMu.Unlock()
 
 	// Hold every FINISH upstream: only ctx cancellation can end it.
 	mock.FinishDelay = time.Hour
@@ -1881,7 +1898,7 @@ func TestBridgeMaintainEvictHonorsCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		p.bridgeMaintain(ctx)
+		p.bridgeMaintain(ctx, false)
 		close(done)
 	}()
 

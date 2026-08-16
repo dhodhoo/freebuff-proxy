@@ -392,6 +392,169 @@ func TestSetConfigUpdatesAliases(t *testing.T) {
 	}
 }
 
+// TestRefreshNon200KeepsState verifies fetchText surfaces a non-200 HTTP
+// status as an error and Refresh keeps the previous registry state (R1: only
+// file://-missing and over-limit paths were previously covered).
+func TestRefreshNon200KeepsState(t *testing.T) {
+	r := New(nil, nil)
+	r.SetSources([]string{fileSource(t, filepath.Join("testdata", "registry-fixture.ts"))})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh: %v", err)
+	}
+	before := r.Models()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	r.SetSources([]string{srv.URL})
+	err := r.Refresh(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "status 500") {
+		t.Fatalf("Refresh against 500 source err = %v, want 'status 500' error", err)
+	}
+	if got := r.Models(); !reflect.DeepEqual(got, before) {
+		t.Errorf("Models after failed refresh = %v, want unchanged %v", got, before)
+	}
+}
+
+// TestRefreshCanceledCtxKeepsState verifies a canceled context fails the
+// fetch and Refresh keeps the previous registry state (R2). The HTTP fetch
+// path is used (the file:// test hook does not consult ctx).
+func TestRefreshCanceledCtxKeepsState(t *testing.T) {
+	r := New(nil, nil)
+	r.SetSources([]string{fileSource(t, filepath.Join("testdata", "registry-fixture.ts"))})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh: %v", err)
+	}
+	before := r.Models()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.SetSources([]string{srv.URL})
+	if err := r.Refresh(ctx); err == nil {
+		t.Fatal("Refresh with canceled ctx succeeded, want error")
+	}
+	if got := r.Models(); !reflect.DeepEqual(got, before) {
+		t.Errorf("Models after canceled Refresh = %v, want unchanged %v", got, before)
+	}
+}
+
+// TestRefreshPartialMultiSourceFailureKeepsState verifies a multi-source
+// refresh with ONE failing source fails the whole refresh and keeps the
+// previous state (R3: only single-source failures were previously covered).
+func TestRefreshPartialMultiSourceFailureKeepsState(t *testing.T) {
+	r := New(nil, nil)
+	r.SetSources([]string{fileSource(t, filepath.Join("testdata", "registry-fixture.ts"))})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh: %v", err)
+	}
+	before := r.Models()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	r.SetSources([]string{
+		fileSource(t, filepath.Join("testdata", "registry-fixture.ts")),
+		srv.URL,
+	})
+	if err := r.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh with one 404 source succeeded, want error")
+	}
+	if got := r.Models(); !reflect.DeepEqual(got, before) {
+		t.Errorf("Models after partially-failed Refresh = %v, want unchanged %v", got, before)
+	}
+}
+
+// TestSetSourcesNilRestoresDefaults verifies SetSources(nil) (or an empty
+// slice) restores the default 5 Codebuff source URLs (R4).
+func TestSetSourcesNilRestoresDefaults(t *testing.T) {
+	r := New(nil, nil)
+	r.SetSources([]string{"file:///custom"})
+	if got := r.sourceURLs(); !reflect.DeepEqual(got, []string{"file:///custom"}) {
+		t.Fatalf("sourceURLs after SetSources = %v, want [file:///custom]", got)
+	}
+
+	r.SetSources(nil)
+	want := make([]string, len(sourceFiles))
+	for i, f := range sourceFiles {
+		want[i] = RawBase + f
+	}
+	if got := r.sourceURLs(); !reflect.DeepEqual(got, want) {
+		t.Errorf("sourceURLs after SetSources(nil) = %v, want defaults %v", got, want)
+	}
+}
+
+// TestModelAliasesOneHop verifies alias resolution is one-hop only: an alias
+// whose value is itself an alias resolves to that alias, never recursed
+// (R5, documented in ResolveModel).
+func TestModelAliasesOneHop(t *testing.T) {
+	cfg := &config.Config{
+		ModelAliases: map[string]string{
+			"alias-a": "alias-b",
+			"alias-b": "deepseek/deepseek-v4-flash",
+		},
+	}
+	r := New(cfg, nil)
+	if got := r.ResolveModel("alias-a"); got != "alias-b" {
+		t.Errorf("ResolveModel(alias-a) = %q, want alias-b (one hop only, no recursion)", got)
+	}
+	if got := r.ResolveModel("alias-b"); got != "deepseek/deepseek-v4-flash" {
+		t.Errorf("ResolveModel(alias-b) = %q, want deepseek/deepseek-v4-flash", got)
+	}
+}
+
+// TestAgentForModelAliasToUnmappedModel verifies an alias resolving to a
+// model that is absent from the registry surfaces ErrModelNotFound (the
+// alias is resolved first, then the lookup misses).
+func TestAgentForModelAliasToUnmappedModel(t *testing.T) {
+	cfg := &config.Config{
+		ModelAliases: map[string]string{"gpt-4o": "not/in-the-registry"},
+	}
+	r := New(cfg, nil)
+	r.LoadFallback()
+
+	if _, err := r.AgentForModel("gpt-4o"); !errors.Is(err, ErrModelNotFound) {
+		t.Fatalf("AgentForModel(alias→unmapped) err = %v, want ErrModelNotFound", err)
+	}
+}
+
+// TestRefreshNoModelsResolvedGuard pins the reachable behavior around the
+// "no models resolved" guard in Refresh. A source whose agent entries only
+// reference unresolvable models collapses to the "no free agents" error: the
+// parser drops every zero-model entry, so the len(allModels)==0 guard at
+// registry.go is defensive and currently unreachable through the parser
+// (verified against parse.go: entries with no resolvable models are dropped,
+// and every kept entry contributes at least one model).
+func TestRefreshNoModelsResolvedGuard(t *testing.T) {
+	r := New(nil, nil)
+	src := filepath.Join(t.TempDir(), "no-models.ts")
+	content := `
+export const FREE_MODE_AGENT_MODELS = {
+  'agent-one': new Set([MISSING_ONE, MISSING_TWO]),
+  'agent-two': UNRESOLVABLE_SET
+}
+`
+	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r.SetSources([]string{fileSource(t, src)})
+	err := r.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("Refresh with zero resolvable models succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "no free agents") {
+		t.Errorf("err = %v, want 'no free agents' (the 'no models resolved' branch is unreachable via the parser)", err)
+	}
+}
+
 func contains(values []string, needle string) bool {
 	for _, v := range values {
 		if v == needle {

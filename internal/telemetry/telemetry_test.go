@@ -277,3 +277,128 @@ func TestAttrValueEscaping(t *testing.T) {
 		t.Errorf("clean attr value must stay unquoted, got: %q", out)
 	}
 }
+
+// TestWithAttrsWithGroupNoOp pins the text handler's no-op
+// WithAttrs/WithGroup contract: both return the SAME handler, and bound
+// attrs/groups are silently dropped from the output (the process logger
+// never carries them — a regression would double-print fields).
+func TestWithAttrsWithGroupNoOp(t *testing.T) {
+	var buf bytes.Buffer
+	h := &textHandler{w: &buf, level: slog.LevelInfo}
+	if got := h.WithAttrs([]slog.Attr{slog.String("k", "v")}); got != slog.Handler(h) {
+		t.Errorf("WithAttrs returned a different handler: %T", got)
+	}
+	if got := h.WithGroup("grp"); got != slog.Handler(h) {
+		t.Errorf("WithGroup returned a different handler: %T", got)
+	}
+	logger := slog.New(h).With("bound", "attr").WithGroup("grp")
+	logger.Info("msg")
+	out := buf.String()
+	if strings.Contains(out, "bound=attr") {
+		t.Errorf("bound attr leaked into output despite no-op WithAttrs: %q", out)
+	}
+	if strings.Contains(out, "grp.") {
+		t.Errorf("group prefix leaked into output despite no-op WithGroup: %q", out)
+	}
+	if !strings.Contains(out, "msg=msg") {
+		t.Errorf("plain record missing: %q", out)
+	}
+}
+
+// TestQuoteMessageEdges pins the quoting decision table: multi-word
+// messages and values with tabs/newlines/CRs/quotes/control characters are
+// strconv-quoted; single tokens, empty strings and non-control Unicode are
+// not.
+func TestQuoteMessageEdges(t *testing.T) {
+	cases := []struct {
+		name string
+		s    string
+		want bool // needsQuote
+	}{
+		{"empty", "", false},
+		{"single token", "hello", false},
+		{"space", "two words", true},
+		{"tab", "a\tb", true},
+		{"newline", "a\nb", true},
+		{"carriage return", "a\rb", true},
+		{"double quote", `a"b`, true},
+		{"control char", "a\x01b", true},
+		{"non-control unicode single token", "héllo", false},
+		{"non-control unicode with space", "héllo wörld", true},
+		{"narrow no-break space", "a\u00a0b", false},
+		{"emoji", "🚀", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := needsQuote(tc.s); got != tc.want {
+				t.Errorf("needsQuote(%q) = %v, want %v", tc.s, got, tc.want)
+			}
+			// quoteMessage must round-trip: quoted iff needsQuote.
+			if quoted := quoteMessage(tc.s) != tc.s; quoted != tc.want {
+				t.Errorf("quoteMessage(%q) quoted=%v, want %v", tc.s, quoted, tc.want)
+			}
+		})
+	}
+}
+
+// TestSanitizeNameBoundary pins the 60-rune truncation boundary and the
+// character replacement: shorter names are unchanged, exactly-60 stays 60,
+// longer names are cut to 60, and invalid file-name characters are
+// replaced with underscores.
+func TestSanitizeNameBoundary(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		wantLen int
+	}{
+		{"empty", "", 0},
+		{"short", "chat-1", 6},
+		{"exactly 60", strings.Repeat("a", 60), 60},
+		{"61 truncated", strings.Repeat("a", 61), 60},
+		{"long with specials", strings.Repeat("a/b:c", 20), 60},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeName(tc.in)
+			if len(got) != tc.wantLen {
+				t.Errorf("sanitizeName(%q) length = %d, want %d", tc.in, len(got), tc.wantLen)
+			}
+		})
+	}
+	if got := sanitizeName(`a\b:c*d?e"f<g>h|i.`); got != "a_b_c_d_e_f_g_h_i_" {
+		t.Errorf("sanitizeName(specials) = %q", got)
+	}
+}
+
+// TestLevelColorBelowDebug pins the ANSI level palette: anything below
+// DEBUG renders gray, DEBUG gray, INFO green, WARN yellow, ERROR and above
+// red.
+func TestLevelColorBelowDebug(t *testing.T) {
+	cases := []struct {
+		level slog.Level
+		want  string
+	}{
+		{slog.LevelDebug - 8, ansiGray},
+		{slog.LevelDebug, ansiGray},
+		{slog.LevelInfo, ansiGreen},
+		{slog.LevelWarn, ansiYellow},
+		{slog.LevelError, ansiRed},
+		{slog.LevelError + 8, ansiRed},
+	}
+	for _, tc := range cases {
+		if got := levelColor(tc.level); got != tc.want {
+			t.Errorf("levelColor(%v) = %q, want %q", tc.level, got, tc.want)
+		}
+	}
+}
+
+// TestRedactHeadersNilEmpty pins the nil/empty inputs: RedactHeaders of a
+// nil or empty header returns an empty (non-nil) map.
+func TestRedactHeadersNilEmpty(t *testing.T) {
+	if got := RedactHeaders(nil); len(got) != 0 {
+		t.Errorf("RedactHeaders(nil) = %v, want empty", got)
+	}
+	if got := RedactHeaders(http.Header{}); len(got) != 0 {
+		t.Errorf("RedactHeaders(empty) = %v, want empty", got)
+	}
+}

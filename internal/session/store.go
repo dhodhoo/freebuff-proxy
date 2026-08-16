@@ -51,6 +51,13 @@ type Store struct {
 	mu     sync.Mutex
 	data   map[string]persistedState
 	loaded bool
+	// readFailed is set when a read of the on-disk file failed with a
+	// non-NotExist error (chmod 000, transient EIO). While set, Save/Remove
+	// keep their in-memory update but must NOT flush the partial map over the
+	// file: that would destroy every other token's persisted entry (B1). The
+	// flag is cleared once a load succeeds (the on-disk content is then
+	// established and a flush is safe again).
+	readFailed bool
 }
 
 // NewStore builds a store backed by path. The file is read lazily on the
@@ -70,6 +77,7 @@ func (s *Store) loadLocked() {
 	if fi, err := os.Stat(s.path); err == nil && fi.Size() > maxStoreFileSize {
 		slog.Warn("session store: file too large, ignoring", "path", s.path, "bytes", fi.Size())
 		s.loaded = true
+		s.readFailed = false
 		return
 	}
 
@@ -78,11 +86,14 @@ func (s *Store) loadLocked() {
 		if errors.Is(err, os.ErrNotExist) {
 			// First run: a missing file is a valid empty store.
 			s.loaded = true
+			s.readFailed = false
 		} else {
 			// Leave loaded=false so the next Load (or Save) retries the
 			// read instead of permanently freezing an empty view that a
 			// later Save would flush over the on-disk file, destroying
-			// other tokens' persisted sessions.
+			// other tokens' persisted sessions. Track readFailed so Save/
+			// Remove skip the flush while the file stays unreadable (B1).
+			s.readFailed = true
 			slog.Warn("session store: read failed, will retry on next access", "path", s.path, "err", err)
 		}
 		return
@@ -93,11 +104,13 @@ func (s *Store) loadLocked() {
 		// and proceed empty (a later Save replaces it).
 		slog.Warn("session store: parse failed, ignoring", "path", s.path, "err", err)
 		s.loaded = true
+		s.readFailed = false
 		return
 	}
 	if file.Version != storeVersion {
 		slog.Warn("session store: version mismatch, ignoring", "path", s.path, "version", file.Version)
 		s.loaded = true
+		s.readFailed = false
 		return
 	}
 	if file.Sessions != nil {
@@ -112,6 +125,7 @@ func (s *Store) loadLocked() {
 		}
 	}
 	s.loaded = true
+	s.readFailed = false
 }
 
 // Load returns the persisted cached state for key, or nil when absent or
@@ -158,7 +172,7 @@ func (s *Store) Save(key string, cs *cachedState) {
 
 	if cs == nil || (cs.instanceID == "" && cs.status != "queued") {
 		delete(s.data, key)
-		s.flushLocked()
+		s.flushLockedUnlessReadFailed()
 		return
 	}
 	s.data[key] = persistedState{
@@ -174,7 +188,7 @@ func (s *Store) Save(key string, cs *cachedState) {
 		CountryCode:        cs.countryCode,
 		CountryBlockReason: cs.countryBlockReason,
 	}
-	s.flushLocked()
+	s.flushLockedUnlessReadFailed()
 }
 
 // Remove drops key from the store (session invalidated/ended at runtime).
@@ -197,6 +211,20 @@ func (s *Store) Remove(key, expectedInstanceID string) {
 		return
 	}
 	delete(s.data, key)
+	s.flushLockedUnlessReadFailed()
+}
+
+// flushLockedUnlessReadFailed writes the current map atomically unless the
+// on-disk file could not be read (B1): flushing the partial in-memory view
+// over an unreadable file would destroy every other token's persisted entry.
+// The in-memory update is kept so the store stays consistent once the file
+// becomes readable again; a warn log is the only signal that persistence was
+// skipped.
+func (s *Store) flushLockedUnlessReadFailed() {
+	if s.readFailed {
+		slog.Warn("session store: file unreadable, skipping persist (in-memory update kept)", "path", s.path)
+		return
+	}
 	s.flushLocked()
 }
 

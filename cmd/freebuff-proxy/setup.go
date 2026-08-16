@@ -24,13 +24,10 @@ func runSetup(autoYes bool) {
 
 	reader := bufio.NewReader(os.Stdin)
 	ask := func(prompt string) bool {
-		if autoYes {
-			return true
+		if !autoYes {
+			fmt.Printf("\n%s [y/N]: ", prompt)
 		}
-		fmt.Printf("\n%s [y/N]: ", prompt)
-		input, _ := reader.ReadString('\n')
-		input = strings.ToLower(strings.TrimSpace(input))
-		return input == "y" || input == "yes"
+		return promptYesNo(reader, autoYes)
 	}
 
 	configured := 0
@@ -113,15 +110,38 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+// promptYesNo reads one confirmation answer from reader: y/yes
+// (case-insensitive) accepts; anything else (n, empty line, garbage, EOF)
+// declines. autoYes accepts without reading stdin at all — the caller's
+// prompts are skipped wholesale.
+func promptYesNo(reader *bufio.Reader, autoYes bool) bool {
+	if autoYes {
+		return true
+	}
+	input, _ := reader.ReadString('\n')
+	input = strings.ToLower(strings.TrimSpace(input))
+	return input == "y" || input == "yes"
+}
+
 func backupFile(p string) {
 	if !fileExists(p) {
 		return
 	}
 	bak := p + ".bak"
 	data, err := os.ReadFile(p)
-	if err == nil {
-		_ = os.WriteFile(bak, data, 0644)
+	if err != nil {
+		return
 	}
+	// S3: preserve the source's permission bits, floored at 0600. Continue
+	// config.yaml / opencode.json carry apiKey secrets and are often 0600; a
+	// hardcoded 0644 backup would leave the secret world-readable.
+	mode := os.FileMode(0o600)
+	if fi, err := os.Stat(p); err == nil {
+		if perm := fi.Mode().Perm(); perm > mode {
+			mode = perm
+		}
+	}
+	_ = os.WriteFile(bak, data, mode)
 }
 
 func setupContinueYamlConfig(p string) bool {
@@ -227,7 +247,15 @@ func setupContinueConfig(p string) bool {
 
 	var cfg map[string]any
 	if data, err := os.ReadFile(p); err == nil {
-		_ = json.Unmarshal(data, &cfg)
+		if jsonErr := json.Unmarshal(data, &cfg); jsonErr != nil {
+			// S2: a failed parse must NOT be treated as an empty config —
+			// rebuilding from scratch would overwrite the user's Continue
+			// models/apiKeys with only the FreeBuff entry. Abort and leave
+			// the file untouched (the .bak made above preserves the original
+			// either way), mirroring setupOpencodeConfig's JSONC abort.
+			fmt.Fprintf(os.Stderr, "ERROR: could not parse existing Continue config.json: %v - add the freebuff model manually, original saved as %s.bak\n", jsonErr, p)
+			return false
+		}
 	}
 	if cfg == nil {
 		cfg = make(map[string]any)
@@ -322,14 +350,19 @@ func setupAiderConfig(p string) bool {
 	}
 	if fileExists(p) {
 		existing, err := os.ReadFile(p)
-		if err == nil && strings.Contains(string(existing), "localhost:3457") {
+		if err != nil {
+			// S4: never clobber a file we could not read. An existing but
+			// unreadable (EACCES) aider config must be left untouched, not
+			// replaced with a fresh one.
+			fmt.Fprintf(os.Stderr, "ERROR: could not read existing %s: %v - leaving it untouched\n", p, err)
+			return false
+		}
+		if strings.Contains(string(existing), "localhost:3457") {
 			return true
 		}
 		backupFile(p)
-		if err == nil {
-			merged := mergeAiderConfig(string(existing), newLines)
-			return os.WriteFile(p, []byte(merged), 0644) == nil
-		}
+		merged := mergeAiderConfig(string(existing), newLines)
+		return os.WriteFile(p, []byte(merged), 0644) == nil
 	}
 	return os.WriteFile(p, []byte(strings.Join(newLines, "\n")+"\n"), 0644) == nil
 }

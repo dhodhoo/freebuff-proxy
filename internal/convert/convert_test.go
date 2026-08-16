@@ -875,3 +875,248 @@ func TestNormalizeRequestReasoningEffort(t *testing.T) {
 		t.Errorf("reasoning_effort = %v, want \"max\"", got["reasoning_effort"])
 	}
 }
+
+// TestSanitizeChunkBranchTable pins the branch-level edges of chunk
+// sanitization: a non-string reasoning_content is dropped (only strings
+// pass through), a fractional created is truncated to its integer part,
+// and a choice carrying an empty delta is KEPT (the choice exists, so the
+// chunk is not dropped).
+func TestSanitizeChunkBranchTable(t *testing.T) {
+	t.Run("non-string reasoning_content dropped", func(t *testing.T) {
+		out, drop := SanitizeChunk([]byte(`{"choices":[{"delta":{"content":"x","reasoning_content":123}}]}`))
+		if drop {
+			t.Fatal("chunk dropped")
+		}
+		got := decode(t, out)
+		delta := got["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
+		if _, ok := delta["reasoning_content"]; ok {
+			t.Errorf("non-string reasoning_content kept: %v", delta)
+		}
+		if delta["content"] != "x" {
+			t.Errorf("content = %v, want x", delta["content"])
+		}
+	})
+
+	t.Run("fractional created truncated", func(t *testing.T) {
+		out, drop := SanitizeChunk([]byte(`{"created":123.7,"choices":[{"delta":{"content":"x"}}]}`))
+		if drop {
+			t.Fatal("chunk dropped")
+		}
+		got := decode(t, out)
+		if got["created"] != float64(123) {
+			t.Errorf("created = %v, want 123 (truncated, not rounded)", got["created"])
+		}
+	})
+
+	t.Run("empty delta choice kept", func(t *testing.T) {
+		out, drop := SanitizeChunk([]byte(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`))
+		if drop {
+			t.Fatal("choice with an empty delta must be kept")
+		}
+		got := decode(t, out)
+		choice := got["choices"].([]any)[0].(map[string]any)
+		if choice["finish_reason"] != "stop" {
+			t.Errorf("finish_reason = %v, want stop", choice["finish_reason"])
+		}
+		if d := choice["delta"].(map[string]any); len(d) != 0 {
+			t.Errorf("delta = %v, want empty", d)
+		}
+	})
+}
+
+// TestAccumulatorLaterFragmentToolCall pins the tool-call stitcher: id,
+// type and function name may arrive on a LATER fragment (the first one
+// carries only arguments); the accumulated arguments concatenate across
+// fragments regardless of which fragment carries the metadata. A gap in
+// tool-call indices sorts the assembled output by index (the index itself
+// is not part of the output shape).
+func TestAccumulatorLaterFragmentToolCall(t *testing.T) {
+	t.Run("id and name on a later fragment", func(t *testing.T) {
+		a := NewAccumulator()
+		for _, line := range []string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_later","type":"function","function":{"name":"fn_later","arguments":"1}"}}]}}]}`,
+		} {
+			if err := a.Add([]byte(line)); err != nil {
+				t.Fatalf("Add(%q): %v", line, err)
+			}
+		}
+		out := decode(t, a.Finish())
+		calls := out["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)
+		if len(calls) != 1 {
+			t.Fatalf("tool_calls = %v, want 1", calls)
+		}
+		first := calls[0].(map[string]any)
+		if first["id"] != "call_later" || first["type"] != "function" {
+			t.Errorf("tool call id/type = %v / %v, want call_later / function", first["id"], first["type"])
+		}
+		if fn := first["function"].(map[string]any); fn["name"] != "fn_later" || fn["arguments"] != `{"a":1}` {
+			t.Errorf("tool call function = %v, want name fn_later args %q", fn, `{"a":1}`)
+		}
+	})
+
+	t.Run("index gap sorted output", func(t *testing.T) {
+		a := NewAccumulator()
+		for _, line := range []string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":3,"id":"c3","function":{"name":"f3","arguments":"{}"}}]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c1","function":{"name":"f1","arguments":"{}"}}]}}]}`,
+		} {
+			if err := a.Add([]byte(line)); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+		}
+		out := decode(t, a.Finish())
+		calls := out["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)
+		if len(calls) != 2 {
+			t.Fatalf("tool_calls = %v, want 2", calls)
+		}
+		if id := calls[0].(map[string]any)["id"]; id != "c1" {
+			t.Errorf("calls[0].id = %v, want c1 (sorted by index)", id)
+		}
+		if id := calls[1].(map[string]any)["id"]; id != "c3" {
+			t.Errorf("calls[1].id = %v, want c3", id)
+		}
+	})
+}
+
+// TestAccumulatorReasoningOnlyFinish pins a reasoning-only stream: the
+// Finish response carries the concatenated reasoning_content while content
+// stays empty.
+func TestAccumulatorReasoningOnlyFinish(t *testing.T) {
+	a := NewAccumulator()
+	for _, line := range []string{
+		`{"choices":[{"index":0,"delta":{"reasoning_content":"think "}}]}`,
+		`{"choices":[{"index":0,"delta":{"reasoning_content":"more"},"finish_reason":"stop"}]}`,
+	} {
+		if err := a.Add([]byte(line)); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	out := decode(t, a.Finish())
+	msg := out["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "" {
+		t.Errorf("content = %v, want empty", msg["content"])
+	}
+	if msg["reasoning_content"] != "think more" {
+		t.Errorf("reasoning_content = %v, want 'think more'", msg["reasoning_content"])
+	}
+}
+
+// TestNormalizeEnumCrossTypeDedupe pins the enum dedupe key: Go type AND
+// JSON encoding combine ("%T:repr"), so values with the same JSON
+// representation but different Go types (float64(1.0) vs int(1) — both
+// "1" after encoding) are BOTH kept, while exact duplicates are removed
+// and null entries dropped. (Tested white-box because the request path
+// round-trips numbers through encoding/json, which collapses every number
+// to float64.)
+func TestNormalizeEnumCrossTypeDedupe(t *testing.T) {
+	schema := map[string]any{"enum": []any{1.0, 1, "1", "a", "a", true, true, nil}}
+	normalizeEnumField(schema)
+	enum := schema["enum"].([]any)
+	want := []any{1.0, 1, "1", "a", true}
+	if len(enum) != len(want) {
+		t.Fatalf("enum = %v (%d), want %v (%d): cross-type entries kept, exact dupes removed", enum, len(enum), want, len(want))
+	}
+	for i := range want {
+		if enum[i] != want[i] || fmt.Sprintf("%T", enum[i]) != fmt.Sprintf("%T", want[i]) {
+			t.Errorf("enum[%d] = %v (%T), want %v (%T)", i, enum[i], enum[i], want[i], want[i])
+		}
+	}
+}
+
+// TestParseSSEDataWhitespaceEdges pins the SSE data-line parser edges:
+// leading whitespace is tolerated (on both "data:" and plain-JSON lines),
+// a space between "data" and the colon is NOT a data line (it falls
+// through to the plain-JSON check and is skipped), and extra spaces after
+// the colon are trimmed.
+func TestParseSSEDataWhitespaceEdges(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want []byte
+		ok   bool
+	}{
+		{"leading spaces before data", "  data: {\"a\":1}", []byte(`{"a":1}`), true},
+		{"space before colon not matched", "data : {\"a\":1}", nil, false},
+		{"extra space after colon", "data:  {\"a\":1}", []byte(`{"a":1}`), true},
+		{"plain json", `{"a":1}`, []byte(`{"a":1}`), true},
+		{"plain json with leading space", `  {"a":1}`, []byte(`{"a":1}`), true},
+		{"blank", "", nil, false},
+		{"comment", ": hi", nil, false},
+		{"event field", "event: message", nil, false},
+		{"data with empty payload", "data: ", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseSSEData([]byte(tc.line))
+			if ok != tc.ok || string(got) != string(tc.want) {
+				t.Errorf("parseSSEData(%q) = %q, %v; want %q, %v", tc.line, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+// TestNormalizeRequestNonMapToolsEndTurn pins end_turn injection when the
+// tools array holds ONLY non-map entries: each entry is skipped by the
+// schema normalizer but left in place, and end_turn is still appended
+// (the array is non-empty, so the foreign_toolset validation path
+// triggers). An existing end_turn must never be duplicated.
+func TestNormalizeRequestNonMapToolsEndTurn(t *testing.T) {
+	t.Run("all non-map tools get end_turn appended", func(t *testing.T) {
+		body := map[string]any{
+			"model":    "m",
+			"messages": []any{},
+			"tools":    []any{"not-a-map", 42},
+		}
+		out, err := NormalizeRequest(mustJSON(t, body), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		got := decode(t, out)
+		tools, ok := got["tools"].([]any)
+		if !ok {
+			t.Fatal("tools missing")
+		}
+		if len(tools) != 3 {
+			t.Fatalf("tools = %v, want [not-a-map, 42, end_turn]", tools)
+		}
+		if tools[0] != "not-a-map" || tools[1] != float64(42) {
+			t.Errorf("non-map entries were modified: %v", tools[:2])
+		}
+		endTurn, ok := tools[2].(map[string]any)
+		if !ok || endTurn["function"].(map[string]any)["name"] != "end_turn" {
+			t.Errorf("tools[2] = %v, want the end_turn tool", tools[2])
+		}
+	})
+
+	t.Run("existing end_turn not duplicated", func(t *testing.T) {
+		body := map[string]any{
+			"model":    "m",
+			"messages": []any{},
+			"tools": []any{map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": "end_turn",
+					"parameters": map[string]any{"type": "object"},
+				},
+			}},
+		}
+		out, err := NormalizeRequest(mustJSON(t, body), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		got := decode(t, out)
+		tools, _ := got["tools"].([]any)
+		count := 0
+		for _, tVal := range tools {
+			if tm, ok := tVal.(map[string]any); ok {
+				if fn, ok := tm["function"].(map[string]any); ok && fn["name"] == "end_turn" {
+					count++
+				}
+			}
+		}
+		if count != 1 {
+			t.Errorf("end_turn appears %d times, want exactly 1: %v", count, tools)
+		}
+	})
+}

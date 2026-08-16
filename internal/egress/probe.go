@@ -104,15 +104,17 @@ func DirectDialer(timeout time.Duration) func(ctx context.Context, network, addr
 
 // Socks5Dialer builds a SOCKS5 proxy dialer for addr, which may be a bare
 // host:port or a socks5:// URL (userinfo allowed). The returned dial
-// function routes every connection through the proxy. x/net/proxy's Dial
-// is not context-aware, so a wedged proxy is bounded by the probe's client
-// timeout rather than ctx cancellation.
+// function routes every connection through the proxy. The userinfo is
+// carried through to the SOCKS5 handshake so authenticated proxies actually
+// authenticate (previously it was dropped and the handshake failed —
+// Audit B2). x/net/proxy's Dial is not context-aware, so a wedged proxy is
+// bounded by the probe's client timeout rather than ctx cancellation.
 func Socks5Dialer(addr string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
-	host, err := proxyAddr(addr)
+	host, auth, err := parseSocks5(addr)
 	if err != nil {
 		return nil, err
 	}
-	d, err := proxy.SOCKS5("tcp", host, nil, proxy.Direct)
+	d, err := proxy.SOCKS5("tcp", host, auth, proxy.Direct)
 	if err != nil {
 		return nil, fmt.Errorf("egress: SOCKS5 dialer for %s: %w", host, err)
 	}
@@ -121,24 +123,29 @@ func Socks5Dialer(addr string) (func(ctx context.Context, network, addr string) 
 	}, nil
 }
 
-// proxyAddr normalizes a configured proxy address to host:port, stripping
-// any scheme and userinfo.
-func proxyAddr(raw string) (string, error) {
+// parseSocks5 normalizes a configured proxy address to host:port plus its
+// credentials. A bare host:port or a socks5:// URL (with optional userinfo)
+// are accepted; the userinfo becomes the SOCKS5 auth.
+func parseSocks5(raw string) (addr string, auth *proxy.Auth, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", errors.New("egress: empty proxy address")
+		return "", nil, errors.New("egress: empty proxy address")
 	}
 	if !strings.Contains(raw, "://") {
-		return raw, nil
+		return raw, nil, nil
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("egress: invalid proxy address %q: %w", raw, err)
+		return "", nil, fmt.Errorf("egress: invalid proxy address %q: %w", raw, err)
 	}
 	if u.Host == "" {
-		return "", fmt.Errorf("egress: proxy address %q has no host", raw)
+		return "", nil, fmt.Errorf("egress: proxy address %q has no host", raw)
 	}
-	return u.Host, nil
+	if u.User != nil {
+		pass, _ := u.User.Password()
+		auth = &proxy.Auth{User: u.User.Username(), Password: pass}
+	}
+	return u.Host, auth, nil
 }
 
 // Path identifies one egress path to probe: the cache key ("direct",
@@ -152,6 +159,18 @@ type Path struct {
 // is canceled, storing each result into cache. Probe failures are logged
 // and cached with Err set (fail-open); the loop keeps running.
 func RunLoop(ctx context.Context, logger *slog.Logger, cache *Cache, paths []Path, timeout, interval time.Duration) {
+	if cache == nil {
+		panic("egress: RunLoop requires a non-nil cache")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if interval <= 0 {
+		// time.NewTicker panics on a non-positive interval; fall back to the
+		// default so a misconfigured caller gets periodic probing instead of
+		// a crash. (Audit B7.)
+		interval = DefaultTTL
+	}
 	run := func() {
 		for key, r := range probeAll(ctx, paths, timeout) {
 			cache.Set(key, r)

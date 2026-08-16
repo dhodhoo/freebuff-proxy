@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,12 +20,81 @@ import (
 	"time"
 )
 
+// maxUpdateDownloadBytes caps a single -update download body (release asset
+// or checksums.txt) so an oversized CDN response cannot OOM the updater (S7;
+// mirrors the registry's 2MiB source cap with a generous release-asset limit).
+const maxUpdateDownloadBytes = 64 << 20
+
+// defaultReleasesURL is the GitHub API endpoint checked for the latest
+// release. FREEBUFF_UPDATE_API_URL overrides it so tests (and self-hosted
+// mirrors) can point -update at a fake release server.
+const defaultReleasesURL = "https://api.github.com/repos/trefeon/freebuff-proxy/releases/latest"
+
+type releaseAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
 type githubRelease struct {
-	TagName string `json:"tag_name"`
-	Assets  []struct {
-		Name               string `json:"name"`
-		BrowserDownloadURL string `json:"browser_download_url"`
-	} `json:"assets"`
+	TagName string         `json:"tag_name"`
+	Assets  []releaseAsset `json:"assets"`
+}
+
+// githubReleasesURL returns the release-check endpoint: the
+// FREEBUFF_UPDATE_API_URL override when set, else the GitHub API default.
+// The default behavior is unchanged; the override exists so -update can be
+// exercised end-to-end against a fake release server.
+func githubReleasesURL() string {
+	if u := strings.TrimSpace(os.Getenv("FREEBUFF_UPDATE_API_URL")); u != "" {
+		return u
+	}
+	return defaultReleasesURL
+}
+
+// isUpToDate reports whether the running version already matches the latest
+// release tag. "dev" builds (no ldflags injection) are never up to date,
+// and the tag may carry a "v" prefix the version string omits. Comparison
+// is exact equality — there is no semver ordering.
+func isUpToDate(currentVersion, latestTag string) bool {
+	return currentVersion != "dev" && (currentVersion == latestTag || "v"+currentVersion == latestTag)
+}
+
+// platformAssetSuffix returns the release-asset filename suffix for the
+// given platform, e.g. "linux_amd64.tar.gz" or "windows_amd64.zip".
+func platformAssetSuffix(goos, goarch string) string {
+	ext := ".tar.gz"
+	if goos == "windows" {
+		ext = ".zip"
+	}
+	return fmt.Sprintf("%s_%s%s", goos, goarch, ext)
+}
+
+// matchReleaseAssets picks the platform asset (name + download URL) and the
+// checksums.txt URL from the release's asset list. ok is false when no
+// asset matches the platform suffix. A missing checksums.txt is NOT an
+// error here — requireChecksums decides that separately (fail closed, S5).
+func matchReleaseAssets(assets []releaseAsset, goos, goarch string) (assetName, assetURL, checksumURL string, ok bool) {
+	suffix := platformAssetSuffix(goos, goarch)
+	for _, a := range assets {
+		if strings.HasSuffix(a.Name, suffix) {
+			assetName, assetURL = a.Name, a.BrowserDownloadURL
+		}
+		if a.Name == "checksums.txt" {
+			checksumURL = a.BrowserDownloadURL
+		}
+	}
+	return assetName, assetURL, checksumURL, assetURL != ""
+}
+
+// requireChecksums fails closed when the release carries no checksums.txt
+// asset (S5): the update must never proceed unverified (see
+// .github/SECURITY.md). A release missing the checksum manifest is refused
+// instead of silently skipping verification.
+func requireChecksums(checksumURL string) error {
+	if checksumURL == "" {
+		return errors.New("release has no checksums.txt asset; refusing to install unverified binary")
+	}
+	return nil
 }
 
 func runUpdate() {
@@ -44,7 +114,7 @@ func runUpdate() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/trefeon/freebuff-proxy/releases/latest", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubReleasesURL(), nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: build request: %v\n", err)
 		os.Exit(1)
@@ -77,30 +147,22 @@ func runUpdate() {
 	}
 
 	fmt.Printf("Latest release: %s\n", rel.TagName)
-	if version != "dev" && (version == rel.TagName || "v"+version == rel.TagName) {
+	if isUpToDate(version, rel.TagName) {
 		fmt.Println("Already up to date!")
 		os.Exit(0)
 	}
 
-	// Match asset for platform
-	ext := ".tar.gz"
-	if runtime.GOOS == "windows" {
-		ext = ".zip"
+	// Match asset for platform.
+	assetName, assetURL, checksumURL, ok := matchReleaseAssets(rel.Assets, runtime.GOOS, runtime.GOARCH)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "ERROR: no release asset found matching platform suffix %q\n", platformAssetSuffix(runtime.GOOS, runtime.GOARCH))
+		os.Exit(1)
 	}
-	assetSuffix := fmt.Sprintf("%s_%s%s", runtime.GOOS, runtime.GOARCH, ext)
-
-	var assetURL, checksumURL string
-	for _, a := range rel.Assets {
-		if strings.HasSuffix(a.Name, assetSuffix) {
-			assetURL = a.BrowserDownloadURL
-		}
-		if a.Name == "checksums.txt" {
-			checksumURL = a.BrowserDownloadURL
-		}
-	}
-
-	if assetURL == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: no release asset found matching platform suffix %q\n", assetSuffix)
+	// S5: fail closed — a release without a checksums.txt asset is refused,
+	// never installed unverified (previously verification was silently
+	// skipped, contradicting the SECURITY.md "never proceed unverified").
+	if err := requireChecksums(checksumURL); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -111,73 +173,20 @@ func runUpdate() {
 		os.Exit(1)
 	}
 
-	if checksumURL != "" {
-		if err := verifyChecksum(ctx, client, checksumURL, assetBytes); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("Checksum verified successfully [ok]")
+	if err := verifyChecksum(ctx, client, checksumURL, assetName, assetBytes); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
 	}
+	fmt.Println("Checksum verified successfully [ok]")
 
 	// Extract binary
-	var binaryBytes []byte
 	binaryName := "freebuff-proxy"
 	if runtime.GOOS == "windows" {
 		binaryName = "freebuff-proxy.exe"
 	}
-
-	if strings.HasSuffix(assetURL, ".zip") {
-		zr, err := zip.NewReader(bytes.NewReader(assetBytes), int64(len(assetBytes)))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: read zip: %v\n", err)
-			os.Exit(1)
-		}
-		for _, f := range zr.File {
-			if filepath.Base(f.Name) == binaryName {
-				rc, err := f.Open()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "ERROR: open zip file: %v\n", err)
-					os.Exit(1)
-				}
-				var readErr error
-				binaryBytes, readErr = io.ReadAll(rc)
-				_ = rc.Close()
-				if readErr != nil {
-					fmt.Fprintf(os.Stderr, "ERROR: read zip entry: %v\n", readErr)
-					os.Exit(1)
-				}
-				break
-			}
-		}
-	} else {
-		gzr, err := gzip.NewReader(bytes.NewReader(assetBytes))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: read gzip: %v\n", err)
-			os.Exit(1)
-		}
-		tr := tar.NewReader(gzr)
-		for {
-			hdr, err := tr.Next()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				break
-			}
-			if filepath.Base(hdr.Name) == binaryName {
-				var readErr error
-				binaryBytes, readErr = io.ReadAll(tr)
-				if readErr != nil {
-					fmt.Fprintf(os.Stderr, "ERROR: read tar entry: %v\n", readErr)
-					os.Exit(1)
-				}
-				break
-			}
-		}
-	}
-
-	if len(binaryBytes) == 0 {
-		fmt.Fprintf(os.Stderr, "ERROR: binary %q not found in downloaded release archive\n", binaryName)
+	binaryBytes, err := extractBinaryFromArchive(assetURL, assetBytes, binaryName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -263,22 +272,96 @@ func downloadURL(ctx context.Context, client *http.Client, url string) ([]byte, 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	// S7: read at most maxUpdateDownloadBytes+1 so an oversized response is
+	// rejected instead of exhausting memory (previously unbounded ReadAll).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpdateDownloadBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxUpdateDownloadBytes {
+		return nil, fmt.Errorf("download exceeds %d-byte safety cap", maxUpdateDownloadBytes)
+	}
+	return body, nil
 }
 
 // verifyChecksum downloads checksums.txt and confirms it lists the sha256 of
-// assetBytes. The update must never proceed unverified (see
-// .github/SECURITY.md), so a checksums.txt fetch failure aborts with an
-// error instead of being silently skipped.
-func verifyChecksum(ctx context.Context, client *http.Client, checksumURL string, assetBytes []byte) error {
+// assetBytes BOUND TO assetFilename — the release asset being installed (S6).
+// A bare hash match for a different filename must not pass: the checksum
+// line only counts when both the hash and the filename match. The update
+// must never proceed unverified (see .github/SECURITY.md), so a checksums.txt
+// fetch failure aborts with an error instead of being silently skipped.
+func verifyChecksum(ctx context.Context, client *http.Client, checksumURL, assetFilename string, assetBytes []byte) error {
 	checksumBytes, err := downloadURL(ctx, client, checksumURL)
 	if err != nil {
 		return fmt.Errorf("download checksums.txt: %w", err)
 	}
 	computed := sha256.Sum256(assetBytes)
 	computedHex := hex.EncodeToString(computed[:])
-	if !strings.Contains(string(checksumBytes), computedHex) {
-		return fmt.Errorf("checksum mismatch! Calculated: %s", computedHex)
+	// GoReleaser writes one "<sha256>  <filename>" pair per line (two-space
+	// separator); a "*" prefix (sha256sum style) is tolerated too. Match
+	// both fields: the hash of the downloaded bytes AND the asset filename.
+	for _, line := range strings.Split(string(checksumBytes), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		hash, name := fields[0], strings.TrimPrefix(fields[1], "*")
+		if strings.EqualFold(hash, computedHex) && name == assetFilename {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("checksum mismatch! Calculated: %s for %s", computedHex, assetFilename)
+}
+
+// extractBinaryFromArchive returns the bytes of binaryName found anywhere in
+// the release archive (a goreleaser zip or tar.gz; the binary may be nested
+// under a versioned directory). An unreadable archive or an absent binary is
+// an error — runUpdate exits rather than installing garbage.
+func extractBinaryFromArchive(assetURL string, assetBytes []byte, binaryName string) ([]byte, error) {
+	if strings.HasSuffix(assetURL, ".zip") {
+		zr, err := zip.NewReader(bytes.NewReader(assetBytes), int64(len(assetBytes)))
+		if err != nil {
+			return nil, fmt.Errorf("read zip: %w", err)
+		}
+		for _, f := range zr.File {
+			if filepath.Base(f.Name) != binaryName {
+				continue
+			}
+			rc, err := f.Open()
+			if err != nil {
+				return nil, fmt.Errorf("open zip file: %w", err)
+			}
+			b, readErr := io.ReadAll(rc)
+			_ = rc.Close()
+			if readErr != nil {
+				return nil, fmt.Errorf("read zip entry: %w", readErr)
+			}
+			return b, nil
+		}
+		return nil, fmt.Errorf("binary %q not found in downloaded release archive", binaryName)
+	}
+
+	gzr, err := gzip.NewReader(bytes.NewReader(assetBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read gzip: %w", err)
+	}
+	tr := tar.NewReader(gzr)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read tar archive: %w", err)
+		}
+		if filepath.Base(hdr.Name) != binaryName {
+			continue
+		}
+		b, readErr := io.ReadAll(tr)
+		if readErr != nil {
+			return nil, fmt.Errorf("read tar entry: %w", readErr)
+		}
+		return b, nil
+	}
+	return nil, fmt.Errorf("binary %q not found in downloaded release archive", binaryName)
 }

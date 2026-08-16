@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	cryptoRand "crypto/rand"
 	"crypto/sha256"
@@ -411,11 +412,11 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		// double-routes SOCKS5 traffic through a second proxy.
 		transport.Proxy = nil
 		for _, raw := range cfg.SOCKS5Proxies {
-			addr, err := parseProxyAddr(raw)
+			addr, auth, err := parseSocks5(raw)
 			if err != nil {
 				return nil, fmt.Errorf("upstream: SOCKS5_PROXIES: %w", err)
 			}
-			dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
+			dialer, err := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
 			if err != nil {
 				return nil, fmt.Errorf("upstream: SOCKS5 dialer: %w", err)
 			}
@@ -436,11 +437,11 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		}
 		baseDial = transport.DialContext
 	case cfg.SOCKS5Proxy != "":
-		socksAddr, err := parseProxyAddr(cfg.SOCKS5Proxy)
+		socksAddr, auth, err := parseSocks5(cfg.SOCKS5Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("upstream: SOCKS5_PROXY: %w", err)
 		}
-		dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
+		dialer, err := proxy.SOCKS5("tcp", socksAddr, auth, proxy.Direct)
 		if err != nil {
 			return nil, fmt.Errorf("upstream: SOCKS5 dialer: %w", err)
 		}
@@ -1013,7 +1014,13 @@ func (c *Client) proxyIndexFor(ctx context.Context) int {
 	if idx, ok := ctx.Value(proxyIndexKey{}).(int); ok && idx >= 0 && idx < len(c.socksProxies) {
 		return idx
 	}
-	return c.tokenIndex % len(c.socksProxies)
+	if n := len(c.socksProxies); n > 0 {
+		return c.tokenIndex % n
+	}
+	// No SOCKS5 proxies configured: a bare-context dial must not divide by
+	// zero. The transport only installs the SOCKS5 DialContext when proxies
+	// exist, so this guards direct callers (tests, future paths). (Audit B4.)
+	return 0
 }
 
 // proxyIndex selects the SOCKS5 proxy index for a new request according to
@@ -1190,8 +1197,25 @@ func wrapDecompress(resp *http.Response) error {
 		}
 		resp.Body = &decompressCloser{Reader: zr, underlying: underlying}
 	case "deflate":
-		zr := flate.NewReader(underlying)
-		resp.Body = &decompressCloser{Reader: zr, underlying: underlying}
+		// RFC 9110 §8.4.1.3 defines Content-Encoding: deflate as a
+		// zlib-wrapped stream (RFC 1950), but some servers historically
+		// send raw DEFLATE (RFC 1951). Sniff the zlib header (CMF/FLG:
+		// CM=8, CINFO<=7, 16-bit header a multiple of 31) WITHOUT
+		// consuming bytes — a consumed header would corrupt the raw
+		// fallback — and decode accordingly. (Audit B1: the raw-only
+		// reader broke mid-stream on conforming zlib responses.)
+		br := bufio.NewReader(underlying)
+		head, _ := br.Peek(2)
+		if len(head) == 2 && head[0]&0x0f == 8 && head[0]>>4 <= 7 &&
+			(uint16(head[0])<<8|uint16(head[1]))%31 == 0 {
+			zr, err := zlib.NewReader(br)
+			if err != nil {
+				return fmt.Errorf("deflate: %w", err)
+			}
+			resp.Body = &decompressCloser{Reader: zr, underlying: underlying}
+		} else {
+			resp.Body = &decompressCloser{Reader: flate.NewReader(br), underlying: underlying}
+		}
 	case "br":
 		resp.Body = &decompressCloser{Reader: brotli.NewReader(underlying), underlying: underlying}
 	case "zstd":
@@ -1201,7 +1225,10 @@ func wrapDecompress(resp *http.Response) error {
 		if err != nil {
 			return fmt.Errorf("zstd: %w", err)
 		}
-		resp.Body = &decompressCloser{Reader: zr, underlying: underlying}
+		// zstd decoders are stateful (per-response buffers), unlike
+		// gzip/brotli: Close must release the decoder's resources, not just
+		// the underlying socket. (Audit B9.)
+		resp.Body = &decompressCloser{Reader: zr, underlying: underlying, closeFn: func() error { zr.Close(); return nil }}
 	default:
 		return fmt.Errorf("unsupported Content-Encoding %q", enc)
 	}
@@ -1211,13 +1238,21 @@ func wrapDecompress(resp *http.Response) error {
 }
 
 // decompressCloser bridges a decompressing reader back to the underlying
-// response body so Close always reaches the socket.
+// response body so Close always reaches the socket. closeFn optionally
+// releases decoder-local resources (e.g. a zstd decoder's buffers) that are
+// distinct from the underlying stream.
 type decompressCloser struct {
 	io.Reader
 	underlying io.ReadCloser
+	closeFn    func() error
 }
 
-func (d *decompressCloser) Close() error { return d.underlying.Close() }
+func (d *decompressCloser) Close() error {
+	if d.closeFn != nil {
+		_ = d.closeFn()
+	}
+	return d.underlying.Close()
+}
 
 // releaseCancel cancels a do() timeout context unless it is nil.
 func releaseCancel(cancel context.CancelFunc) {
@@ -1335,7 +1370,12 @@ func classifyError(status int, body string, hdr http.Header) error {
 	retryAfter := parseRetryAfter(hdr)
 
 	switch {
-	case status == http.StatusForbidden && (strings.Contains(lower, `"status":"banned"`) || strings.Contains(lower, "banned")):
+	case status == http.StatusForbidden && strings.Contains(lower, `"status":"banned"`):
+		// The canonical ban body is {"status":"banned"} (the free-session
+		// status wire shape, reference/freebuff freebuff-session.ts). Match
+		// the marker exactly: any 403 whose body merely mentions the word
+		// "banned" (e.g. {"error":"model temporarily banned..."}) must stay
+		// a generic 403, not trigger the long ban cooldown. (Audit B5.)
 		return parseBan(body)
 	case strings.Contains(lower, "deployment_outside_hours"):
 		// Free tier is outside its operating hours: temporarily unavailable
@@ -1619,24 +1659,32 @@ func padBase36(id string) string {
 	return id
 }
 
-// parseProxyAddr strips any scheme/userinfo from a proxy URL, returning
-// host:port for the SOCKS5 dialer.
-func parseProxyAddr(raw string) (string, error) {
+// parseSocks5 normalizes a SOCKS5 proxy URL to host:port plus its
+// credentials. A bare host:port or a socks5:// URL (with optional userinfo)
+// are accepted; the userinfo becomes the SOCKS5 auth so authenticated
+// proxies actually authenticate (previously userinfo was silently stripped
+// and the client connected unauthenticated, failing the handshake — Audit
+// B2).
+func parseSocks5(raw string) (addr string, auth *proxy.Auth, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", errors.New("empty proxy URL")
+		return "", nil, errors.New("empty proxy URL")
 	}
 	if !strings.Contains(raw, "://") {
-		return raw, nil
+		return raw, nil, nil
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if u.Host == "" {
-		return "", fmt.Errorf("proxy URL %q has no host", raw)
+		return "", nil, fmt.Errorf("proxy URL %q has no host", raw)
 	}
-	return u.Host, nil
+	if u.User != nil {
+		pass, _ := u.User.Password()
+		auth = &proxy.Auth{User: u.User.Username(), Password: pass}
+	}
+	return u.Host, auth, nil
 }
 
 // httpConnectDial returns a dial function that reaches addr through an HTTP

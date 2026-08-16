@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"freebuff-proxy/internal/testutil"
 )
 
 // envKeys lists every environment variable the package reads. Tests clear
@@ -16,9 +18,23 @@ import (
 var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "HTTP_PROXY",
-	"SOCKS5_PROXY", "SOCKS5_PROXIES", "COST_MODE", "TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
-	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES", "AUTO_DISCOVER_TOKEN",
-	"TRANSIENT_RETRIES", "ADMIN_TOKEN",
+	"SOCKS5_PROXY", "SOCKS5_PROXIES", "PROXY_ROTATION", "COST_MODE",
+	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
+	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
+	"MODELS_HIDE_UNAVAILABLE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
+	"AUTO_DISCOVER_TOKEN", "TRANSIENT_RETRIES", "ADMIN_TOKEN",
+	"SESSION_PERSIST", "SESSION_STATE_FILE",
+}
+
+// TestMain strips ambient freebuff-proxy config env vars for the whole test
+// binary (testutil.UnsetConfigEnvForTestMain). clearEnv in each test covers
+// the per-test isolation, but a developer's exported SESSION_PERSIST /
+// PROXY_ROTATION / MODELS_HIDE_UNAVAILABLE / SESSION_STATE_FILE would
+// otherwise leak into package-level behavior before the first clearEnv runs
+// (e.g. TestDefaults / TestSessionPersist assert on those defaults).
+func TestMain(m *testing.M) {
+	testutil.UnsetConfigEnvForTestMain()
+	os.Exit(m.Run())
 }
 
 func clearEnv(t *testing.T) {
@@ -1132,6 +1148,306 @@ func TestIdleRotationTimeout(t *testing.T) {
 	t.Setenv("IDLE_ROTATION_TIMEOUT", "soon")
 	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "IDLE_ROTATION_TIMEOUT") {
 		t.Fatalf("Load (bad): err = %v, want parse error mentioning IDLE_ROTATION_TIMEOUT", err)
+	}
+}
+
+// TestEnvEmptyAuthTokensClearsDotenv is the C1 precedence hole: an
+// explicitly-empty AUTH_TOKENS in the real environment (the shape
+// systemd/Docker unit files use to force bridge mode) must clear tokens that
+// came from ./.env — the empty env value wins like any other env override —
+// and suppress CLI auto-discovery.
+func TestEnvEmptyAuthTokensClearsDotenv(t *testing.T) {
+	clearEnv(t)
+	// Re-enable auto-discovery; the explicit-empty AUTH_TOKENS below is what
+	// must suppress it (not the AUTO_DISCOVER_TOKEN=off switch).
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=from-dotenv\nLISTEN_ADDR=:1111\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUTH_TOKENS", "")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.AuthTokens) != 0 {
+		t.Errorf("AuthTokens = %v, want empty (empty env AUTH_TOKENS clears .env tokens)", cfg.AuthTokens)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode() = false, want true after explicit empty env AUTH_TOKENS")
+	}
+	if cfg.ListenAddr != ":1111" {
+		t.Errorf("ListenAddr = %q, want :1111 (non-token .env keys still apply)", cfg.ListenAddr)
+	}
+	if cfg.DiscoveredSource != "" {
+		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must stay suppressed)", cfg.DiscoveredSource)
+	}
+}
+
+// TestConfigJSONStripsBOM is the B3 regression: a UTF-8 BOM at the start of
+// a -config JSON file (Windows editors/PowerShell writers) must not break
+// json.Unmarshal — every other file reader in the package strips it.
+func TestConfigJSONStripsBOM(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := "\xef\xbb\xbf" + `{"LISTEN_ADDR":":9999","AUTH_TOKENS":["from-json"]}`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load of BOM'd config.json: %v", err)
+	}
+	if cfg.ListenAddr != ":9999" {
+		t.Errorf("ListenAddr = %q, want :9999 (BOM must not corrupt the first key)", cfg.ListenAddr)
+	}
+	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "from-json" {
+		t.Errorf("AuthTokens = %v, want [from-json]", got)
+	}
+}
+
+// TestDotenvCRLF verifies a CRLF .env file (the line-ending default on
+// Windows editors) parses cleanly: \r is trimmed along with surrounding
+// whitespace on every line.
+func TestDotenvCRLF(t *testing.T) {
+	clearEnv(t)
+
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=from-dotenv\r\nLISTEN_ADDR=:1111\r\nCOST_MODE=free\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load (CRLF .env): %v", err)
+	}
+	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "from-dotenv" {
+		t.Errorf("AuthTokens = %v, want [from-dotenv] (CRLF must not corrupt keys/values)", got)
+	}
+	if cfg.ListenAddr != ":1111" {
+		t.Errorf("ListenAddr = %q, want :1111", cfg.ListenAddr)
+	}
+	if cfg.CostMode != "free" {
+		t.Errorf("CostMode = %q, want free", cfg.CostMode)
+	}
+}
+
+// TestDotenvDuplicateKeyLastWins verifies the sequential-override semantics
+// of parseDotenv: when the same KEY appears twice, the LAST value wins.
+func TestDotenvDuplicateKeyLastWins(t *testing.T) {
+	clearEnv(t)
+
+	if err := os.WriteFile(".env", []byte("LISTEN_ADDR=:1111\nLISTEN_ADDR=:2222\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ListenAddr != ":2222" {
+		t.Errorf("ListenAddr = %q, want :2222 (duplicate key: last wins)", cfg.ListenAddr)
+	}
+}
+
+// TestDotenvAsDirectoryFails verifies a ./.env path that is a directory (or
+// otherwise unreadable with a non-NotExist error) fails the Load instead of
+// being silently treated as absent.
+func TestDotenvAsDirectoryFails(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	if err := os.Mkdir(".env", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(""); err == nil {
+		t.Fatal("Load with .env as a directory succeeded, want error")
+	}
+}
+
+// TestModelAliasesFromJSON verifies MODEL_ALIASES is read from the -config
+// JSON file (rawConfig.ModelAliases is a string field; only the env and .env
+// paths were previously exercised).
+func TestModelAliasesFromJSON(t *testing.T) {
+	clearEnv(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"AUTH_TOKENS":["tok-1"],"MODEL_ALIASES":"gpt-4o:deepseek/deepseek-v4-flash,glm:z-ai/glm-5.2"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.ModelAliases) != 2 {
+		t.Fatalf("ModelAliases len = %d, want 2", len(cfg.ModelAliases))
+	}
+	if cfg.ModelAliases["gpt-4o"] != "deepseek/deepseek-v4-flash" {
+		t.Errorf("ModelAliases[gpt-4o] = %q, want deepseek/deepseek-v4-flash (from JSON config)", cfg.ModelAliases["gpt-4o"])
+	}
+	if cfg.ModelAliases["glm"] != "z-ai/glm-5.2" {
+		t.Errorf("ModelAliases[glm] = %q, want z-ai/glm-5.2 (from JSON config)", cfg.ModelAliases["glm"])
+	}
+}
+
+// TestRequestJitterNegative pins the REQUEST_JITTER validation: a negative
+// duration must fail Load (only TRANSIENT_RETRIES negativity was tested).
+func TestRequestJitterNegative(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("REQUEST_JITTER", "-1s")
+
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "REQUEST_JITTER") {
+		t.Fatalf("Load (REQUEST_JITTER=-1s): err = %v, want validation error mentioning REQUEST_JITTER", err)
+	}
+}
+
+// TestJSONExplicitEmptyAuthTokensBridge is the C8 distinction: a JSON
+// `"AUTH_TOKENS": []` (explicit empty array) must record presence — bridge
+// mode, and CLI auto-discovery must NOT refill the pool — unlike an absent
+// key which leaves AuthTokensSet false.
+func TestJSONExplicitEmptyAuthTokensBridge(t *testing.T) {
+	clearEnv(t)
+	// Re-enable auto-discovery; the explicit-empty AUTH_TOKENS below is what
+	// must suppress it (not the AUTO_DISCOVER_TOKEN=off switch).
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"AUTH_TOKENS":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.AuthTokens) != 0 {
+		t.Errorf("AuthTokens = %v, want empty (explicit [] is bridge mode)", cfg.AuthTokens)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode() = false, want true with explicit empty AUTH_TOKENS array")
+	}
+	if cfg.DiscoveredSource != "" {
+		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must be suppressed)", cfg.DiscoveredSource)
+	}
+}
+
+// TestSessionPersistEmptyStateFileEnv pins the combined env case: an empty
+// SESSION_STATE_FILE env value is treated as unset (the default path
+// stands), so SESSION_PERSIST=true + SESSION_STATE_FILE= loads cleanly with
+// the default path — the validation error is only reachable through the
+// JSON/struct path (pinned in TestValidate).
+func TestSessionPersistEmptyStateFileEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("SESSION_PERSIST", "true")
+	t.Setenv("SESSION_STATE_FILE", "")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load (SESSION_PERSIST=true, SESSION_STATE_FILE=): %v", err)
+	}
+	if !cfg.SessionPersist {
+		t.Error("SessionPersist = false, want true")
+	}
+	if cfg.SessionStateFile != ".freebuff-session-state.json" {
+		t.Errorf("SessionStateFile = %q, want default %q (empty env leaves the default)", cfg.SessionStateFile, ".freebuff-session-state.json")
+	}
+}
+
+// TestDedupeAPIKeysSOCKS5Proxies asserts the dedupeStrings pass for API_KEYS
+// and SOCKS5_PROXIES (only AUTH_TOKENS dedupe was previously asserted) when
+// the same value appears multiple times in one env value.
+func TestDedupeAPIKeysSOCKS5Proxies(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("API_KEYS", "k1,k2,k1, k1")
+	t.Setenv("SOCKS5_PROXIES", "p1:9050,p2:9050,p1:9050")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"k1", "k2"}; !equalStrings(cfg.APIKeys, want) {
+		t.Errorf("APIKeys = %v, want %v (deduped)", cfg.APIKeys, want)
+	}
+	if want := []string{"p1:9050", "p2:9050"}; !equalStrings(cfg.SOCKS5Proxies, want) {
+		t.Errorf("SOCKS5Proxies = %v, want %v (deduped)", cfg.SOCKS5Proxies, want)
+	}
+}
+
+// TestPrecedenceChainSingleLoad exercises the full defaults < JSON < .env <
+// env chain in ONE Load: a key provided at every level resolves to the env
+// value, a JSON-only key survives, a .env-only key applies, and an env-only
+// key applies.
+func TestPrecedenceChainSingleLoad(t *testing.T) {
+	clearEnv(t)
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	json := `{
+		"LISTEN_ADDR": ":9999",
+		"LOG_FILE": "from-json.log",
+		"AUTH_TOKENS": ["json-tok"],
+		"COST_MODE": "free"
+	}`
+	if err := os.WriteFile(path, []byte(json), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(".env", []byte("LISTEN_ADDR=:1111\nAUTH_TOKENS=dotenv-tok\nCLI_VERSION=9.9.9\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("LISTEN_ADDR", ":7777")
+	t.Setenv("AUTH_TOKENS", "env-tok")
+	t.Setenv("SESSION_PERSIST", "true")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ListenAddr != ":7777" {
+		t.Errorf("ListenAddr = %q, want :7777 (env > .env > JSON)", cfg.ListenAddr)
+	}
+	if got := cfg.AuthTokens; len(got) != 1 || got[0] != "env-tok" {
+		t.Errorf("AuthTokens = %v, want [env-tok] (env wins)", cfg.AuthTokens)
+	}
+	if cfg.LogFile != "from-json.log" {
+		t.Errorf("LogFile = %q, want from-json.log (JSON-only key survives)", cfg.LogFile)
+	}
+	if cfg.CLIVersion != "9.9.9" {
+		t.Errorf("CLIVersion = %q, want 9.9.9 (from .env)", cfg.CLIVersion)
+	}
+	if !cfg.SessionPersist {
+		t.Error("SessionPersist = false, want true (env-only key applies)")
+	}
+	if cfg.CostMode != "free" {
+		t.Errorf("CostMode = %q, want free (JSON default kept)", cfg.CostMode)
 	}
 }
 

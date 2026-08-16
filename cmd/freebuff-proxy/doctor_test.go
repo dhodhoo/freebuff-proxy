@@ -4,11 +4,17 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"freebuff-proxy/internal/egress"
+	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/testutil"
 )
 
 // TestDoctorEgressProbeParsesTrace guards the doctor's region probe: a
@@ -62,5 +68,182 @@ func TestEgressRegionRow(t *testing.T) {
 	line, warn = egressRegionRow(c)
 	if !warn || !strings.Contains(line, "unavailable") {
 		t.Errorf("empty-cache row = %q (warn=%v), want unavailable warning", line, warn)
+	}
+}
+
+// fileSourceURL builds a file:// URL for a local fixture path (no network),
+// the same pattern internal/registry tests use to drive Refresh.
+func fileSourceURL(t *testing.T, path string) string {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "file:///" + filepath.ToSlash(abs)
+}
+
+// TestProbeModel pins the token-probe model selection: an empty catalog
+// yields "" (runTokenTest then exits 1), the fallback default
+// deepseek/deepseek-v4-flash wins even when it is NOT the alphabetical
+// first model (capacity-gated offer models would fail most token tests),
+// and a catalog without it falls back to the first model.
+func TestProbeModel(t *testing.T) {
+	t.Run("empty catalog", func(t *testing.T) {
+		reg := registry.New(nil, nil)
+		if got := probeModel(reg); got != "" {
+			t.Errorf("probeModel(empty) = %q, want empty", got)
+		}
+	})
+
+	t.Run("prefers deepseek-v4-flash over sorted-first", func(t *testing.T) {
+		reg := registry.New(nil, nil)
+		reg.LoadFallback()
+		models := reg.Models()
+		if len(models) == 0 {
+			t.Fatal("fallback registry has no models")
+		}
+		if models[0] == "deepseek/deepseek-v4-flash" {
+			t.Skip("fallback already sorts deepseek-v4-flash first; cannot pin the preference")
+		}
+		if got := probeModel(reg); got != "deepseek/deepseek-v4-flash" {
+			t.Errorf("probeModel = %q, want deepseek/deepseek-v4-flash", got)
+		}
+	})
+
+	t.Run("first model when deepseek absent", func(t *testing.T) {
+		reg := registry.New(nil, nil)
+		reg.SetSources([]string{fileSourceURL(t, filepath.Join("testdata", "registry-noflash.ts"))})
+		if err := reg.Refresh(context.Background()); err != nil {
+			t.Fatalf("Refresh: %v", err)
+		}
+		models := reg.Models()
+		if len(models) == 0 {
+			t.Fatal("fixture refresh produced no models")
+		}
+		if got := probeModel(reg); got != models[0] {
+			t.Errorf("probeModel = %q, want first model %q", got, models[0])
+		}
+	})
+}
+
+// TestTokenFormatWarn pins the doctor's per-token format checks: a "Bearer "
+// prefix (the token value must be bare in .env) and the cb_xxx/cb_yyy
+// placeholders are flagged with the 1-based token number; valid tokens warn
+// nothing.
+func TestTokenFormatWarn(t *testing.T) {
+	cases := []struct {
+		name string
+		idx  int
+		tok  string
+		want string
+	}{
+		{"valid", 0, "cb_real_token_abc", ""},
+		{"bearer prefix", 1, "Bearer cb_abc", "starts with 'Bearer ' prefix"},
+		{"bearer prefix lowercase", 2, "bearer xyz", "starts with 'Bearer ' prefix"},
+		{"placeholder xxx", 3, "cb_xxx", "placeholder string"},
+		{"placeholder yyy", 4, "cb_yyy", "placeholder string"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tokenFormatWarn(tc.idx, tc.tok)
+			if tc.want == "" {
+				if got != "" {
+					t.Errorf("tokenFormatWarn(%d, %q) = %q, want empty", tc.idx, tc.tok, got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) || !strings.Contains(got, "#"+strconv.Itoa(tc.idx+1)) {
+				t.Errorf("tokenFormatWarn(%d, %q) = %q, want %q with token #%d", tc.idx, tc.tok, got, tc.want, tc.idx+1)
+			}
+		})
+	}
+
+	if w := bridgeModeWarning(); !strings.Contains(w, "AUTH_TOKENS is empty") {
+		t.Errorf("bridgeModeWarning = %q, want the empty-AUTH_TOKENS warning", w)
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}
+
+// TestDoctorSummary pins the doctor's closing summary format.
+func TestDoctorSummary(t *testing.T) {
+	if got := doctorSummary(3, 2, 1); got != "\nSummary: 3 passed, 2 warnings, 1 failed" {
+		t.Errorf("doctorSummary = %q", got)
+	}
+	if got := doctorSummary(0, 0, 0); got != "\nSummary: 0 passed, 0 warnings, 0 failed" {
+		t.Errorf("doctorSummary = %q", got)
+	}
+}
+
+// TestDoctorTargetHost is the S1 regression: an UPSTREAM_BASE_URL carrying
+// an explicit port must yield the bare host for the doctor's DNS/TLS
+// checks ("host:8443" would NXDOMAIN LookupHost and fail tls.Dial with
+// "too many colons in address"). Unparseable or hostless URLs fall back to
+// the default host.
+func TestDoctorTargetHost(t *testing.T) {
+	cases := []struct{ name, upstream, want string }{
+		{"bare host", "https://www.codebuff.com", "www.codebuff.com"},
+		{"bare host with path", "https://www.codebuff.com/", "www.codebuff.com"},
+		{"explicit port", "https://host:8443", "host"},
+		{"explicit port with path", "https://host:8443/v1", "host"},
+		{"ipv4 with port", "http://127.0.0.1:8080/v1", "127.0.0.1"},
+		{"ipv6 with port", "https://[::1]:8443", "::1"},
+		{"empty falls back", "", "www.codebuff.com"},
+		{"unparseable falls back", "not a url", "www.codebuff.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := doctorTargetHost(tc.upstream); got != tc.want {
+				t.Errorf("doctorTargetHost(%q) = %q, want %q", tc.upstream, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunDoctorBrokenConfigExits1 pins the doctor's config-failure path
+// end to end: a missing config file prints "[FAIL] Config loading failed",
+// a summary line, and exits 1 — before any DNS/TLS/egress probe runs (the
+// path is fully hermetic: no network touch). runDoctor os.Exit(1)s, so it
+// runs in a re-exec'd helper process.
+func TestRunDoctorBrokenConfigExits1(t *testing.T) {
+	if os.Getenv("GO_WANT_DOCTOR_HELPER") == "1" {
+		testutil.UnsetConfigEnv(t)
+		runDoctor(filepath.Join(t.TempDir(), "missing-config.json"))
+		return // unreachable: runDoctor os.Exit(1)s
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunDoctorBrokenConfigExits1$")
+	cmd.Env = append(os.Environ(), "GO_WANT_DOCTOR_HELPER=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("helper exited 0, want 1\n%s", out)
+	}
+	s := string(out)
+	for _, want := range []string{
+		"[FAIL] Config loading failed",
+		"Summary: 0 passed, 0 warnings, 1 failed",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("doctor output missing %q:\n%s", want, s)
+		}
 	}
 }

@@ -53,6 +53,46 @@ func probeModel(reg *registry.Registry) string {
 	return models[0]
 }
 
+// doctorTargetHost derives the host the doctor's DNS/TLS reachability
+// checks probe, from the upstream base URL. An explicit port on the URL is
+// stripped: LookupHost and tls.Dial take a bare host, and "host:8443" would
+// otherwise NXDOMAIN the lookup and fail tls.Dial with "too many colons in
+// address" (S1) — failing a healthy config. Falls back to the default host
+// when the URL is unparseable or hostless.
+func doctorTargetHost(upstreamBaseURL string) string {
+	if u, err := url.Parse(upstreamBaseURL); err == nil && u.Host != "" {
+		if host, _, err := net.SplitHostPort(u.Host); err == nil {
+			return host
+		}
+		return u.Host
+	}
+	return "www.codebuff.com"
+}
+
+// tokenFormatWarn returns the doctor's warning for a configured token, or
+// "" when its format looks valid. "Bearer " prefixes (the token value must
+// be bare in .env) and the cb_xxx/cb_yyy placeholders are flagged.
+func tokenFormatWarn(index int, token string) string {
+	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
+		return fmt.Sprintf("Token #%d starts with 'Bearer ' prefix -- remove it from .env", index+1)
+	}
+	if token == "cb_xxx" || token == "cb_yyy" {
+		return fmt.Sprintf("Token #%d is a placeholder string %q", index+1, token)
+	}
+	return ""
+}
+
+// bridgeModeWarning is the doctor warning shown when AUTH_TOKENS is empty
+// (bridge mode active).
+func bridgeModeWarning() string {
+	return "AUTH_TOKENS is empty (bridge mode active). Clients must supply Authorization: Bearer <token>"
+}
+
+// doctorSummary renders the doctor's closing summary line.
+func doctorSummary(passed, warnings, failed int) string {
+	return fmt.Sprintf("\nSummary: %d passed, %d warnings, %d failed", passed, warnings, failed)
+}
+
 func runTokenTest(configPath string) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -114,20 +154,18 @@ func runDoctor(configPath string) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		fail(fmt.Sprintf("Config loading failed: %v", err))
-		fmt.Printf("\nSummary: %d passed, %d warnings, %d failed\n", passed, warnings, failed)
+		fmt.Println(doctorSummary(passed, warnings, failed))
 		os.Exit(1)
 	}
 	ok("Configuration loaded & validated successfully")
 
 	if cfg.BridgeMode() {
-		warn("AUTH_TOKENS is empty (bridge mode active). Clients must supply Authorization: Bearer <token>")
+		warn(bridgeModeWarning())
 	} else {
 		ok(fmt.Sprintf("AUTH_TOKENS: %d token(s) configured", len(cfg.AuthTokens)))
 		for i, tok := range cfg.AuthTokens {
-			if strings.HasPrefix(strings.ToLower(tok), "bearer ") {
-				warn(fmt.Sprintf("Token #%d starts with 'Bearer ' prefix -- remove it from .env", i+1))
-			} else if tok == "cb_xxx" || tok == "cb_yyy" {
-				warn(fmt.Sprintf("Token #%d is a placeholder string %q", i+1, tok))
+			if w := tokenFormatWarn(i, tok); w != "" {
+				warn(w)
 			} else {
 				ok(fmt.Sprintf("Token #%d format valid (%d chars)", i+1, len(tok)))
 			}
@@ -144,10 +182,7 @@ func runDoctor(configPath string) {
 	}
 
 	// DNS & TLS reachability check
-	targetHost := "www.codebuff.com"
-	if u, err := url.Parse(cfg.UpstreamBaseURL); err == nil && u.Host != "" {
-		targetHost = u.Host
-	}
+	targetHost := doctorTargetHost(cfg.UpstreamBaseURL)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -223,7 +258,7 @@ func runDoctor(configPath string) {
 		}
 	}
 
-	fmt.Printf("\nSummary: %d passed, %d warnings, %d failed\n", passed, warnings, failed)
+	fmt.Println(doctorSummary(passed, warnings, failed))
 	if failed > 0 {
 		os.Exit(1)
 	}

@@ -58,6 +58,13 @@ const maxBridgeEntries = 32
 // maintain loop FINISHes its runs and drops it from the cache.
 const bridgeIdleEvict = 2 * time.Hour
 
+// retiredDrainGrace is how long a retired token may sit without a lease
+// before maintainTick drops it from the retired map. RemoveLastToken drains
+// the entry at removal, so a parked entry's runs are already finished; the
+// grace exists to cover an Acquire that loaded the pre-removal snapshot and
+// is still mid-admission when the park happens (see RemoveLastToken).
+const retiredDrainGrace = 2 * time.Minute
+
 // Lease is one acquired right to send a chat request through a specific
 // token. The caller must call Pool.LeaseRelease when the request completes
 // or fails (it decrements the run's inflight counter).
@@ -69,6 +76,12 @@ type Lease struct {
 	TierAccess        string       // upstream accessTier, "" when unknown
 	TierCountry       string       // upstream countryCode, "" when unknown
 	Bridge            *bridgeEntry // nil for pooled (fixed-token) leases
+	// entry is the fixed-token entry backing this lease. Set by Acquire so
+	// LeaseRelease always releases through the right run manager: after a
+	// concurrent RemoveLastToken, the Token index may be out of range (or
+	// reused by a later AddToken), and a bounds-checked release would leak
+	// the run's inflight or hit an unrelated manager.
+	entry *tokenEntry
 }
 
 // bridgeEntry is one lazily-created client-token slot in bridge mode: the
@@ -130,6 +143,17 @@ type Pool struct {
 	// RemoveAllTokens rebuild the slice); every reader Load()s once per call
 	// and bounds-checks indices, since the slice can shrink mid-flight.
 	toks atomic.Pointer[[]*tokenEntry]
+
+	// retired maps token entries removed by RemoveLastToken to the time they
+	// were parked. The busy check and the toks swap are TOCTOU: an Acquire
+	// that loaded the pre-removal snapshot can lease the removed token in
+	// between, and its LeaseRelease would no-op on the post-removal bounds
+	// check (or mis-target a reused index). Leases carry their entry, so
+	// release always lands on the right manager; LeaseRelease drains a
+	// parked entry once its last lease releases. maintainTick prunes
+	// entries that never saw a slipped lease (already drained at removal).
+	retiredMu sync.Mutex
+	retired   map[*tokenEntry]time.Time
 
 	rr     atomic.Uint64 // round-robin start index
 	logger *slog.Logger
@@ -271,7 +295,10 @@ func (p *Pool) AddToken(token string) (int, error) {
 // RemoveLastToken removes the highest-index fixed token (dashboard action).
 // Only the last index can be removed safely: removing a middle token would
 // shift indices under in-flight leases. Refuses while the token has active
-// runs. Returns an error for an empty pool or a busy token.
+// runs. The removed token's runs are FINISHed and its admitted session
+// ended (they used to leak upstream, contrast RemoveAllTokens); a lease
+// that slips through the busy-check/swap race is released through the
+// retired map and drained once it releases.
 func (p *Pool) RemoveLastToken() error {
 	toks := p.toks.Load()
 	if len(*toks) == 0 {
@@ -286,7 +313,37 @@ func (p *Pool) RemoveLastToken() error {
 	p.usageMu.Lock()
 	p.msgsPerToken = p.msgsPerToken[:len(p.msgsPerToken)-1]
 	p.usageMu.Unlock()
+
+	// The busy check above and the swap are TOCTOU: an Acquire that loaded
+	// the pre-removal snapshot can lease the removed token in between. Park
+	// the entry so that lease is still released (LeaseRelease bounds-checks
+	// the new snapshot and would otherwise no-op, leaking the run's
+	// inflight), then drain now when no lease slipped — finishing the
+	// removed token's run and ending its admitted session. A slipped lease
+	// keeps the entry parked; LeaseRelease drains it once the last lease
+	// releases.
+	slip := last.runs.InflightCount() > 0
+	p.retiredMu.Lock()
+	if p.retired == nil {
+		p.retired = make(map[*tokenEntry]time.Time)
+	}
+	p.retired[last] = time.Now()
+	p.retiredMu.Unlock()
+	if !slip {
+		p.drainRemovedToken(last)
+	}
 	return nil
+}
+
+// drainRemovedToken finishes the removed token's runs and ends its admitted
+// session (mirrors RemoveAllTokens' run finish plus the session end that
+// removal previously skipped), bounded by the per-token shutdown timeout so
+// a hung upstream cannot block the dashboard action.
+func (p *Pool) drainRemovedToken(entry *tokenEntry) {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	entry.runs.FinishAllRuns(ctx)
+	_ = entry.session.EndSession(ctx)
 }
 
 // RemoveAllTokens finishes every fixed token's runs and empties the pool
@@ -425,6 +482,16 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			continue
 		}
 
+		// Re-validate the token is still current: a concurrent
+		// RemoveLastToken may have swapped the snapshot while the session
+		// admission above was in flight. Leasing a removed token would
+		// strand its run's inflight — LeaseRelease always releases through
+		// the lease's own entry, but the run would belong to a drained,
+		// retiring manager — so skip instead (the removal path drains the
+		// retired entry once it observes the slip).
+		if cur := p.toks.Load(); idx < 0 || idx >= len(*cur) || (*cur)[idx] != tok {
+			continue
+		}
 		run, err := tok.runs.Acquire(ctx, agentID)
 		if err != nil {
 			if errors.Is(err, upstream.ErrAuthRejected) {
@@ -456,7 +523,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		p.idleFinished = false
 		p.lastActiveMu.Unlock()
 		return &Lease{Token: idx, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
-			TierAccess: ss.TierAccess, TierCountry: ss.TierCountry}, nil
+			TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, entry: tok}, nil
 	}
 
 	// Failover precedence (PRD §6 error matrix): when buckets are mixed the
@@ -650,6 +717,15 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 	ss := entry.session.Snapshot()
 	p.logger.Debug("pool: bridge lease acquired", "model", model, "agent", agentID, "instance_id", instanceID,
 		"tier", ss.TierAccess, "country", ss.TierCountry)
+	// Track the activity and end any idle-maintenance pause, mirroring
+	// Acquire: without this, IDLE_ROTATION_TIMEOUT was dead config in
+	// bridge mode — lastActive stayed zero forever, so the pool never
+	// idle-paused and bridge entries were maintained, heartbeated, and
+	// queued-advanced every pass indefinitely.
+	p.lastActiveMu.Lock()
+	p.lastActive = time.Now()
+	p.idleFinished = false
+	p.lastActiveMu.Unlock()
 	return &Lease{Token: -1, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
 		TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, Bridge: entry}, nil
 }
@@ -664,11 +740,21 @@ func (p *Pool) LeaseRelease(lease *Lease) {
 		lease.Bridge.runs.Release(lease.Run)
 		return
 	}
-	toks := p.toks.Load()
-	if lease.Token < 0 || lease.Token >= len(*toks) {
-		return
+	if lease.entry == nil {
+		return // synthetic lease without a backing entry
 	}
-	(*toks)[lease.Token].runs.Release(lease.Run)
+	lease.entry.runs.Release(lease.Run)
+	// A lease on a removed token (RemoveLastToken swapped the snapshot out
+	// from under a concurrent Acquire) releases through its own entry — the
+	// bounds-checked index path would no-op and leak the run's inflight, or
+	// mis-target a reused index. RemoveLastToken parked the entry undrained
+	// when it observed the slip; drain it once its last lease has released.
+	p.retiredMu.Lock()
+	_, parked := p.retired[lease.entry]
+	p.retiredMu.Unlock()
+	if parked && lease.entry.runs.InflightCount() == 0 {
+		p.drainRemovedToken(lease.entry)
+	}
 }
 
 // InvalidateSession drops the cached free session of token so the next
@@ -1385,12 +1471,22 @@ func (p *Pool) maintainLoop(ctx context.Context) {
 func (p *Pool) maintainTick(ctx context.Context) {
 	toks := p.toks.Load()
 	cfg := p.cfg.Load()
+	// Drop retired tokens that never saw a slipped lease (their runs were
+	// drained at removal). Entries still carrying a lease stay until
+	// LeaseRelease drains them; the park grace covers an Acquire that loaded
+	// the pre-removal snapshot (see RemoveLastToken).
+	p.pruneRetired()
 	if cfg.IdleRotationTimeout > 0 && p.idleFor() > cfg.IdleRotationTimeout {
 		// Past the idle threshold. If this is the first idle pass, FINISH
 		// every run so the token's rotation/refresh activity stops
 		// upstream; sessions are left untouched. Later passes skip the
 		// per-token work entirely while the pool stays idle.
 		if !p.setIdleFinishedOnce() {
+			// Later idle passes still sweep idle bridge entries: without
+			// this, entries idle past bridgeIdleEvict are never evicted
+			// while the pool stays idle and their sessions stay admitted
+			// upstream until expiry.
+			p.bridgeMaintain(ctx, true)
 			return
 		}
 		for _, tok := range *toks {
@@ -1405,6 +1501,7 @@ func (p *Pool) maintainTick(ctx context.Context) {
 			// shutdown for the full upstream call timeout.
 			tok.runs.FinishAllRuns(ctx)
 		}
+		p.bridgeMaintain(ctx, true)
 		return
 	}
 	for i, tok := range *toks {
@@ -1433,7 +1530,21 @@ func (p *Pool) maintainTick(ctx context.Context) {
 	}
 	// Bridge sweep: drop entries idle past bridgeIdleEvict (runs FINISHed
 	// best-effort), maintain the rest like the fixed tokens above.
-	p.bridgeMaintain(ctx)
+	p.bridgeMaintain(ctx, false)
+}
+
+// pruneRetired drops retired tokens that hold no leases and have been
+// parked past the drain grace (their runs were already finished at removal
+// or on the last release). Entries still carrying a lease stay until
+// LeaseRelease drains them.
+func (p *Pool) pruneRetired() {
+	p.retiredMu.Lock()
+	defer p.retiredMu.Unlock()
+	for entry, swappedAt := range p.retired {
+		if entry.runs.InflightCount() == 0 && time.Since(swappedAt) > retiredDrainGrace {
+			delete(p.retired, entry)
+		}
+	}
 }
 
 // bridgeMaintain sweeps the bridge cache: entries idle past bridgeIdleEvict
@@ -1443,8 +1554,11 @@ func (p *Pool) maintainTick(ctx context.Context) {
 // maintain work below and are only swept once their leases drain and they
 // stay idle. The remaining entries get the per-token maintain work — rotate
 // aged runs and advance queued sessions, bounded by the same RequestTimeout
-// ctx as the fixed-token loop.
-func (p *Pool) bridgeMaintain(ctx context.Context) {
+// ctx as the fixed-token loop. On idle passes (idle=true) only the sweep
+// runs: the per-entry heartbeat/queued-advance pauses with the fixed
+// tokens, and the idle-sweep keeps bridge entries from staying admitted
+// upstream past bridgeIdleEvict while the pool stays idle.
+func (p *Pool) bridgeMaintain(ctx context.Context, idle bool) {
 	cfg := p.cfg.Load()
 	var toEvict []*bridgeEntry
 	var toMaintain []*bridgeEntry
@@ -1481,6 +1595,11 @@ func (p *Pool) bridgeMaintain(ctx context.Context) {
 		cancel()
 	}
 	for _, entry := range toMaintain {
+		if idle {
+			// Idle pass: the per-entry maintain work pauses with the fixed
+			// tokens; only the idle-eviction sweep above runs.
+			continue
+		}
 		// Same cooldown skip as the fixed-token loop: no heartbeat, no
 		// queued-session EnsureSession, no rotation while cooling down.
 		if time.Now().Before(entry.runs.CooldownUntil()) {

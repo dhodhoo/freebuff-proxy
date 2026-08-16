@@ -340,6 +340,11 @@ func (m *RunManager) Cooldown(d time.Duration) {
 	m.rateLimit = nil
 	m.ban = nil
 	m.countryBlock = nil
+	// The ban/country windows die with their remembered errors: leaving the
+	// deadlines set would surface a stale future BannedUntil (healthz risk
+	// gating via Snapshot) with no ban attached. Mirror ClearCooldowns.
+	m.banUntil = time.Time{}
+	m.countryUntil = time.Time{}
 	m.mu.Unlock()
 }
 

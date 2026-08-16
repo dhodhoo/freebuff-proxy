@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,11 +22,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
+	utls "github.com/refraction-networking/utls"
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/stealth"
@@ -1064,6 +1068,22 @@ func TestWrapDecompress(t *testing.T) {
 			_ = zw.Close()
 			return buf.Bytes()
 		}, ""},
+		// RFC 9110 §8.4.1.3: deflate = zlib-wrapped (RFC 1950). A conforming
+		// server's body must decode; the raw-flate fallback must not break
+		// the existing raw case above. (Audit B1.)
+		{"deflate zlib-wrapped", "deflate", func(b []byte) []byte {
+			var buf bytes.Buffer
+			zw := zlib.NewWriter(&buf)
+			_, _ = zw.Write(b)
+			_ = zw.Close()
+			return buf.Bytes()
+		}, ""},
+		{"corrupt gzip", "gzip", func(b []byte) []byte {
+			return []byte("this is not gzip data")
+		}, "gzip:"},
+		// Multi-value Content-Encoding is rejected with a clear error, not
+		// silently mis-decoded. (Audit G1.)
+		{"multi-value encoding rejected", "gzip, br", nil, "unsupported Content-Encoding"},
 		{"brotli", "br", func(b []byte) []byte {
 			var buf bytes.Buffer
 			zw := brotli.NewWriter(&buf)
@@ -1975,5 +1995,1428 @@ func TestNextStealthProfile(t *testing.T) {
 		if got := nextStealthProfile(tc.cur); got != tc.want {
 			t.Errorf("nextStealthProfile(%s) = %s, want %s", tc.cur.ID, got.ID, tc.want.ID)
 		}
+	}
+}
+
+// TestNextStealthProfileUnknownFallback guards the unknown-profile fallback
+// (G11): a profile outside the rotation order rotates to the first entry.
+func TestNextStealthProfileUnknownFallback(t *testing.T) {
+	got := nextStealthProfile(&stealth.Profile{ID: "bogus"})
+	if want := retryProfileRotation[0].next; got != want {
+		t.Errorf("nextStealthProfile(unknown) = %s, want %s", got.ID, want.ID)
+	}
+}
+
+// TestWrapDecompressZstdDecoderClosed guards Audit B9 (fix 6): closing a
+// zstd-wrapped response body must release the per-response decoder, not just
+// the underlying socket (decoder buffers would otherwise linger until GC).
+func TestWrapDecompressZstdDecoderClosed(t *testing.T) {
+	var buf bytes.Buffer
+	zw, _ := zstd.NewWriter(&buf)
+	_, _ = zw.Write([]byte(`{"status":"active"}`))
+	_ = zw.Close()
+
+	resp := &http.Response{
+		Header: http.Header{"Content-Encoding": []string{"zstd"}},
+		Body:   io.NopCloser(bytes.NewReader(buf.Bytes())),
+	}
+	if err := wrapDecompress(resp); err != nil {
+		t.Fatal(err)
+	}
+	dc, ok := resp.Body.(*decompressCloser)
+	if !ok {
+		t.Fatalf("body = %T, want *decompressCloser", resp.Body)
+	}
+	if dc.closeFn == nil {
+		t.Error("zstd decompressCloser has no closeFn: decoder resources leak until GC")
+	}
+	if _, err := io.ReadAll(dc); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if err := dc.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestParseRetryAfterAndFlexTime guards the time parsers' edge branches
+// (G2): HTTP-date Retry-After, zero/negative/garbage values, and
+// numeric-string unix seconds for flex times.
+func TestParseRetryAfterAndFlexTime(t *testing.T) {
+	t.Run("http-date", func(t *testing.T) {
+		future := time.Now().Add(90 * time.Second).UTC()
+		hdr := http.Header{}
+		hdr.Set("Retry-After", future.Format(http.TimeFormat))
+		got := parseRetryAfter(hdr)
+		if got <= 0 || got > 3*time.Minute {
+			t.Errorf("HTTP-date Retry-After = %v, want ~90s", got)
+		}
+	})
+	t.Run("seconds, zero, negative, garbage", func(t *testing.T) {
+		cases := []struct {
+			raw  string
+			want time.Duration
+		}{
+			{"30", 30 * time.Second},
+			{"0", 0},
+			{"-5", 0},
+			{"garbage", 0},
+			{"", 0},
+		}
+		for _, tc := range cases {
+			hdr := http.Header{}
+			hdr.Set("Retry-After", tc.raw)
+			if got := parseRetryAfter(hdr); got != tc.want {
+				t.Errorf("Retry-After %q = %v, want %v", tc.raw, got, tc.want)
+			}
+		}
+	})
+	t.Run("flex time numeric string seconds", func(t *testing.T) {
+		got, err := parseFlexTime("1753075087")
+		if err != nil {
+			t.Fatalf("parseFlexTime(string seconds): %v", err)
+		}
+		if want := time.Unix(1753075087, 0); !got.Equal(want) {
+			t.Errorf("parseFlexTime = %v, want %v", got, want)
+		}
+	})
+	t.Run("flex time nil and empty error", func(t *testing.T) {
+		if _, err := parseFlexTime(nil); err == nil {
+			t.Error("parseFlexTime(nil) succeeded")
+		}
+		if _, err := parseFlexTime(""); err == nil {
+			t.Error("parseFlexTime(\"\") succeeded")
+		}
+	})
+}
+
+// TestDoBackoffCancelAndDeadline guards the do() retry-loop branches (G3):
+// ctx cancellation during the backoff aborts without a second attempt; a
+// pre-existing deadline skips the internal timeout entirely; and after the
+// retry budget is exhausted the error surfaces as a non-transient wrap.
+func TestDoBackoffCancelAndDeadline(t *testing.T) {
+	t.Run("ctx cancel during backoff aborts", func(t *testing.T) {
+		client, rt := newRetryClient(t, "", 1, "")
+		// Block the backoff so cancellation has a window to land in.
+		client.retryBackoff = func() time.Duration { return time.Hour }
+		rt.failN = 1
+		rt.err = errors.New("connection reset by peer")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := client.newRequest(ctx, http.MethodPost, "/api/v1/chat/completions", []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := client.do(req, 0)
+			done <- err
+		}()
+		// Wait for the first (failed) attempt, then cancel mid-backoff.
+		deadline := time.Now().Add(5 * time.Second)
+		for rt.calls < 1 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if rt.calls != 1 {
+			t.Fatalf("first attempt never ran (calls=%d)", rt.calls)
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want context.Canceled", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("do() did not return after cancel during backoff")
+		}
+		if rt.calls != 1 {
+			t.Errorf("calls = %d after cancel, want 1 (no retry fired)", rt.calls)
+		}
+	})
+
+	t.Run("pre-existing deadline skips timeout", func(t *testing.T) {
+		client, _ := newRetryClient(t, "", 0, "")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+		defer cancel()
+		req, err := client.newRequest(ctx, http.MethodPost, "/api/v1/chat/completions", []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, cfn, err := client.do(req, 30*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if cfn != nil {
+			t.Error("timeout applied despite a pre-existing deadline (cancel must be nil)")
+		}
+	})
+
+	t.Run("exhausted budget returns non-transient wrap", func(t *testing.T) {
+		client, rt := newRetryClient(t, "", 1, "")
+		rt.failN = 2
+		rt.err = errors.New("connection reset by peer")
+		req, err := client.newRequest(context.Background(), http.MethodPost, "/api/v1/chat/completions", []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = client.do(req, 0)
+		if err == nil {
+			t.Fatal("expected an error after exhausting the retry budget")
+		}
+		if !strings.Contains(err.Error(), "upstream:") {
+			t.Errorf("err = %v, want an upstream-wrapped error", err)
+		}
+		if rt.calls != 2 {
+			t.Errorf("calls = %d, want 2 (initial + 1 retry)", rt.calls)
+		}
+		if got := client.TransientRetries(); got != 1 {
+			t.Errorf("TransientRetries = %d, want 1", got)
+		}
+	})
+}
+
+// TestClassifyErrorMatrix guards the 403 classification matrix (G4): the
+// narrowed banned marker, deployment_outside_hours precedence across
+// statuses, chat-level session markers, 500+rate_limited bodies, and
+// ban-before-rate discrimination (E2E flow 3).
+func TestClassifyErrorMatrix(t *testing.T) {
+	t.Run("banned substring does not over-match", func(t *testing.T) {
+		// Regression for Audit B5: a 403 body merely mentioning "banned"
+		// (not the {"status":"banned"} marker) must stay a generic 403.
+		err := classifyError(403, `{"error":"model temporarily banned from free tier"}`, http.Header{})
+		if errors.Is(err, ErrBanned) {
+			t.Fatalf("403 with the word banned but no status marker classified as ErrBanned: %v", err)
+		}
+		var upErr *UpstreamError
+		if !errors.As(err, &upErr) || upErr.Status != 403 {
+			t.Errorf("err = %v, want a generic 403 UpstreamError", err)
+		}
+	})
+
+	t.Run("status banned marker still classifies", func(t *testing.T) {
+		err := classifyError(403, `{"status":"banned","resumes_at":"2026-07-21T09:18:07+00:00"}`, http.Header{})
+		if !errors.Is(err, ErrBanned) {
+			t.Errorf("err = %v, want ErrBanned", err)
+		}
+	})
+
+	t.Run("ban beats rate_limited text", func(t *testing.T) {
+		// E2E flow 3: a banned body that also mentions rate_limited text
+		// still classifies as a ban (first case wins).
+		err := classifyError(403, `{"status":"banned","error":"rate_limited","resumes_at":"2026-07-21T09:18:07+00:00"}`, http.Header{})
+		if !errors.Is(err, ErrBanned) {
+			t.Errorf("err = %v, want ErrBanned (ban must beat rate text)", err)
+		}
+	})
+
+	t.Run("deployment_outside_hours preempts status cases", func(t *testing.T) {
+		// Pin current behavior (Audit B6, NOT fixed): the marker wins over
+		// 401/403/429 classification and yields a retryable UpstreamError.
+		cases := []struct {
+			name   string
+			status int
+			body   string
+			notErr error
+		}{
+			{"401", 401, `{"status":"deployment_outside_hours"}`, ErrAuthRejected},
+			{"403", 403, `{"status":"deployment_outside_hours"}`, ErrFreeModeCLIRequired},
+			{"429", 429, `{"status":"deployment_outside_hours"}`, ErrRateLimited},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := classifyError(tc.status, tc.body, http.Header{})
+				var upErr *UpstreamError
+				if !errors.As(err, &upErr) {
+					t.Fatalf("err = %v, want UpstreamError", err)
+				}
+				if !upErr.Retryable {
+					t.Errorf("deployment_outside_hours not marked Retryable: %v", err)
+				}
+				if errors.Is(err, tc.notErr) {
+					t.Errorf("err = %v, must not classify as %v", err, tc.notErr)
+				}
+			})
+		}
+	})
+
+	t.Run("chat-level session markers", func(t *testing.T) {
+		err := classifyError(409, `{"status":"model_locked","currentModel":"a","requestedModel":"b"}`, http.Header{})
+		if !errors.Is(err, ErrSessionInvalid) {
+			t.Errorf("model_locked at chat level = %v, want ErrSessionInvalid", err)
+		}
+		err = classifyError(400, `{"status":"session_model_mismatch"}`, http.Header{})
+		if !errors.Is(err, ErrSessionInvalid) {
+			t.Errorf("session_model_mismatch at chat level = %v, want ErrSessionInvalid", err)
+		}
+	})
+
+	t.Run("500 with rate_limited body", func(t *testing.T) {
+		// Pin current behavior: the rate_limited body marker wins even on a
+		// 500, producing a RateLimitError.
+		err := classifyError(500, `{"status":"rate_limited"}`, http.Header{})
+		if !errors.Is(err, ErrRateLimited) {
+			t.Errorf("err = %v, want ErrRateLimited", err)
+		}
+	})
+
+	t.Run("chat-level country blocked", func(t *testing.T) {
+		// E2E flow 2: a chat 403 country_blocked body surfaces the typed
+		// CountryBlockedError with parsed fields, not a generic 403.
+		err := classifyError(403, `{"status":"country_blocked","countryCode":"CN","countryBlockReason":"region_restricted","ipPrivacySignals":["vpn"]}`, http.Header{})
+		var cbe *CountryBlockedError
+		if !errors.As(err, &cbe) {
+			t.Fatalf("err = %v, want CountryBlockedError", err)
+		}
+		if cbe.CountryCode != "CN" || cbe.CountryBlockReason != "region_restricted" {
+			t.Errorf("country fields = %q/%q, want CN/region_restricted", cbe.CountryCode, cbe.CountryBlockReason)
+		}
+		if len(cbe.IpPrivacySignals) != 1 || cbe.IpPrivacySignals[0] != "vpn" {
+			t.Errorf("ipPrivacySignals = %v, want [vpn]", cbe.IpPrivacySignals)
+		}
+	})
+}
+
+// TestEnsureCliSystemMarkerBranches covers the system-marker merge matrix
+// (G5): empty messages, already-present marker, non-string content, merge
+// into the first system message, and the unshift path.
+func TestEnsureCliSystemMarkerBranches(t *testing.T) {
+	t.Run("missing messages gets marker-only system", func(t *testing.T) {
+		p := map[string]any{}
+		ensureCliSystemMarker(p)
+		msgs, ok := p["messages"].([]any)
+		if !ok || len(msgs) != 1 {
+			t.Fatalf("messages = %v, want a single system message", p["messages"])
+		}
+		sys, ok := msgs[0].(map[string]any)
+		if !ok || sys["role"] != "system" || sys["content"] != cliSystemMarker {
+			t.Errorf("system message = %v, want role=system with the CLI marker", msgs[0])
+		}
+	})
+
+	t.Run("empty messages gets marker-only system", func(t *testing.T) {
+		p := map[string]any{"messages": []any{}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if len(msgs) != 1 {
+			t.Fatalf("messages = %v, want a single system message", msgs)
+		}
+		if msgs[0].(map[string]any)["content"] != cliSystemMarker {
+			t.Errorf("system content = %v", msgs[0])
+		}
+	})
+
+	t.Run("marker already present is untouched", func(t *testing.T) {
+		content := cliSystemMarker + "\n\nextra instructions"
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": content},
+			map[string]any{"role": "user", "content": "hi"},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("messages = %v, want unchanged length", msgs)
+		}
+		if got := msgs[0].(map[string]any)["content"]; got != content {
+			t.Errorf("system content changed: %v", got)
+		}
+	})
+
+	t.Run("non-string system content replaced", func(t *testing.T) {
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": []any{"structured"}},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if got := msgs[0].(map[string]any)["content"]; got != cliSystemMarker {
+			t.Errorf("system content = %v, want the CLI marker", got)
+		}
+	})
+
+	t.Run("merges into first system message", func(t *testing.T) {
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "user", "content": "u"},
+			map[string]any{"role": "system", "content": "existing"},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("messages = %v, want length 2", msgs)
+		}
+		sys := msgs[1].(map[string]any)
+		if sys["role"] != "system" {
+			t.Fatalf("second message = %v, want system", sys)
+		}
+		if got := sys["content"].(string); !strings.HasPrefix(got, cliSystemMarker) || !strings.Contains(got, "existing") {
+			t.Errorf("merged content = %q, want marker + existing", got)
+		}
+	})
+
+	t.Run("unshifts marker before user", func(t *testing.T) {
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "user", "content": "u"},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("messages = %v, want length 2", msgs)
+		}
+		if msgs[0].(map[string]any)["role"] != "system" {
+			t.Errorf("first message = %v, want system", msgs[0])
+		}
+	})
+}
+
+// TestInjectEnvelopeBranchMatrix covers injectEnvelope's override behavior
+// (G5): stream:false is force-overridden, provider is replaced, stop is
+// preserved, and a non-object body is rejected.
+func TestInjectEnvelopeBranchMatrix(t *testing.T) {
+	t.Run("stream false overridden to true", func(t *testing.T) {
+		out, err := injectEnvelope([]byte(`{"model":"m","stream":false}`), "free", ChatOptions{RunID: "r"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(out, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["stream"] != true {
+			t.Errorf("stream = %v, want true", payload["stream"])
+		}
+	})
+
+	t.Run("provider replaced", func(t *testing.T) {
+		out, err := injectEnvelope([]byte(`{"model":"m","provider":{"data_collection":"allow"}}`), "free", ChatOptions{RunID: "r"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(out, &payload); err != nil {
+			t.Fatal(err)
+		}
+		prov, ok := payload["provider"].(map[string]any)
+		if !ok || prov["data_collection"] != "deny" {
+			t.Errorf("provider = %v, want data_collection=deny", payload["provider"])
+		}
+	})
+
+	t.Run("client stop preserved", func(t *testing.T) {
+		out, err := injectEnvelope([]byte(`{"model":"m","stop":["custom"]}`), "free", ChatOptions{RunID: "r"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(out, &payload); err != nil {
+			t.Fatal(err)
+		}
+		stop, ok := payload["stop"].([]any)
+		if !ok || len(stop) != 1 || stop[0] != "custom" {
+			t.Errorf("stop = %v, want preserved [custom]", payload["stop"])
+		}
+	})
+
+	t.Run("no stop adds cb_easp", func(t *testing.T) {
+		out, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "r"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(out, &payload); err != nil {
+			t.Fatal(err)
+		}
+		stop, ok := payload["stop"].([]any)
+		if !ok || len(stop) != 1 || stop[0] != "cb_easp" {
+			t.Errorf("stop = %v, want [cb_easp]", payload["stop"])
+		}
+	})
+
+	t.Run("non-object body rejected", func(t *testing.T) {
+		if _, err := injectEnvelope([]byte(`[1,2,3]`), "free", ChatOptions{RunID: "r"}); err == nil {
+			t.Error("injectEnvelope accepted a JSON array body")
+		}
+	})
+}
+
+// TestRequestJitter guards the REQUEST_JITTER gate (G6): the request is held
+// before any upstream contact, and canceling during the window aborts with
+// context.Canceled and no upstream hit.
+func TestRequestJitter(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	client, err := New("tok", testConfig(mock.URL(), func(c *config.Config) {
+		c.RequestJitter = time.Hour
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.ChatCompletions(ctx, ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
+		done <- err
+	}()
+
+	// The jitter gate must hold the request before any upstream contact.
+	time.Sleep(50 * time.Millisecond)
+	if n := mock.Requests; n != 0 {
+		t.Fatalf("upstream hit %d times during the jitter window, want 0", n)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ChatCompletions did not abort on cancel during jitter")
+	}
+	if n := mock.Requests; n != 0 {
+		t.Fatalf("upstream hit %d times after cancel, want 0", n)
+	}
+
+	t.Run("small jitter still completes", func(t *testing.T) {
+		mock2 := testutil.NewMock()
+		defer mock2.Close()
+		mock2.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`)
+		client2, err := New("tok", testConfig(mock2.URL(), func(c *config.Config) {
+			c.RequestJitter = 30 * time.Millisecond
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := client2.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatalf("chat with jitter failed: %v", err)
+		}
+		_ = rc.Close()
+		if mock2.Requests != 1 {
+			t.Errorf("Requests = %d, want 1", mock2.Requests)
+		}
+	})
+}
+
+// TestRedirectMultihop guards multi-hop redirect token semantics (G7): an
+// A→B→A loop keeps the token at the origin (B never sees it, A receives its
+// own token on the loop-back hop), the 3-hop limit errors out, and a
+// port-differing same-host hop is treated as cross-host (token stripped).
+func TestRedirectMultihop(t *testing.T) {
+	const token = "tok-multihop"
+
+	t.Run("A-B-A loop", func(t *testing.T) {
+		bKeySeen := make(chan string, 1)
+		aKeySeen := make(chan string, 2)
+
+		var targetBURL string
+		originA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/start":
+				http.Redirect(w, r, targetBURL+"/b", http.StatusTemporaryRedirect)
+			default:
+				aKeySeen <- r.Header.Get("x-codebuff-api-key")
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer originA.Close()
+
+		targetB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			bKeySeen <- r.Header.Get("x-codebuff-api-key")
+			// Loop back to the ORIGIN: Go re-copies headers from via[0]
+			// (the origin), so the origin must receive its own token again.
+			http.Redirect(w, r, originA.URL+"/loop", http.StatusTemporaryRedirect)
+		}))
+		defer targetB.Close()
+		targetBURL = targetB.URL
+
+		client, err := New(token, testConfig(originA.URL, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := client.newRequest(context.Background(), http.MethodGet, "/start", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.http.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+
+		if got := <-bKeySeen; got != "" {
+			t.Errorf("intermediate host B received token %q, want stripped", got)
+		}
+		if got := <-aKeySeen; got != token {
+			t.Errorf("loop-back hop to A carried %q, want %q kept", got, token)
+		}
+	})
+
+	t.Run("three-hop limit", func(t *testing.T) {
+		targetC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/final", http.StatusTemporaryRedirect)
+		}))
+		defer targetC.Close()
+		targetB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, targetC.URL+"/c", http.StatusTemporaryRedirect)
+		}))
+		defer targetB.Close()
+		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, targetB.URL+"/b", http.StatusTemporaryRedirect)
+		}))
+		defer origin.Close()
+
+		client, err := New(token, testConfig(origin.URL, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := client.newRequest(context.Background(), http.MethodGet, "/start", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.http.Do(req)
+		if err == nil {
+			t.Fatal("3-redirect chain succeeded, want too-many-redirects error")
+		}
+		if !strings.Contains(err.Error(), "too many redirects") {
+			t.Errorf("err = %v, want too many redirects", err)
+		}
+	})
+
+	t.Run("port-differing same-host strips token", func(t *testing.T) {
+		keySeen := make(chan string, 1)
+		otherPort := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			keySeen <- r.Header.Get("x-codebuff-api-key")
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer otherPort.Close()
+		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, otherPort.URL+"/final", http.StatusTemporaryRedirect)
+		}))
+		defer origin.Close()
+
+		client, err := New(token, testConfig(origin.URL, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := client.newRequest(context.Background(), http.MethodGet, "/start", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.http.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		// Pin current behavior: Go's Host includes the port, so a different
+		// port is treated as cross-host and the token is dropped.
+		if got := <-keySeen; got != "" {
+			t.Errorf("port-differing hop carried token %q, want stripped", got)
+		}
+	})
+}
+
+// TestNewWithIndexPrecedence guards the proxy precedence combos (G8):
+// SOCKS5_PROXIES > SOCKS5_PROXY > HTTP_PROXY, and the winner disables the
+// env-proxy path.
+func TestNewWithIndexPrecedence(t *testing.T) {
+	t.Run("socks proxies beat single socks proxy", func(t *testing.T) {
+		client, err := NewWithIndex("tok", 0, testConfig("", func(c *config.Config) {
+			c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
+			c.SOCKS5Proxy = "socks5://127.0.0.1:9999"
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(client.socksProxies) != 2 || len(client.socksDialers) != 2 {
+			t.Fatalf("socksProxies = %v, want the SOCKS5_PROXIES list", client.socksProxies)
+		}
+		tr := client.http.Transport.(*http.Transport)
+		if tr.Proxy != nil {
+			t.Error("env HTTP proxy not disabled when SOCKS5_PROXIES wins")
+		}
+		if !tr.DisableKeepAlives {
+			t.Error("multi-proxy rotation should disable keep-alives")
+		}
+	})
+
+	t.Run("socks proxies beat http proxy", func(t *testing.T) {
+		client, err := NewWithIndex("tok", 0, testConfig("", func(c *config.Config) {
+			c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001"}
+			c.HTTPProxy = "http://127.0.0.1:9999"
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr := client.http.Transport.(*http.Transport)
+		if tr.Proxy != nil {
+			t.Error("HTTP_PROXY applied even though SOCKS5_PROXIES wins")
+		}
+	})
+
+	t.Run("single socks proxy beats http proxy", func(t *testing.T) {
+		client, err := NewWithIndex("tok", 0, testConfig("", func(c *config.Config) {
+			c.SOCKS5Proxy = "socks5://127.0.0.1:9999"
+			c.HTTPProxy = "http://127.0.0.1:9998"
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(client.socksProxies) != 0 {
+			t.Errorf("socksProxies = %v, want empty for the singular SOCKS5_PROXY", client.socksProxies)
+		}
+		tr := client.http.Transport.(*http.Transport)
+		if tr.Proxy != nil {
+			t.Error("HTTP_PROXY applied even though SOCKS5_PROXY wins")
+		}
+		if tr.DialContext == nil {
+			t.Error("SOCKS5 dialer not wired into DialContext")
+		}
+	})
+}
+
+// socks5TestServer is a minimal RFC 1928 SOCKS5 server (optional RFC 1929
+// username/password auth) used to observe which proxy actually gets dialed
+// and which credentials arrive.
+type socks5TestServer struct {
+	ln          net.Listener
+	requireAuth bool
+	user, pass  string
+
+	mu        sync.Mutex
+	conns     int
+	gotUser   string
+	gotPass   string
+	authFails int
+}
+
+func newSocks5TestServer(t *testing.T, requireAuth bool, user, pass string) *socks5TestServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("socks5 listen: %v", err)
+	}
+	s := &socks5TestServer{ln: ln, requireAuth: requireAuth, user: user, pass: pass}
+	go s.serve()
+	t.Cleanup(func() { _ = ln.Close() })
+	return s
+}
+
+func (s *socks5TestServer) Addr() string { return s.ln.Addr().String() }
+
+func (s *socks5TestServer) serve() {
+	for {
+		c, err := s.ln.Accept()
+		if err != nil {
+			return
+		}
+		go s.handle(c)
+	}
+}
+
+func (s *socks5TestServer) handle(c net.Conn) {
+	defer c.Close()
+	br := bufio.NewReader(c)
+
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(br, hdr); err != nil || hdr[0] != 5 {
+		return
+	}
+	methods := make([]byte, int(hdr[1]))
+	if _, err := io.ReadFull(br, methods); err != nil {
+		return
+	}
+	if s.requireAuth {
+		if _, err := c.Write([]byte{5, 2}); err != nil {
+			return
+		}
+		ahdr := make([]byte, 2)
+		if _, err := io.ReadFull(br, ahdr); err != nil || ahdr[0] != 1 {
+			return
+		}
+		uname := make([]byte, int(ahdr[1]))
+		if _, err := io.ReadFull(br, uname); err != nil {
+			return
+		}
+		phdr := make([]byte, 1)
+		if _, err := io.ReadFull(br, phdr); err != nil {
+			return
+		}
+		pw := make([]byte, int(phdr[0]))
+		if _, err := io.ReadFull(br, pw); err != nil {
+			return
+		}
+		s.mu.Lock()
+		s.gotUser, s.gotPass = string(uname), string(pw)
+		s.mu.Unlock()
+		if string(uname) != s.user || string(pw) != s.pass {
+			s.mu.Lock()
+			s.authFails++
+			s.mu.Unlock()
+			_, _ = c.Write([]byte{1, 1})
+			return
+		}
+		if _, err := c.Write([]byte{1, 0}); err != nil {
+			return
+		}
+	} else if _, err := c.Write([]byte{5, 0}); err != nil {
+		return
+	}
+
+	req := make([]byte, 3)
+	if _, err := io.ReadFull(br, req); err != nil || req[0] != 5 || req[1] != 1 {
+		return
+	}
+	atyp := make([]byte, 1)
+	if _, err := io.ReadFull(br, atyp); err != nil {
+		return
+	}
+	var host string
+	switch atyp[0] {
+	case 1:
+		b := make([]byte, 4)
+		if _, err := io.ReadFull(br, b); err != nil {
+			return
+		}
+		host = net.IP(b).String()
+	case 3:
+		l := make([]byte, 1)
+		if _, err := io.ReadFull(br, l); err != nil {
+			return
+		}
+		b := make([]byte, int(l[0]))
+		if _, err := io.ReadFull(br, b); err != nil {
+			return
+		}
+		host = string(b)
+	case 4:
+		b := make([]byte, 16)
+		if _, err := io.ReadFull(br, b); err != nil {
+			return
+		}
+		host = net.IP(b).String()
+	default:
+		return
+	}
+	port := make([]byte, 2)
+	if _, err := io.ReadFull(br, port); err != nil {
+		return
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(port))))
+
+	up, err := net.Dial("tcp", target)
+	if err != nil {
+		_, _ = c.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer up.Close()
+	if _, err := c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.conns++
+	s.mu.Unlock()
+	done := make(chan struct{}, 1)
+	go func() {
+		_, _ = io.Copy(up, br)
+		done <- struct{}{}
+	}()
+	_, _ = io.Copy(c, up)
+	<-done
+}
+
+// TestSocks5UserinfoDialThrough is the regression test for Audit B2 (fix 4):
+// an authenticated socks5://user:pass@ URL must actually authenticate against
+// a proxy that requires it, and the credentials must arrive intact.
+func TestSocks5UserinfoDialThrough(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`)
+
+	srv := newSocks5TestServer(t, true, "alice", "s3cret")
+	client, err := New("tok", testConfig(mock.URL(), func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://alice:s3cret@" + srv.Addr()}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("chat through authenticated proxy failed: %v", err)
+	}
+	_ = rc.Close()
+
+	srv.mu.Lock()
+	gotUser, gotPass, conns, fails := srv.gotUser, srv.gotPass, srv.conns, srv.authFails
+	srv.mu.Unlock()
+	if gotUser != "alice" || gotPass != "s3cret" {
+		t.Errorf("proxy saw auth %q/%q, want alice/s3cret (userinfo must reach the SOCKS5 handshake)", gotUser, gotPass)
+	}
+	if conns != 1 || fails != 0 {
+		t.Errorf("proxy conns=%d authFails=%d, want 1/0", conns, fails)
+	}
+}
+
+// TestProxyRotationActualConnections exercises PROXY_ROTATION end to end
+// (E2E flow 4): with round-robin across two SOCKS5 proxies, each chat
+// request actually dials a different proxy (DisableKeepAlives forces the
+// re-dial), and every request reaches the upstream.
+func TestProxyRotationActualConnections(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`)
+
+	s1 := newSocks5TestServer(t, false, "", "")
+	s2 := newSocks5TestServer(t, false, "", "")
+	client, err := New("tok", testConfig(mock.URL(), func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://" + s1.Addr(), "socks5://" + s2.Addr()}
+		c.ProxyRotation = "round-robin"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatalf("chat through rotated proxy failed: %v", err)
+		}
+		_ = rc.Close()
+	}
+	s1.mu.Lock()
+	c1 := s1.conns
+	s1.mu.Unlock()
+	s2.mu.Lock()
+	c2 := s2.conns
+	s2.mu.Unlock()
+	if c1 != 1 || c2 != 1 {
+		t.Errorf("proxy connections = %d/%d, want 1/1 (each request must land on a different proxy)", c1, c2)
+	}
+	if mock.Requests != 2 {
+		t.Errorf("upstream requests = %d, want 2", mock.Requests)
+	}
+}
+
+// TestProxyIndexForZeroProxies guards the division-by-zero fix (fix 3, Audit
+// B4): proxyIndexFor must not panic with zero proxies, with or without a
+// stashed (out-of-range) index in the context.
+func TestProxyIndexForZeroProxies(t *testing.T) {
+	client, err := New("tok", testConfig("", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.proxyIndexFor(context.Background()); got != 0 {
+		t.Errorf("proxyIndexFor(bare ctx) = %d, want 0", got)
+	}
+	stashed := context.WithValue(context.Background(), proxyIndexKey{}, 7)
+	if got := client.proxyIndexFor(stashed); got != 0 {
+		t.Errorf("proxyIndexFor(stashed 7, no proxies) = %d, want 0 (no panic)", got)
+	}
+}
+
+// TestFailedReplayMetricsDisagreement pins the current metrics behavior on a
+// failed body replay (Audit B3, NOT fixed): the pinned fingerprint is rotated
+// and counted BEFORE the replay, so a failed replay leaves FingerprintRotations
+// incremented with no TransientRetries and the profile permanently swapped.
+func TestFailedReplayMetricsDisagreement(t *testing.T) {
+	client, rt := newRetryClient(t, "", 1, "chrome126")
+	rt.failN = 1
+	rt.err = errors.New("tls handshake failed")
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		"http://example.com/api/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.GetBody = func() (io.ReadCloser, error) { return nil, errors.New("replay body unavailable") }
+
+	// With the replay failing, do() surfaces the transient error directly
+	// (no second attempt fires): the rotation already happened, the retry
+	// did not.
+	_, cfn, err := client.do(req, 0)
+	if err == nil {
+		t.Fatal("expected the transient error to surface when the body cannot be replayed")
+	}
+	if cfn != nil {
+		defer cfn()
+	}
+
+	if got := client.FingerprintRotations(); got != 1 {
+		t.Errorf("FingerprintRotations = %d, want 1 (rotation precedes the replay)", got)
+	}
+	if got := client.TransientRetries(); got != 0 {
+		t.Errorf("TransientRetries = %d, want 0 (no retry fired)", got)
+	}
+	if got := client.currentStealthProfile().ID; got != stealth.ProfileIDSafari18 {
+		t.Errorf("profile after failed replay = %s, want %s (permanently rotated)", got, stealth.ProfileIDSafari18)
+	}
+}
+
+// TestSessionCallUnknownStatus5xx pins current sessionCall behavior (G10):
+// any status code with a parseable body carrying a non-empty status field
+// yields a SessionState, not an error — even a 5xx with an unknown status.
+func TestSessionCallUnknownStatus5xx(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"status":"weird","message":"unknown status"}`)
+	}
+	client, err := New("tok", testConfig(mock.URL(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := client.CreateSession(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error for a parseable 5xx body: %v", err)
+	}
+	if st.Status != "weird" {
+		t.Errorf("status = %q, want weird", st.Status)
+	}
+}
+
+// TestEndSession404Tolerated guards the EndSession 404 contract (E2E flow
+// 10): a 404 DELETE is "nothing to end", not an error, while a 5xx is.
+func TestEndSession404Tolerated(t *testing.T) {
+	t.Run("404 tolerated", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":"session not found"}`)
+		}
+		client, err := New("tok", testConfig(mock.URL(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.EndSession(context.Background(), "inst-1"); err != nil {
+			t.Errorf("EndSession 404 = %v, want nil", err)
+		}
+	})
+
+	t.Run("5xx surfaces error", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"boom"}`)
+		}
+		client, err := New("tok", testConfig(mock.URL(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.EndSession(context.Background(), "inst-1"); err == nil {
+			t.Error("EndSession 500 succeeded, want error")
+		}
+	})
+}
+
+// TestClassify429ChatLevel guards 429 ip_capped/spend_limited bodies at the
+// chat level (G10): they classify as RateLimitError carrying the status.
+func TestClassify429ChatLevel(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantStatus string
+	}{
+		{"ip_capped", `{"status":"ip_capped","activeUsersForIp":5,"limit":4,"retryAfterMs":30000}`, "ip_capped"},
+		{"spend_limited", `{"status":"spend_limited","message":"Daily budget reached","retryAfterMs":60000}`, "spend_limited"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := classifyError(http.StatusTooManyRequests, tc.body, http.Header{})
+			var rle *RateLimitError
+			if !errors.As(err, &rle) {
+				t.Fatalf("err = %v, want RateLimitError", err)
+			}
+			if !errors.Is(err, ErrRateLimited) {
+				t.Errorf("err = %v, want ErrRateLimited", err)
+			}
+			if rle.Status != tc.wantStatus {
+				t.Errorf("RateLimitError.Status = %q, want %q", rle.Status, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// TestChatNonObjectBodyAndGzipError guards G12: a non-object chat body is
+// rejected at the envelope stage, and a gzip-compressed 4xx error body is
+// drained and decompressed before classification.
+func TestChatNonObjectBodyAndGzipError(t *testing.T) {
+	t.Run("non-object body rejected", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		client, err := New("tok", testConfig(mock.URL(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`[1,2,3]`))
+		if err == nil {
+			t.Fatal("array chat body accepted, want envelope error")
+		}
+		if !strings.Contains(err.Error(), "envelope") {
+			t.Errorf("err = %v, want an envelope error", err)
+		}
+		if mock.Requests != 0 {
+			t.Errorf("upstream hit %d times for a rejected body, want 0", mock.Requests)
+		}
+	})
+
+	t.Run("gzip 4xx body decompressed before classify", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusTooManyRequests)
+			zw := gzip.NewWriter(w)
+			_, _ = zw.Write([]byte(`{"status":"rate_limited","retryAfterMs":60000}`))
+			_ = zw.Close()
+		}
+		client, err := New("tok", testConfig(mock.URL(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`{"model":"m"}`))
+		if !errors.Is(err, ErrRateLimited) {
+			t.Errorf("err = %v, want ErrRateLimited (gzip body must be decompressed before classification)", err)
+		}
+	})
+}
+
+// TestChatRetriesRealDialFailure is E2E flow 1: a real transport failure
+// (the listener accepts then hangs up mid-request) is retried over a fresh
+// connection with a byte-identical replayed body, and the SSE stream reads
+// back cleanly.
+func TestChatRetriesRealDialFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	bodies := make(chan []byte, 2)
+	sse := testutil.SSEEvent(`{"id":"c0","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`) +
+		"data: [DONE]\n\n"
+
+	go func() {
+		for i := 0; i < 2; i++ {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			br := bufio.NewReader(conn)
+			req, err := http.ReadRequest(br)
+			if err != nil {
+				// Keep accepting: the retry still needs a second connection.
+				_ = conn.Close()
+				continue
+			}
+			body, _ := io.ReadAll(req.Body)
+			_ = req.Body.Close()
+			bodies <- body
+			if i == 0 {
+				// Swallow the first request, then hang up: the client sees
+				// a transport-level EOF and must retry.
+				_ = conn.Close()
+				continue
+			}
+			resp := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: " +
+				strconv.Itoa(len(sse)) + "\r\nConnection: close\r\n\r\n" + sse
+			_, _ = conn.Write([]byte(resp))
+			_ = conn.Close()
+		}
+	}()
+
+	client, err := New("tok", testConfig("http://"+ln.Addr().String(), func(c *config.Config) {
+		c.TransientRetries = 1
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.retryBackoff = func() time.Duration { return time.Millisecond }
+
+	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"},
+		[]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("chat failed after retry: %v", err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("stream read: %v", err)
+	}
+	_ = rc.Close()
+	if !strings.Contains(string(data), `"content":"hi"`) {
+		t.Errorf("stream missing expected chunk: %s", data)
+	}
+	if got := client.TransientRetries(); got != 1 {
+		t.Errorf("TransientRetries = %d, want 1", got)
+	}
+
+	first := <-bodies
+	second := <-bodies
+	if !bytes.Equal(first, second) {
+		t.Errorf("replayed body differs:\n first: %s\nsecond: %s", first, second)
+	}
+}
+
+// TestRetryRotatesFingerprintAtDialLayer is E2E flow 5: after a transient
+// retry, the transport dials with the rotated profile's ClientHello — the
+// dial-layer profile capture must show chrome126 then safari18.
+func TestRetryRotatesFingerprintAtDialLayer(t *testing.T) {
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`))
+	}))
+	defer tlsSrv.Close()
+
+	client, err := New("tok", testConfig(tlsSrv.URL, func(c *config.Config) {
+		c.TLSFingerprint = "chrome126"
+		c.TransientRetries = 1
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.retryBackoff = func() time.Duration { return time.Millisecond }
+
+	tr := client.http.Transport.(*http.Transport)
+	var mu sync.Mutex
+	var dials []stealth.ProfileID
+	var dialCount int
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		prof := client.dialProfileFor(ctx)
+		mu.Lock()
+		dialCount++
+		dials = append(dials, prof.ID)
+		mu.Unlock()
+		if dialCount == 1 {
+			return nil, errors.New("tls handshake failed: injected first-dial failure")
+		}
+		if prof.ID == stealth.ProfileIDSafari18 {
+			// The package-level Safari profile shares one mutable
+			// utls.ClientHelloSpec that the first utls handshake corrupts
+			// (KeyShareExtension data is written in place), so a second
+			// real dial through the shared spec is flaky (pre-existing
+			// stealth bug, reported separately). Dial with utls's own
+			// built-in Safari preset instead — still a Safari-family
+			// fingerprint — while the rotation DECISION (chrome126 ->
+			// safari18) is pinned by the captured profile IDs.
+			p := *prof
+			p.ClientHelloID = utls.HelloSafari_16_0
+			p.CustomSpec = nil
+			prof = &p
+		}
+		// Production hard-codes InsecureSkipVerify=false; the local test
+		// server's self-signed cert requires true.
+		return stealth.Dialer(prof, nil, true)(ctx, network, addr)
+	}
+
+	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("chat failed: %v", err)
+	}
+	_, _ = io.ReadAll(rc)
+	_ = rc.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dials) != 2 || dials[0] != stealth.ProfileIDChrome126 || dials[1] != stealth.ProfileIDSafari18 {
+		t.Errorf("dialed profiles = %v, want [chrome126 safari18]", dials)
+	}
+	if got := client.TransientRetries(); got != 1 {
+		t.Errorf("TransientRetries = %d, want 1", got)
+	}
+	if got := client.FingerprintRotations(); got != 1 {
+		t.Errorf("FingerprintRotations = %d, want 1", got)
+	}
+}
+
+// TestConnectTunnelStealthRealSockets is E2E flow 6: HTTP_PROXY with
+// credentials plus a pinned TLS fingerprint routes the origin TLS through a
+// CONNECT tunnel over real sockets, authenticating to the proxy.
+func TestConnectTunnelStealthRealSockets(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"tunneled"},"finish_reason":null}]}`))
+	}))
+	defer origin.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	proxyAddr := ln.Addr().String()
+	authSeen := make(chan string, 1)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				authSeen <- req.Header.Get("Proxy-Authorization")
+				up, err := net.Dial("tcp", req.Host)
+				if err != nil {
+					return
+				}
+				defer up.Close()
+				_, _ = io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n")
+				done := make(chan struct{}, 1)
+				go func() {
+					_, _ = io.Copy(up, br)
+					done <- struct{}{}
+				}()
+				_, _ = io.Copy(c, up)
+				<-done
+			}(c)
+		}
+	}()
+
+	proxyURL := "http://user:pass@" + proxyAddr
+	client, err := New("tok", testConfig(origin.URL, func(c *config.Config) {
+		c.HTTPProxy = proxyURL
+		c.TLSFingerprint = "chrome126"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := client.http.Transport.(*http.Transport)
+	pu, _ := url.Parse(proxyURL)
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		prof := client.dialProfileFor(ctx)
+		// InsecureSkipVerify=true only because the local origin is
+		// self-signed; production hard-codes false.
+		return stealth.Dialer(prof, httpConnectDial(pu), true)(ctx, network, addr)
+	}
+
+	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("chat through CONNECT tunnel failed: %v", err)
+	}
+	data, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if !strings.Contains(string(data), `"content":"tunneled"`) {
+		t.Errorf("stream missing tunneled chunk: %s", data)
+	}
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass"))
+	if got := <-authSeen; got != wantAuth {
+		t.Errorf("CONNECT Proxy-Authorization = %q, want %q", got, wantAuth)
+	}
+}
+
+// TestFullChatLifecycleChained is E2E flow 7: create session, start run,
+// chat (with instance-id + envelope), finish run, end session — in one
+// chain, asserting the instance/run ids thread through.
+func TestFullChatLifecycleChained(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"lifecycle"},"finish_reason":null}]}`)
+
+	client, err := New("tok-a", testConfig(mock.URL(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	st, err := client.CreateSession(ctx)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if st.Status != "active" || st.InstanceID == "" {
+		t.Fatalf("session = %+v, want active with an instance id", st)
+	}
+
+	runID, err := client.StartRun(ctx, "agent-1")
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if runID == "" {
+		t.Fatal("StartRun returned an empty run id")
+	}
+
+	rc, err := client.ChatCompletions(ctx, ChatOptions{Model: "m", RunID: runID, SessionInstanceID: st.InstanceID},
+		[]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	data, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if !strings.Contains(string(data), `"content":"lifecycle"`) {
+		t.Errorf("stream missing chunk: %s", data)
+	}
+	if len(mock.RecordedChatHeaders) != 1 {
+		t.Fatalf("recorded chat headers = %d, want 1", len(mock.RecordedChatHeaders))
+	}
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-instance-id"); got != st.InstanceID {
+		t.Errorf("chat x-freebuff-instance-id = %q, want %q", got, st.InstanceID)
+	}
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "m" {
+		t.Errorf("chat x-freebuff-model = %q, want m", got)
+	}
+	if !mock.BodyContains(`"freebuff_instance_id":"` + st.InstanceID + `"`) {
+		t.Error("chat body missing freebuff_instance_id in codebuff_metadata")
+	}
+	if !mock.BodyContains(`"run_id":"` + runID + `"`) {
+		t.Error("chat body missing run_id in codebuff_metadata")
+	}
+
+	if err := client.FinishRun(ctx, runID, 3); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	if err := client.EndSession(ctx, st.InstanceID); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+
+	if mock.SessionCreates != 1 || mock.SessionEnds != 1 {
+		t.Errorf("session creates/ends = %d/%d, want 1/1", mock.SessionCreates, mock.SessionEnds)
+	}
+	if got := mock.StartedRunsSnapshot(); len(got) != 1 || got[0] != "agent-1" {
+		t.Errorf("started runs = %v, want [agent-1]", got)
+	}
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 1 || finished[0].RunID != runID || finished[0].TotalSteps != 3 {
+		t.Errorf("finished runs = %+v, want run %s with 3 steps", finished, runID)
+	}
+}
+
+// TestCompactHeartbeatAbsentTolerant is E2E flow 8: a compact heartbeat poll
+// without quota/offer fields parses cleanly with nil maps.
+func TestCompactHeartbeatAbsentTolerant(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	gotCompact := make(chan string, 1)
+	gotHeartbeat := make(chan string, 1)
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		gotCompact <- r.Header.Get("x-freebuff-compact-session")
+		gotHeartbeat <- r.Header.Get("x-freebuff-heartbeat")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-1","expiresAt":"2026-08-17T10:00:00.000Z"}`)
+	}
+
+	client, err := New("tok", testConfig(mock.URL(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true, true)
+	if err != nil {
+		t.Fatalf("compact heartbeat poll: %v", err)
+	}
+	if st.Status != "active" || st.InstanceID != "inst-1" {
+		t.Errorf("state = %+v, want active inst-1", st)
+	}
+	if st.RateLimitsByModel != nil {
+		t.Errorf("RateLimitsByModel = %v, want nil on a compact poll without quotas", st.RateLimitsByModel)
+	}
+	if st.LimitedModelOffers != nil {
+		t.Errorf("LimitedModelOffers = %v, want nil on a compact poll without offers", st.LimitedModelOffers)
+	}
+	if got := <-gotCompact; got != "1" {
+		t.Errorf("compact header = %q, want 1", got)
+	}
+	if got := <-gotHeartbeat; got != "1" {
+		t.Errorf("heartbeat header = %q, want 1", got)
 	}
 }

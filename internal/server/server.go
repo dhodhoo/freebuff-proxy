@@ -133,7 +133,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/mode", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleModeSwitch)))))
 	mux.Handle("POST /admin/diag", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleDiag)))))
 	mux.Handle("POST /admin/smoke", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleSmoke)))))
-	mux.Handle("GET /admin/assets/", http.StripPrefix("/admin/assets/", noDirListing(http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
+	// noDirListing must wrap StripPrefix, not the other way around: after
+	// the strip the path is "" and a trailing-slash directory request would
+	// slip past the guard into FileServerFS, which renders a listing.
+	mux.Handle("GET /admin/assets/", noDirListing(http.StripPrefix("/admin/assets/", http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -887,12 +890,22 @@ func (s *Server) handleTokenAdd(w http.ResponseWriter, r *http.Request) {
 	s.adminSaveMu.Lock()
 	defer s.adminSaveMu.Unlock()
 
+	cfg := s.cfg.Load()
+	// Divergence guard (mirrors handleTokenRemove): a config-editor
+	// AUTH_TOKENS edit or /admin/reload can diverge cfg.AuthTokens from the
+	// live pool. Adding to a stale list would persist cfg.AuthTokens+new to
+	// .env while the pool holds its own list, leaving pool/.env/cfg
+	// permanently divergent — and the next remove is rejected by the same
+	// guard, stranding the operator until restart.
+	if len(cfg.AuthTokens) != s.pool.TokenCount() {
+		s.dash.RenderConfigResult(w, r, false, "AUTH_TOKENS in .env differs from the live pool — reconcile in the Config editor or restart.")
+		return
+	}
 	idx, err := s.pool.AddToken(req.Token)
 	if err != nil {
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
 	}
-	cfg := s.cfg.Load()
 	tokens := append(append([]string{}, cfg.AuthTokens...), req.Token)
 	if err := s.syncTokensAfterMutation(tokens); err != nil {
 		_ = s.pool.RemoveLastToken()
@@ -1204,6 +1217,17 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 			s.dash.RenderConfigResult(w, r, false, "Failed to read request body.")
 			return
 		}
+	}
+
+	// Guard: an empty payload (urlencoded POST without content=, or an empty
+	// text/plain body) must never write an empty .env. config.Load succeeds
+	// on an empty file with built-in defaults, so the write would silently
+	// wipe the operator's AUTH_TOKENS/ADMIN_TOKEN/API_KEYS/SAFE_MODE while
+	// reporting a green "Saved and reloaded". Reject it and leave the file
+	// untouched.
+	if len(bytes.TrimSpace(content)) == 0 {
+		s.dash.RenderConfigResult(w, r, false, "Configuration rejected: empty .env content — nothing to save.")
+		return
 	}
 
 	s.adminSaveMu.Lock()

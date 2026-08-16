@@ -489,6 +489,11 @@ func loadRaw(configPath string) (rawConfig, error) {
 		if err != nil {
 			return rawConfig{}, fmt.Errorf("read config file: %w", err)
 		}
+		// Strip a leading UTF-8 BOM (Windows editors/PowerShell writers add
+		// one) or json.Unmarshal fails with "invalid character '\ufeff'".
+		// Every other file reader in the package (discoverCLIToken,
+		// parseDotenv) already strips it; this was the missed case (B3).
+		data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return rawConfig{}, fmt.Errorf("parse config file: %w", err)
 		}

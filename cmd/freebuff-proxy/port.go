@@ -96,25 +96,39 @@ func unixPortPID(port string) string {
 	if pid := execFirstOutput("lsof", "-ti", ":"+port, "-sTCP:LISTEN"); pid != "" {
 		return pid
 	}
-	if pid := execFirstOutput("ss", "-ltnp", "sport = :"+port); pid != "" {
-		// ss output: "LISTEN 0 128 0.0.0.0:3457 0.0.0.0:* users:(("proc",pid=1234,fd=5))"
-		for _, line := range strings.Split(pid, "\n") {
-			if i := strings.Index(line, "pid="); i >= 0 {
-				rest := line[i+4:]
-				if j := strings.IndexAny(rest, ",)"); j >= 0 {
-					rest = rest[:j]
-				}
-				if rest != "" {
-					return rest
-				}
+	if out := execFirstOutput("ss", "-ltnp", "sport = :"+port); out != "" {
+		return ssPortPID(out)
+	}
+	return busyboxPortPID(execFirstOutput("netstat", "-ltnp"), port)
+}
+
+// ssPortPID extracts the first "pid=N" from ss -ltnp output, e.g.
+// "LISTEN 0 128 0.0.0.0:3457 0.0.0.0:* users:(("proc",pid=1234,fd=5))".
+// Pure so the parsing is testable without the ss binary.
+func ssPortPID(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if i := strings.Index(line, "pid="); i >= 0 {
+			rest := line[i+len("pid="):]
+			if j := strings.IndexAny(rest, ",)"); j >= 0 {
+				rest = rest[:j]
+			}
+			if rest != "" {
+				return rest
 			}
 		}
-		return ""
 	}
-	// busybox netstat -ltnp output:
-	//   tcp  0  0 0.0.0.0:3457 0.0.0.0:*  LISTEN  1234/program
-	// State is field 5; the last field is "PID/program" — strip the name.
-	for _, line := range strings.Split(execFirstOutput("netstat", "-ltnp"), "\n") {
+	return ""
+}
+
+// busyboxPortPID extracts the LISTENING pid for port from busybox netstat
+// -ltnp output:
+//
+//	tcp  0  0 0.0.0.0:3457 0.0.0.0:*  LISTEN  1234/program
+//
+// State is field 5; the last field is "PID/program" — the name is stripped.
+// Pure so the parsing is testable without the netstat binary.
+func busyboxPortPID(out, port string) string {
+	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 7 && strings.HasPrefix(f[0], "tcp") && strings.Contains(f[5], "LISTEN") && strings.HasSuffix(f[3], ":"+port) {
 			if pid, _, ok := strings.Cut(f[len(f)-1], "/"); ok && pid != "" {

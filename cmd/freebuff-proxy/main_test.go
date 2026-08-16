@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"flag"
+	"log/slog"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/egress"
 )
 
@@ -155,4 +161,207 @@ func TestEgressCacheTTL(t *testing.T) {
 	if _, ok := c.Get("direct"); !ok {
 		t.Error("re-Set entry not returned")
 	}
+}
+
+// TestEgressPaths pins the probe-path construction (the cmd package's
+// highest-value pure function): index 0 is ALWAYS the direct connection,
+// each parseable SOCKS5_PROXIES entry gets a "proxy-<index>" key with its
+// ORIGINAL index (gaps after skipped entries stay visible), and
+// unparseable proxies are skipped with a warning (fail-open) — never
+// killing the direct probe.
+func TestEgressPaths(t *testing.T) {
+	newLogger := func() (*bytes.Buffer, *slog.Logger) {
+		var buf bytes.Buffer
+		h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+		return &buf, slog.New(h)
+	}
+
+	t.Run("no proxies: direct only", func(t *testing.T) {
+		_, logger := newLogger()
+		paths := egressPaths(&config.Config{}, logger)
+		if len(paths) != 1 {
+			t.Fatalf("paths = %d, want 1 (direct only)", len(paths))
+		}
+		if paths[0].Key != "direct" {
+			t.Errorf("paths[0].Key = %q, want direct", paths[0].Key)
+		}
+	})
+
+	t.Run("direct always first, proxies in order", func(t *testing.T) {
+		_, logger := newLogger()
+		cfg := &config.Config{SOCKS5Proxies: []string{"127.0.0.1:9050", "127.0.0.1:9051"}}
+		paths := egressPaths(cfg, logger)
+		if len(paths) != 3 {
+			t.Fatalf("paths = %d, want 3 (direct + 2 proxies)", len(paths))
+		}
+		for i, want := range []string{"direct", "proxy-0", "proxy-1"} {
+			if paths[i].Key != want {
+				t.Errorf("paths[%d].Key = %q, want %q", i, paths[i].Key, want)
+			}
+		}
+	})
+
+	t.Run("invalid SOCKS5 skipped with warning, direct survives", func(t *testing.T) {
+		buf, logger := newLogger()
+		cfg := &config.Config{SOCKS5Proxies: []string{"", "socks5://", "127.0.0.1:9050"}}
+		paths := egressPaths(cfg, logger)
+		if len(paths) != 2 {
+			t.Fatalf("paths = %d, want 2 (direct + one valid proxy)", len(paths))
+		}
+		if paths[0].Key != "direct" || paths[1].Key != "proxy-2" {
+			t.Errorf("keys = [%q, %q], want [direct proxy-2] (original index kept)", paths[0].Key, paths[1].Key)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "skipping invalid SOCKS5 proxy") {
+			t.Errorf("no skip warning logged: %q", out)
+		}
+		for _, idx := range []string{"index=0", "index=1"} {
+			if !strings.Contains(out, idx) {
+				t.Errorf("warning missing %s: %q", idx, out)
+			}
+		}
+	})
+
+	t.Run("valid socks5:// URL accepted", func(t *testing.T) {
+		_, logger := newLogger()
+		cfg := &config.Config{SOCKS5Proxies: []string{"socks5://user:pass@127.0.0.1:1080"}}
+		paths := egressPaths(cfg, logger)
+		if len(paths) != 2 || paths[1].Key != "proxy-0" {
+			t.Fatalf("paths = %+v, want direct + proxy-0", paths)
+		}
+	})
+}
+
+// TestVersionFlagPrintsVersion re-executes the test binary with -version
+// (main() os.Exit's, so it cannot run in-process) and pins the output:
+// "freebuff-proxy <version>" on stdout, exit 0.
+func TestVersionFlagPrintsVersion(t *testing.T) {
+	if os.Getenv("GO_WANT_VERSION_HELPER") == "1" {
+		// Re-executed: the test framework already consumed -test.* flags on
+		// the global flag set, so swap in a fresh set before running main.
+		flag.CommandLine = flag.NewFlagSet("freebuff-proxy", flag.ExitOnError)
+		os.Args = []string{"freebuff-proxy", "-version"}
+		main()
+		return // unreachable: main os.Exit(0)s
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestVersionFlagPrintsVersion$")
+	cmd.Env = append(os.Environ(), "GO_WANT_VERSION_HELPER=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helper exited with error: %v\n%s", err, out)
+	}
+	if want := "freebuff-proxy " + version; !strings.Contains(string(out), want) {
+		t.Errorf("output %q missing %q", out, want)
+	}
+}
+
+// TestModeFlagsExclusiveWarning pins the mutually-exclusive-mode warning:
+// 2+ of -doctor/-update/-setup/-test-token prints the warning (only the
+// first flag then runs), at most one set prints nothing.
+func TestModeFlagsExclusiveWarning(t *testing.T) {
+	cases := []struct {
+		name                   string
+		doctor, update, setup, testToken bool
+		want                   string
+	}{
+		{"none", false, false, false, false, ""},
+		{"single", false, false, true, false, ""},
+		{"two", true, false, true, false, "mutually exclusive"},
+		{"three", true, true, false, true, "mutually exclusive"},
+		{"all four", true, true, true, true, "mutually exclusive"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := modeFlagsExclusiveWarning(tc.doctor, tc.update, tc.setup, tc.testToken)
+			if tc.want == "" {
+				if got != "" {
+					t.Errorf("modeFlagsExclusiveWarning = %q, want empty", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) || !strings.HasPrefix(got, "freebuff-proxy: warning:") {
+				t.Errorf("modeFlagsExclusiveWarning = %q, want warning containing %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveLogLevel pins the effective log-level precedence: LOG_LEVEL
+// config wins when set and parseable (even over -v), -v → debug, else
+// info, and an unparseable LOG_LEVEL silently falls back to info.
+func TestResolveLogLevel(t *testing.T) {
+	cases := []struct {
+		name     string
+		logLevel string
+		verbose  bool
+		want     slog.Level
+	}{
+		{"empty not verbose", "", false, slog.LevelInfo},
+		{"empty verbose", "", true, slog.LevelDebug},
+		{"config wins", "warn", false, slog.LevelWarn},
+		{"config beats verbose", "error", true, slog.LevelError},
+		{"config case-insensitive", "DEBUG", false, slog.LevelDebug},
+		{"unparseable falls back to info", "bogus", true, slog.LevelInfo},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveLogLevel(tc.logLevel, tc.verbose); got != tc.want {
+				t.Errorf("resolveLogLevel(%q, %v) = %v, want %v", tc.logLevel, tc.verbose, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIgnoredExeAdjacentEnv pins the exe-adjacent .env warning branch: a
+// .env next to the executable is flagged ONLY when the working directory
+// differs from the executable's directory — the usual reason config "seems
+// to vanish" under a launcher. Same directory, a missing exe-adjacent
+// .env, or empty inputs must not warn.
+func TestIgnoredExeAdjacentEnv(t *testing.T) {
+	dir := t.TempDir()
+	exeDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(exeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(exeDir, "freebuff-proxy.exe")
+	envPath := filepath.Join(exeDir, ".env")
+	if err := os.WriteFile(envPath, []byte("A=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("same working directory", func(t *testing.T) {
+		if got := ignoredExeAdjacentEnv(exeDir, exe); got != "" {
+			t.Errorf("same dir returned %q, want empty", got)
+		}
+	})
+	t.Run("different cwd with exe-adjacent env", func(t *testing.T) {
+		work := filepath.Join(dir, "work")
+		if err := os.MkdirAll(work, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := ignoredExeAdjacentEnv(work, exe); got != envPath {
+			t.Errorf("cross-dir returned %q, want %q", got, envPath)
+		}
+	})
+	t.Run("no env next to exe", func(t *testing.T) {
+		cleanDir := filepath.Join(dir, "clean-bin")
+		if err := os.MkdirAll(cleanDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		work := filepath.Join(dir, "work2")
+		if err := os.MkdirAll(work, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := ignoredExeAdjacentEnv(work, filepath.Join(cleanDir, "other.exe")); got != "" {
+			t.Errorf("missing exe-adjacent env returned %q, want empty", got)
+		}
+	})
+	t.Run("empty inputs", func(t *testing.T) {
+		if got := ignoredExeAdjacentEnv("", exe); got != "" {
+			t.Errorf("empty cwd returned %q, want empty", got)
+		}
+		if got := ignoredExeAdjacentEnv(exeDir, ""); got != "" {
+			t.Errorf("empty exe path returned %q, want empty", got)
+		}
+	})
 }

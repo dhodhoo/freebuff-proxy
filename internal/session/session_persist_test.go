@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -364,6 +365,197 @@ func TestShutdownKeepAliveOnlyWhenResumable(t *testing.T) {
 			t.Errorf("store after Shutdown = %+v, want nil", got)
 		}
 	})
+}
+
+// TestShutdownPersistedDisabledNoEnd verifies a disabled session under
+// persistence is neither DELETE'd upstream nor persisted: there is no slot to
+// keep alive and nothing to resume.
+func TestShutdownPersistedDisabledNoEnd(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "disabled"
+	store := NewStore(filepath.Join(t.TempDir(), "state.json"))
+	mgr, key := newPersistTestManager(t, mock, store)
+
+	instance, err := mgr.EnsureSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "" {
+		t.Fatalf("instance = %q, want empty (disabled)", instance)
+	}
+
+	if err := mgr.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if mock.SessionEnds != 0 {
+		t.Errorf("SessionEnds = %d, want 0 (disabled: no upstream slot to release)", mock.SessionEnds)
+	}
+	if got := store.Load(key); got != nil {
+		t.Errorf("store after Shutdown = %+v, want nil (disabled sessions are never persisted)", got)
+	}
+}
+
+// TestRestartWithPersistedQueuedCreatesFresh verifies a persisted queued
+// entry is ignored on restart (pollPersisted only resumes active slots):
+// the manager falls through to a fresh create without polling, and the store
+// is eventually overwritten with the active session.
+func TestRestartWithPersistedQueuedCreatesFresh(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	store := NewStore(filepath.Join(t.TempDir(), "state.json"))
+	mgr, key := newPersistTestManager(t, mock, store)
+
+	store.Save(key, &cachedState{
+		status:     "queued",
+		instanceID: "inst-q",
+		model:      "m",
+		pollAt:     time.Now().Add(time.Hour),
+	})
+
+	var polls, creates atomic.Int32
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			polls.Add(1)
+			http.NotFound(w, r) // must not be reached; visible as a poll count
+		case http.MethodPost:
+			creates.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123","expiresAt":"2030-01-01T00:00:00Z"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	instance, err := mgr.EnsureSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-abc-123" {
+		t.Errorf("instance = %q, want inst-abc-123 (fresh create, queued slot not resumable)", instance)
+	}
+	if got := creates.Load(); got != 1 {
+		t.Errorf("creates = %d, want 1 (fresh create)", got)
+	}
+	if got := polls.Load(); got != 0 {
+		t.Errorf("polls = %d, want 0 (pollPersisted returns before any GET for a queued entry)", got)
+	}
+	if got := store.Load(key); got == nil || got.instanceID != "inst-abc-123" {
+		t.Errorf("store after create = %+v, want active inst-abc-123 (queued entry overwritten)", got)
+	}
+}
+
+// TestConcurrentInvalidateEnsureSession hammers Invalidate() against
+// EnsureSession from many goroutines (run with -race): the single-flight
+// refresh and invalidation must not race on the cached state, and the final
+// state must be a valid active session. Under this adversarial invalidation
+// load a caller may legitimately hit the designed bounded failure mode
+// ("not ready after repeated refreshes" — every refresh's commit was
+// invalidated before the caller could act); that error is allowed, any other
+// error is not.
+func TestConcurrentInvalidateEnsureSession(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	const workers = 8
+	const iterations = 100
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				if (w+i)%2 == 0 {
+					if _, err := mgr.EnsureSession(context.Background()); err != nil {
+						// Invalidate racing the commit starves the session:
+						// the outer budget is a designed bounded failure, not
+						// a race corruption.
+						if !strings.Contains(err.Error(), "not ready after repeated refreshes") {
+							t.Errorf("EnsureSession: %v", err)
+							return
+						}
+					}
+				} else {
+					mgr.Invalidate()
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// Final state must be a valid active session.
+	instance, err := mgr.EnsureSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-abc-123" {
+		t.Errorf("final instance = %q, want inst-abc-123", instance)
+	}
+}
+
+// TestPersistAdoptThenModelUnavailableDropsSlot covers the S5 edge: a fresh
+// manager ADOPTS a persisted compatible slot, then a live refresh for an
+// unavailable model drops the adopted slot (commit(nil)) and falls back to a
+// DefaultFallbackModel create — the persisted slot must not survive as a
+// stale store entry.
+func TestPersistAdoptThenModelUnavailableDropsSlot(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	store := NewStore(filepath.Join(t.TempDir(), "state.json"))
+	mgr, key := newPersistTestManager(t, mock, store)
+	store.Save(key, activeSlot("inst-A", "model/A"))
+
+	var mu sync.Mutex
+	var createdModels []string
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-A","model":"model/A","expiresAt":"2030-01-01T00:00:00Z"}`)
+		case http.MethodPost:
+			model := r.Header.Get("x-freebuff-model")
+			mu.Lock()
+			createdModels = append(createdModels, model)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if model == "rare/model" {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = io.WriteString(w, `{"status":"model_unavailable","requestedModel":"rare/model"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-fallback","model":"`+model+`","expiresAt":"2030-01-01T00:00:00Z"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	// Fresh manager: the persisted model/A slot is adopted (no create).
+	if _, err := mgr.EnsureSessionForModel(context.Background(), "model/A"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	afterAdopt := len(createdModels)
+	mu.Unlock()
+	if afterAdopt != 0 {
+		t.Errorf("creates after adopt = %d, want 0 (persisted slot adopted, not created)", afterAdopt)
+	}
+
+	// Live refresh for an unavailable model: fallback drops the adopted slot
+	// from the store and creates on the default fallback model.
+	if _, err := mgr.EnsureSessionForModel(context.Background(), "rare/model"); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Load(key); got == nil || got.instanceID != "inst-fallback" {
+		t.Errorf("store after fallback = %+v, want inst-fallback (adopted slot replaced)", got)
+	}
+	mu.Lock()
+	gotModels := append([]string(nil), createdModels...)
+	mu.Unlock()
+	if len(gotModels) != 2 || gotModels[0] != "rare/model" || gotModels[1] != DefaultFallbackModel {
+		t.Errorf("created models = %v, want [rare/model %s]", gotModels, DefaultFallbackModel)
+	}
 }
 
 // TestPersistStoreNotConsultedOnLiveRefresh verifies the store is only

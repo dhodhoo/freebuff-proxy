@@ -68,6 +68,12 @@ func (r *Ring) push(timeStr, level, message string, fields []string) {
 func (r *Ring) recent(n int) []Entry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if n < 0 {
+		// S9: a negative count must return empty, not panic in make with a
+		// negative capacity. No in-repo caller passes one, but this is a
+		// public API (dashboard Recent(200)).
+		n = 0
+	}
 	if n > r.filled {
 		n = r.filled
 	}

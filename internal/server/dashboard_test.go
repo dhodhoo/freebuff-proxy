@@ -155,6 +155,10 @@ func TestDashboardLoginFlow(t *testing.T) {
 
 	// Correct token: redirect to /admin plus the session cookie.
 	resp = postLogin(t, ts.URL+"/admin/login", "secret")
+	// Drain and close the redirect body (it has none) so the connection is
+	// released back to the client pool instead of leaking per run.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("login status = %d, want 302", resp.StatusCode)
 	}
@@ -211,8 +215,11 @@ func TestDashboardAssetsPublic(t *testing.T) {
 // client; a remote client gets 403, not the .env.
 func TestDashboardConfigLoopbackGate(t *testing.T) {
 	ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.AdminToken = "" }, testutil.NewMock())
-	// httptest.NewRequest defaults RemoteAddr to a non-loopback address.
 	req := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+	// Pin a non-loopback client explicitly: the loopback gate reads
+	// RemoteAddr, and httptest.NewRequest's default (192.0.2.1) is
+	// undocumented behavior a toolchain change could flip.
+	req.RemoteAddr = "203.0.113.9:1234"
 	rec := httptest.NewRecorder()
 	ts.Config.Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
@@ -640,10 +647,39 @@ func TestDashboardTokenAddPreservesCRLF(t *testing.T) {
 }
 
 // Concurrent token adds must not lose updates: adminSaveMu serializes the
-// cfg read + .env write + reload, so every added token lands in .env.
+// cfg read + .env write + reload, so every added token lands in .env, the
+// live pool, and the reloaded config — a lost pool token with a correct .env
+// (or vice versa) must fail here.
 func TestDashboardConcurrentTokenAdds(t *testing.T) {
 	t.Chdir(t.TempDir())
-	ts := dashboardServer(t, "secret", nil)
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		AdminToken:         "secret",
+	}
+	clientCfg := *cfg
+	clientCfg.UpstreamBaseURL = mock.URL()
+	client, err := upstream.New(cfg.AuthTokens[0], &clientCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := []*session.Manager{session.NewManager(client)}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, sessions, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(cfg, p, reg, nil, nil, "")
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
 	cookie := authedCookie(t, ts)
 
 	const n = 8
@@ -654,6 +690,7 @@ func TestDashboardConcurrentTokenAdds(t *testing.T) {
 			defer wg.Done()
 			token := fmt.Sprintf("cb_conc_%d", i)
 			resp := postJSON(t, ts.URL, cookie, "/admin/tokens/add", `{"token":"`+token+`"}`)
+			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 		}(i)
 	}
@@ -668,6 +705,19 @@ func TestDashboardConcurrentTokenAdds(t *testing.T) {
 		if !strings.Contains(string(env), want) {
 			t.Errorf("token %q lost from .env after concurrent adds", want)
 		}
+	}
+	// All 1+8 tokens must be in the live pool...
+	if got := p.TokenCount(); got != n+1 {
+		t.Errorf("pool TokenCount = %d, want %d", got, n+1)
+	}
+	// ...and a fresh config.Load must agree with both (.env is the source
+	// of truth for cfg after each add's reload).
+	reloaded, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reloaded.AuthTokens); got != n+1 {
+		t.Errorf("reloaded AUTH_TOKENS = %d, want %d", got, n+1)
 	}
 }
 

@@ -79,6 +79,11 @@ func chatBody(model string) []byte {
 	return []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}],"stream":true}`)
 }
 
+// testClient bounds every doJSON request: a handler regression that hangs
+// (e.g. an unbounded retry loop) fails the request in 30s instead of hanging
+// the whole suite until the go-test timeout.
+var testClient = &http.Client{Timeout: 30 * time.Second}
+
 // doJSON performs one request and returns the response plus its full body.
 func doJSON(t *testing.T, method, url string, body []byte, hdr map[string]string) (*http.Response, []byte) {
 	t.Helper()
@@ -93,7 +98,7 @@ func doJSON(t *testing.T, method, url string, body []byte, hdr map[string]string
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := testClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1010,6 +1015,10 @@ type quotaEntry struct {
 }
 
 func TestAdminReload(t *testing.T) {
+	// Isolate cwd: handleReload runs config.Load("") which reads ./.env.
+	// Without a temp dir the test would silently pick up a developer's .env
+	// dropped into internal/server.
+	t.Chdir(t.TempDir())
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
 	ts, _ := newTestServer(t, nil, mock0)
@@ -1063,6 +1072,9 @@ func TestAdminReloadToken(t *testing.T) {
 }
 
 func TestConcurrentReloadAndChat(t *testing.T) {
+	// Isolate cwd: the reload workers run config.Load("") which reads
+	// ./.env (see TestAdminReload).
+	t.Chdir(t.TempDir())
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-c1", 1, `"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]`))

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"reflect"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -55,7 +56,16 @@ func Dialer(profile *Profile, baseDial func(ctx context.Context, network, addr s
 		}, helloID)
 
 		if connProfile.CustomSpec != nil {
-			if err := uConn.ApplyPreset(connProfile.CustomSpec); err != nil {
+			// ApplyPreset re-greases the spec's extensions in place, writing
+			// the first connection's key shares and GREASE values into the
+			// extension objects. Safari17/18 share a package-level spec
+			// singleton, so every connection after the first would reuse the
+			// previous connection's key share (nil ECDHE key → "internal
+			// error" handshake failure). utls docs: "Fields of TLSExtensions
+			// that are slices/pointers are shared across different
+			// connections with same ClientHelloSpec... avoid any shared
+			// state." Clone per connection.
+			if err := uConn.ApplyPreset(cloneSpec(connProfile.CustomSpec)); err != nil {
 				_ = rawConn.Close()
 				return nil, fmt.Errorf("stealth: apply custom spec failed: %w", err)
 			}
@@ -104,4 +114,79 @@ func setALPN(uConn *utls.UConn, protocols []string) {
 		}
 	}
 	uConn.Extensions = append(uConn.Extensions, ext)
+}
+
+// cloneSpec returns a deep copy of spec so utls's ApplyPreset re-grease
+// cannot mutate a spec shared across connections or profiles (Safari17/18
+// share one package-level singleton). utls warns that ClientHelloSpec
+// extension slices/pointers are shared across connections; a reflective deep
+// copy guarantees fresh extension objects per dial, covering any extension
+// type (key shares, GREASE, curves, versions) without a per-type switch.
+func cloneSpec(spec *utls.ClientHelloSpec) *utls.ClientHelloSpec {
+	if spec == nil {
+		return nil
+	}
+	c := *spec
+	c.Extensions = make([]utls.TLSExtension, len(spec.Extensions))
+	for i := range spec.Extensions {
+		c.Extensions[i] = cloneExtension(spec.Extensions[i])
+	}
+	return &c
+}
+
+func cloneExtension(ext utls.TLSExtension) utls.TLSExtension {
+	v := reflect.ValueOf(ext)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return ext
+	}
+	dst := reflect.New(v.Elem().Type())
+	deepCopyValue(dst.Elem(), v.Elem())
+	return dst.Interface().(utls.TLSExtension)
+}
+
+// deepCopyValue recursively copies src into dst (both settable), duplicating
+// every pointer, slice, map, and struct field so no underlying object is
+// shared between the clone and the original.
+func deepCopyValue(dst, src reflect.Value) {
+	switch src.Kind() {
+	case reflect.Ptr:
+		if src.IsNil() {
+			return
+		}
+		dst.Set(reflect.New(src.Elem().Type()))
+		deepCopyValue(dst.Elem(), src.Elem())
+	case reflect.Slice:
+		if src.IsNil() {
+			return
+		}
+		out := reflect.MakeSlice(src.Type(), src.Len(), src.Len())
+		for i := range src.Len() {
+			deepCopyValue(out.Index(i), src.Index(i))
+		}
+		dst.Set(out)
+	case reflect.Map:
+		if src.IsNil() {
+			return
+		}
+		out := reflect.MakeMapWithSize(src.Type(), src.Len())
+		iter := src.MapRange()
+		for iter.Next() {
+			kv := reflect.New(iter.Key().Type()).Elem()
+			vv := reflect.New(iter.Value().Type()).Elem()
+			deepCopyValue(kv, iter.Key())
+			deepCopyValue(vv, iter.Value())
+			out.SetMapIndex(kv, vv)
+		}
+		dst.Set(out)
+	case reflect.Struct:
+		for i := range src.NumField() {
+			if dst.Field(i).CanSet() {
+				deepCopyValue(dst.Field(i), src.Field(i))
+			}
+		}
+	default:
+		if dst.CanSet() {
+			dst.Set(src)
+		}
+	}
 }

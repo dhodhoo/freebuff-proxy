@@ -3,10 +3,12 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -620,9 +622,373 @@ func TestHeartbeat(t *testing.T) {
 	})
 }
 
-// TestHeartbeatStatusErrors verifies Heartbeat maps terminal poll statuses
-// through the same statusError helper as refresh, so the pool sees typed
-// errors and can cool tokens down.
+// TestRecreateStatusesRecreates pins status-matrix parity for the
+// transparently-recreated statuses: "ended" is tested elsewhere, and
+// "superseded"/"none" must behave identically (drop the stale slot, create
+// again).
+func TestRecreateStatusesRecreates(t *testing.T) {
+	for _, status := range []string{"superseded", "none"} {
+		t.Run(status, func(t *testing.T) {
+			mock := testutil.NewMock()
+			defer mock.Close()
+			mock.SessionSequence = []string{status, "active"}
+			mgr := newTestManager(t, mock)
+
+			instance, err := mgr.EnsureSession(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if instance != "inst-abc-123" {
+				t.Errorf("instance = %q", instance)
+			}
+			if mock.SessionCreates != 2 {
+				t.Errorf("creates = %d, want 2 (%s → recreate)", mock.SessionCreates, status)
+			}
+		})
+	}
+}
+
+// TestHeartbeatInvalidatesRecreateStatuses verifies Heartbeat invalidates
+// the cached admission for "superseded"/"none" polls exactly like "ended"
+// (status parity for the heartbeat path).
+func TestHeartbeatInvalidatesRecreateStatuses(t *testing.T) {
+	for _, status := range []string{"superseded", "none"} {
+		t.Run(status, func(t *testing.T) {
+			mock := testutil.NewMock()
+			defer mock.Close()
+			mgr := newTestManager(t, mock)
+
+			if _, err := mgr.EnsureSession(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"status":"`+status+`","instanceId":"inst-abc-123"}`)
+			}
+
+			if err := mgr.Heartbeat(context.Background()); err != nil {
+				t.Fatalf("Heartbeat: %v", err)
+			}
+			if snap := mgr.Snapshot(); snap.Status != "" {
+				t.Errorf("status = %q, want empty after %s invalidation", snap.Status, status)
+			}
+		})
+	}
+}
+
+// TestModelLockedReleasesOldSlot verifies the model_locked branch releases
+// the OLD upstream slot (SessionEnds == 1) before retrying with the desired
+// model: the model-switch invariant that a locked slot is not leaked.
+func TestModelLockedReleasesOldSlot(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	var creates, ends atomic.Int32
+	var mu sync.Mutex
+	bAttempts := 0
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			model := r.Header.Get("x-freebuff-model")
+			creates.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if model == "model/A" {
+				_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-A","model":"model/A","expiresAt":"2030-01-01T00:00:00Z"}`)
+				return
+			}
+			// model/B: the first attempt is locked, the retry succeeds.
+			mu.Lock()
+			bAttempts++
+			attempt := bAttempts
+			mu.Unlock()
+			if attempt == 1 {
+				_, _ = io.WriteString(w, `{"status":"model_locked","currentModel":"model/A","requestedModel":"model/B"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-B","model":"model/B","expiresAt":"2030-01-01T00:00:00Z"}`)
+		case http.MethodDelete:
+			ends.Add(1)
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"status":"ended"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	if _, err := mgr.EnsureSessionForModel(context.Background(), "model/A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.EnsureSessionForModel(context.Background(), "model/B"); err != nil {
+		t.Fatal(err)
+	}
+	// The model_locked response is itself a create (POST), so the total is:
+	// model/A create + model/B locked create + model/B retry create.
+	if got := creates.Load(); got != 3 {
+		t.Errorf("creates = %d, want 3 (model/A + locked model/B + retry model/B)", got)
+	}
+	if got := ends.Load(); got != 1 {
+		t.Errorf("ends = %d, want 1 (old model/A slot released on model lock)", got)
+	}
+	if snap := mgr.Snapshot(); snap.InstanceID != "inst-B" {
+		t.Errorf("final instance = %q, want inst-B", snap.InstanceID)
+	}
+}
+
+// TestRefreshBudgetExhaustedAlwaysNone verifies the create/poll loop is
+// bounded: an upstream that always returns "none" burns exactly
+// maxRefreshIterations creates, then errors out (no infinite loop).
+func TestRefreshBudgetExhaustedAlwaysNone(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "none"
+	mgr := newTestManager(t, mock)
+
+	_, err := mgr.EnsureSession(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("err = %v, want refresh budget exhaustion error", err)
+	}
+	if mock.SessionCreates != maxRefreshIterations {
+		t.Errorf("creates = %d, want %d (exactly the iteration budget, no infinite loop)", mock.SessionCreates, maxRefreshIterations)
+	}
+}
+
+// TestEnsureSessionOuterBudgetExhausted pins the outer-cap path: an upstream
+// that always returns "queued" with a pollAt in the past makes every refresh
+// succeed without progress, so EnsureSession must stop after
+// maxOuterIterations attempts with "not ready after repeated refreshes"
+// (creates exactly once; every later attempt is a poll).
+func TestEnsureSessionOuterBudgetExhausted(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "queued"
+	mock.EstimatedWaitMs = 0 // mock formats pollAt with ms precision → always in the past
+	mgr := newTestManager(t, mock)
+
+	_, err := mgr.EnsureSession(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not ready after repeated refreshes") {
+		t.Fatalf("err = %v, want 'not ready after repeated refreshes'", err)
+	}
+	if mock.SessionCreates != 1 {
+		t.Errorf("creates = %d, want 1 (only the first refresh creates)", mock.SessionCreates)
+	}
+	if mock.SessionPolls != maxOuterIterations-1 {
+		t.Errorf("polls = %d, want %d (one poll per remaining outer iteration)", mock.SessionPolls, maxOuterIterations-1)
+	}
+}
+
+// TestQueuedZeroPollAtClamp covers the S2 dead path: a queued response with
+// a zero pollAt is clamped to max(1s, min(5s, estimatedWaitMs)) instead of
+// parking the caller at "now" (the mock always sends pollAt, so the clamp is
+// exercised through a custom handler).
+func TestQueuedZeroPollAtClamp(t *testing.T) {
+	tests := []struct {
+		name   string
+		waitMs int
+		min    time.Duration
+		max    time.Duration
+	}{
+		{"zero wait → 1s floor", 0, 800 * time.Millisecond, 1500 * time.Millisecond},
+		{"3s wait kept", 3000, 2800 * time.Millisecond, 3200 * time.Millisecond},
+		{"10s wait → 5s cap", 10000, 4500 * time.Millisecond, 5500 * time.Millisecond},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := testutil.NewMock()
+			defer mock.Close()
+			mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, fmt.Sprintf(`{"status":"queued","instanceId":"inst-q","position":1,"queueDepth":3,"estimatedWaitMs":%d}`, tt.waitMs))
+			}
+			mgr := newTestManager(t, mock)
+
+			_, err := mgr.EnsureSession(context.Background())
+			var wr *WaitingRoomError
+			if !errors.As(err, &wr) {
+				t.Fatalf("want WaitingRoomError, got %v", err)
+			}
+			if wr.RetryAfter < tt.min || wr.RetryAfter > tt.max {
+				t.Errorf("RetryAfter = %s, want in [%s, %s] (zero-pollAt clamp)", wr.RetryAfter, tt.min, tt.max)
+			}
+		})
+	}
+}
+
+// TestHeartbeatTransportErrorKeepsCachedState verifies a transport error on
+// the heartbeat poll surfaces as an error (pool cooldown path) while the
+// cached active admission stays intact — the transport failure did not prove
+// the session dead.
+func TestHeartbeatTransportErrorKeepsCachedState(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Subsequent heartbeat GET hangs up the connection (transport error).
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("mock server does not support hijacking")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack failed: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}
+
+	if err := mgr.Heartbeat(context.Background()); err == nil {
+		t.Fatal("heartbeat transport error must surface, got nil")
+	}
+	snap := mgr.Snapshot()
+	if snap.Status != "active" {
+		t.Errorf("status = %q, want active kept after transport error", snap.Status)
+	}
+	if snap.InstanceID != "inst-abc-123" {
+		t.Errorf("instance = %q, want inst-abc-123 kept", snap.InstanceID)
+	}
+}
+
+// TestEndSessionSwallowsSessionInvalid verifies EndSession returns nil when
+// the upstream DELETE fails with a 400 session_superseded (ErrSessionInvalid
+// — the slot is already gone, nothing to do).
+func TestEndSessionSwallowsSessionInvalid(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":"session_superseded"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}
+
+	if err := mgr.EndSession(context.Background()); err != nil {
+		t.Fatalf("EndSession with 400 session_superseded = %v, want nil (ErrSessionInvalid swallowed)", err)
+	}
+}
+
+// TestEndSessionSurfacesServerError verifies EndSession surfaces a generic
+// upstream error (500) instead of swallowing it.
+func TestEndSessionSurfacesServerError(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"boom"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}
+
+	if err := mgr.EndSession(context.Background()); err == nil {
+		t.Fatal("EndSession with 500 = nil, want error surfaced")
+	}
+}
+
+// TestLiveModelSwitchDoesNotReleaseOldSlot pins the B2 doc-vs-code
+// divergence: EnsureSessionForModel's doc claims a live model switch
+// "releases the previous slot", but the live-refresh path only creates for
+// the new model — the old upstream slot is never DELETE'd (only the
+// model_locked branch releases). The CURRENT behavior (creates==2, ends==0)
+// is pinned here; do not change it without also changing the doc.
+func TestLiveModelSwitchDoesNotReleaseOldSlot(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	var creates, ends atomic.Int32
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			model := r.Header.Get("x-freebuff-model")
+			creates.Add(1)
+			instance := "inst-B"
+			if model == "model/A" {
+				instance = "inst-A"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"`+instance+`","model":"`+model+`","expiresAt":"2030-01-01T00:00:00Z"}`)
+		case http.MethodDelete:
+			ends.Add(1)
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"status":"ended"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}
+
+	if _, err := mgr.EnsureSessionForModel(context.Background(), "model/A"); err != nil {
+		t.Fatal(err)
+	}
+	if got := creates.Load(); got != 1 {
+		t.Fatalf("creates after model/A = %d, want 1", got)
+	}
+
+	instance, err := mgr.EnsureSessionForModel(context.Background(), "model/B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-B" {
+		t.Errorf("instance = %q, want inst-B (fresh create for model/B)", instance)
+	}
+	if got := creates.Load(); got != 2 {
+		t.Errorf("creates = %d, want 2", got)
+	}
+	if got := ends.Load(); got != 0 {
+		t.Errorf("ends = %d, want 0 (current code does NOT release the old slot on live model switch — B2 divergence pinned)", got)
+	}
+}
+
+// TestActiveSessionWithoutModelServesAnyModel pins the S1 leniency: a
+// session created via the default-model path (cached model "") is reused for
+// ANY requested model — the cache-hit check treats "" as a wildcard. The
+// upstream may later reject with session_model_mismatch; the leniency is
+// current behavior and must not silently change.
+func TestActiveSessionWithoutModelServesAnyModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	// The mock's active body carries no model field → cached model stays "".
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if snap := mgr.Snapshot(); snap.Model != "" {
+		t.Fatalf("cached model = %q, want empty (default-model create)", snap.Model)
+	}
+
+	instance, err := mgr.EnsureSessionForModel(context.Background(), "anything/model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-abc-123" {
+		t.Errorf("instance = %q, want inst-abc-123 (cache reused)", instance)
+	}
+	if mock.SessionCreates != 1 {
+		t.Errorf("creates = %d, want 1 (model-less session reused for any model)", mock.SessionCreates)
+	}
+}
 func TestHeartbeatStatusErrors(t *testing.T) {
 	t.Run("banned returns BanError and clears cached admission", func(t *testing.T) {
 		mock := testutil.NewMock()

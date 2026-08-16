@@ -92,7 +92,7 @@
           <td class="mono">{{.ResetAt}}{{if .ResetsIn}} <span class="countdown{{if .NearLimit}} countdown-near{{end}}">{{.ResetsIn}}</span>{{end}}</td>
           <td class="mono">{{if .HasEntitlement}}{{.Entitled}}{{end}}</td>
         </tr>
-        {{if gt .Limit 0}}
+        {{if .HasBar}}
         <tr class="quota-bar-row">
           <td colspan="6"><div class="usage {{if .NearLimit}}usage-near{{end}}"><div class="usage-bar" style="width: {{.UsagePct}}%"></div></div></td>
         </tr>

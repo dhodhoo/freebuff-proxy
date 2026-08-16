@@ -254,7 +254,23 @@ func TestStoreRemoveCAS(t *testing.T) {
 }
 
 func TestStoreConcurrentSaveLoadRemove(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
+	dir := t.TempDir()
+	// The store hammers hundreds of atomic temp+rename writes into this
+	// directory; on Windows a transient handle (AV/indexer scan) can make a
+	// single-pass RemoveAll fail with "directory is not empty". Retry the
+	// removal so the flake cannot fail the suite.
+	t.Cleanup(func() {
+		for attempt := range 5 {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			} else if attempt == 4 {
+				t.Logf("could not remove temp dir %s: %v", dir, err)
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+	path := filepath.Join(dir, "state.json")
 	store := NewStore(path)
 
 	const workers = 16
@@ -379,6 +395,137 @@ func TestStoreReadErrorDoesNotClobberFile(t *testing.T) {
 	// read must not have been cached as an empty store) and see the seed.
 	if got := store.Load("a"); got == nil || got.instanceID != "inst-a" {
 		t.Fatalf("Load after perms restored = %+v, want inst-a", got)
+	}
+}
+
+// TestStoreReadErrorDoesNotClobberFileUnreadableFile is the B1 regression:
+// the on-disk file itself is unreadable (chmod 000) while the DIRECTORY stays
+// writable, so a Save could silently replace the file with the in-memory
+// partial view — destroying every OTHER token's persisted entries. The store
+// must skip the flush while the file is unreadable (keep the in-memory
+// update only), leaving the on-disk file byte-identical, and re-read it once
+// access is restored.
+func TestStoreReadErrorDoesNotClobberFileUnreadableFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are not enforced on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	seed := NewStore(path)
+	seed.Save("a", &cachedState{status: "active", instanceID: "inst-a", expiresAt: time.Now().Add(time.Hour)})
+	seed.Save("other", &cachedState{status: "active", instanceID: "inst-other", expiresAt: time.Now().Add(time.Hour)})
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make the FILE unreadable but leave the directory writable: this is the
+	// dangerous window where the old code flushed the partial view over the
+	// file (the both-fail dir test never hit it).
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Errorf("restoring file perms: %v", err)
+		}
+	}()
+
+	store := NewStore(path)
+	if got := store.Load("a"); got != nil {
+		t.Fatalf("Load on unreadable store = %+v, want nil", got)
+	}
+	// Save during the failure window must NOT replace the file.
+	store.Save("b", &cachedState{status: "active", instanceID: "inst-b", expiresAt: time.Now().Add(time.Hour)})
+	store.Remove("a", "") // remove must also not flush the partial view
+
+	// Restore access before reading the file back (the deferred restore is
+	// only a safety net for temp-dir cleanup).
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("Save/Remove clobbered an unreadable file: got %d bytes, want %d (other tokens' entries destroyed)", len(after), len(before))
+	}
+
+	// Once access is restored the store re-reads the file (the failed read
+	// must not have been cached as an empty store) and sees the seeds.
+	if got := store.Load("a"); got == nil || got.instanceID != "inst-a" {
+		t.Fatalf("Load('a') after perms restored = %+v, want inst-a", got)
+	}
+	if got := store.Load("other"); got == nil || got.instanceID != "inst-other" {
+		t.Fatalf("Load('other') after perms restored = %+v, want inst-other (other token survived)", got)
+	}
+
+	// A healed Save must now flush the merged map and work normally.
+	store.Save("c", &cachedState{status: "active", instanceID: "inst-c", expiresAt: time.Now().Add(time.Hour)})
+	if got := NewStore(path).Load("c"); got == nil || got.instanceID != "inst-c" {
+		t.Fatalf("Load('c') after healed Save = %+v, want inst-c", got)
+	}
+	if got := NewStore(path).Load("a"); got == nil || got.instanceID != "inst-a" {
+		t.Fatalf("Load('a') after healed Save = %+v, want inst-a (existing entry preserved on flush)", got)
+	}
+}
+
+// TestStoreVersionMismatchIgnoredThenReplaced is S14: a store file with a
+// version other than storeVersion is ignored (empty view), and the next Save
+// replaces it wholesale with the current version.
+func TestStoreVersionMismatchIgnoredThenReplaced(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	file := storeFile{
+		Version: storeVersion + 1,
+		Sessions: map[string]persistedState{
+			"old": {Status: "active", InstanceID: "inst-old", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(path)
+	if got := store.Load("old"); got != nil {
+		t.Fatalf("Load of version-mismatched entry = %+v, want nil (ignored)", got)
+	}
+
+	store.Save("new", &cachedState{status: "active", instanceID: "inst-new", expiresAt: time.Now().Add(time.Hour)})
+	fresh := NewStore(path)
+	if got := fresh.Load("new"); got == nil || got.instanceID != "inst-new" {
+		t.Fatalf("Load('new') after Save = %+v, want inst-new", got)
+	}
+	if got := fresh.Load("old"); got != nil {
+		t.Errorf("Load('old') after Save = %+v, want nil (version-mismatched file replaced wholesale)", got)
+	}
+}
+
+// TestStoreEmptyKeyNoop verifies Save/Remove with an empty key are no-ops
+// that do not even create the store file (S12-adjacent guard).
+func TestStoreEmptyKeyNoop(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore(path)
+
+	store.Save("", &cachedState{status: "active", instanceID: "inst-1", expiresAt: time.Now().Add(time.Hour)})
+	store.Remove("", "")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("state file exists after empty-key Save/Remove, want not created: %v", err)
+	}
+
+	// A real key still works afterwards.
+	store.Save("key", &cachedState{status: "active", instanceID: "inst-1", expiresAt: time.Now().Add(time.Hour)})
+	if got := store.Load("key"); got == nil || got.instanceID != "inst-1" {
+		t.Fatalf("Load('key') after Save = %+v, want inst-1", got)
 	}
 }
 

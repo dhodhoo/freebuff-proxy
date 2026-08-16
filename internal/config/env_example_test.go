@@ -4,25 +4,28 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"freebuff-proxy/internal/testutil"
 )
 
 // TestEnvExampleLoadsCleanly proves the shipped .env.example is a valid,
 // loadable configuration (a fresh user copying it to .env starts without
 // errors) and that every documented safety default lands as expected.
 func TestEnvExampleLoadsCleanly(t *testing.T) {
-	dir := t.TempDir()
+	// Read the fixture from the repo before changing the working directory.
 	data, err := os.ReadFile(filepath.Join("..", "..", ".env.example"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".env"), data, 0o600); err != nil {
+	// Isolate from the developer's real environment: an ambient AUTH_TOKENS
+	// (or LISTEN_ADDR etc.) outranks .env values and would break the
+	// BridgeMode()/ListenAddr assertions below. t.Chdir also keeps the .env
+	// lookup inside the test's temp dir.
+	testutil.UnsetConfigEnv(t)
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile(".env", data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old, _ := os.Getwd()
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.Chdir(old) }()
 
 	cfg, err := Load("")
 	if err != nil {

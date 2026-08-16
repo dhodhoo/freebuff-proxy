@@ -6,6 +6,7 @@ package testutil
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -80,10 +81,19 @@ type MockUpstream struct {
 	// RateLimit makes every route return a 429 rate_limited quota-exhaustion
 	// body (daily session quota, Pacific-day reset contract).
 	RateLimit bool
+	// RateLimitRetryAfterMs overrides retryAfterMs in the rate-limit body
+	// when > 0 (default 48549499). Tests use it to serve DIFFERENT windows
+	// per mock so best-window selection actually compares values.
+	RateLimitRetryAfterMs int
 
 	// Ban makes every route return a 403 {"status":"banned"} with a
 	// resumes_at timestamp ~1h in the future.
 	Ban bool
+
+	// FinishFailures fails the next N agent-runs FINISH requests with a 500
+	// (the body is recorded as usual otherwise). Tests use it to exercise
+	// the runs package's FINISH-failure re-drain path.
+	FinishFailures int
 
 	RecordedChatHeaders []http.Header
 	RecordedChatBodies  []string
@@ -135,7 +145,11 @@ func (m *MockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		// writeRaw (not writeJSON): the body must reach the client verbatim
 		// so parseRateLimit can unmarshal the quota fields — writeJSON would
 		// re-encode it as a quoted JSON string.
-		writeRaw(w, 429, `{"model":"deepseek/deepseek-v4-flash","entitlementBreakdown":{"base":6,"referral":0,"streak":0},"limit":6,"period":"pacific_day","resetTimeZone":"America/Los_Angeles","resetAt":"2026-08-12T07:00:00.000Z","windowHours":24,"recentCount":6.6,"status":"rate_limited","accessTier":"limited","retryAfterMs":48549499}`)
+		retryAfterMs := 48549499
+		if m.RateLimitRetryAfterMs > 0 {
+			retryAfterMs = m.RateLimitRetryAfterMs
+		}
+		writeRaw(w, 429, fmt.Sprintf(`{"model":"deepseek/deepseek-v4-flash","entitlementBreakdown":{"base":6,"referral":0,"streak":0},"limit":6,"period":"pacific_day","resetTimeZone":"America/Los_Angeles","resetAt":"2026-08-12T07:00:00.000Z","windowHours":24,"recentCount":6.6,"status":"rate_limited","accessTier":"limited","retryAfterMs":%d}`, retryAfterMs))
 		return
 	}
 	if m.Ban {
@@ -304,6 +318,10 @@ func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
 		m.FinishesStarted++
 		delay := m.FinishDelay
+		fail := m.FinishFailures > 0
+		if fail {
+			m.FinishFailures--
+		}
 		m.mu.Unlock()
 		if delay > 0 {
 			select {
@@ -311,6 +329,10 @@ func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 				return
 			case <-time.After(delay):
 			}
+		}
+		if fail {
+			writeJSON(w, 500, map[string]any{"error": "mock FINISH failure"})
+			return
 		}
 		m.mu.Lock()
 		m.FinishedRuns = append(m.FinishedRuns, FinishedRun{
@@ -426,4 +448,13 @@ func (m *MockUpstream) FinishesStartedSnapshot() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.FinishesStarted
+}
+
+// SessionCreatesSnapshot returns a locked copy of the session-create
+// counter (see StartedRunsSnapshot). Tests poll it while an admission is in
+// flight without racing the mock server goroutine.
+func (m *MockUpstream) SessionCreatesSnapshot() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.SessionCreates
 }
