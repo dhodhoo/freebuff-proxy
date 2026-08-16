@@ -130,7 +130,7 @@ func defaultRawConfig() rawConfig {
 		HybridMode:          false, // relay client tokens AND serve the pool (off by default)
 		RequestJitter:       "",    // "" = disabled (unset → SAFE_MODE preset may fill)
 		CLIVersion:          "0.10.7",
-		TransientRetries:    nil, // nil = 1 (one retry after a transient transport failure; 0 disables)
+		TransientRetries:    nil,   // nil = 1 (one retry after a transient transport failure; 0 disables)
 		SessionPersist:      false, // opt-in: persist session state across restarts
 		SessionStateFile:    ".freebuff-session-state.json",
 	}

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,11 +61,11 @@ func TestPersistResumePollTransportError(t *testing.T) {
 	mgr, key := newPersistTestManager(t, mock, store)
 	store.Save(key, activeSlot("inst-abc-123", ""))
 
-	polls, creates := 0, 0
+	var polls, creates atomic.Int32
 	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			polls++
+			polls.Add(1)
 			// Transport failure: hang up the connection without a response
 			// (verified: the Go transport does not retry, single EOF).
 			hj, ok := w.(http.Hijacker)
@@ -78,7 +80,7 @@ func TestPersistResumePollTransportError(t *testing.T) {
 			}
 			_ = conn.Close()
 		case http.MethodPost:
-			creates++
+			creates.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123","expiresAt":"2030-01-01T00:00:00Z"}`)
 		default:
@@ -90,11 +92,11 @@ func TestPersistResumePollTransportError(t *testing.T) {
 	if err == nil {
 		t.Fatal("resume poll transport error must surface, got nil")
 	}
-	if creates != 0 {
-		t.Errorf("creates = %d, want 0 (transport error must not fall through to create)", creates)
+	if got := creates.Load(); got != 0 {
+		t.Errorf("creates = %d, want 0 (transport error must not fall through to create)", got)
 	}
-	if polls != 1 {
-		t.Errorf("polls = %d, want 1 (persisted slot polled once)", polls)
+	if got := polls.Load(); got != 1 {
+		t.Errorf("polls = %d, want 1 (persisted slot polled once)", got)
 	}
 	if got := store.Load(key); got == nil || got.instanceID != "inst-abc-123" {
 		t.Errorf("store after transport error = %+v, want intact inst-abc-123", got)
@@ -114,6 +116,7 @@ func TestPersistModelMismatchNotAdopted(t *testing.T) {
 		mgr, key := newPersistTestManager(t, mock, store)
 		store.Save(key, activeSlot("inst-A", "model/A"))
 
+		var mu sync.Mutex
 		var createdModels []string
 		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
@@ -121,7 +124,9 @@ func TestPersistModelMismatchNotAdopted(t *testing.T) {
 				// Not reached: the pre-flight gate rejects before the poll.
 				t.Errorf("unexpected resume poll for a model-mismatched slot")
 			case http.MethodPost:
+				mu.Lock()
 				createdModels = append(createdModels, r.Header.Get("x-freebuff-model"))
+				mu.Unlock()
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-B","model":"`+r.Header.Get("x-freebuff-model")+`","expiresAt":"2030-01-01T00:00:00Z"}`)
 			default:
@@ -150,8 +155,11 @@ func TestPersistModelMismatchNotAdopted(t *testing.T) {
 		if instance != "inst-B" {
 			t.Errorf("instance = %q, want inst-B (fresh create for model/B, not inst-A)", instance)
 		}
-		if len(createdModels) != 1 || createdModels[0] != "model/B" {
-			t.Errorf("created models = %v, want [model/B]", createdModels)
+		mu.Lock()
+		gotModels := append([]string(nil), createdModels...)
+		mu.Unlock()
+		if len(gotModels) != 1 || gotModels[0] != "model/B" {
+			t.Errorf("created models = %v, want [model/B]", gotModels)
 		}
 	})
 
@@ -164,11 +172,11 @@ func TestPersistModelMismatchNotAdopted(t *testing.T) {
 		mgr, key := newPersistTestManager(t, mock, store)
 		store.Save(key, activeSlot("inst-A", ""))
 
-		polls := 0
+		var polls atomic.Int32
 		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
 			case http.MethodGet:
-				polls++
+				polls.Add(1)
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-A","model":"model/A","expiresAt":"2030-01-01T00:00:00Z"}`)
 			case http.MethodPost:
@@ -186,8 +194,8 @@ func TestPersistModelMismatchNotAdopted(t *testing.T) {
 		if instance != "inst-B" {
 			t.Errorf("instance = %q, want inst-B (post-flight mismatch → create)", instance)
 		}
-		if polls != 1 {
-			t.Errorf("polls = %d, want 1 (slot polled once, then rejected)", polls)
+		if got := polls.Load(); got != 1 {
+			t.Errorf("polls = %d, want 1 (slot polled once, then rejected)", got)
 		}
 		// The model/A slot was dropped; the store now holds the model/B session.
 		if got := store.Load(key); got == nil || got.instanceID != "inst-B" {
@@ -207,15 +215,15 @@ func TestPersistModelMatchAdopted(t *testing.T) {
 		mgr, key := newPersistTestManager(t, mock, store)
 		store.Save(key, activeSlot("inst-A", "model/A"))
 
-		polls, creates := 0, 0
+		var polls, creates atomic.Int32
 		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
 			case http.MethodGet:
-				polls++
+				polls.Add(1)
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-A","model":"model/A","expiresAt":"2030-01-01T00:00:00Z"}`)
 			case http.MethodPost:
-				creates++
+				creates.Add(1)
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-X","expiresAt":"2030-01-01T00:00:00Z"}`)
 			default:
@@ -230,11 +238,11 @@ func TestPersistModelMatchAdopted(t *testing.T) {
 		if instance != "inst-A" {
 			t.Errorf("instance = %q, want inst-A (adopted, not created)", instance)
 		}
-		if creates != 0 {
-			t.Errorf("creates = %d, want 0", creates)
+		if got := creates.Load(); got != 0 {
+			t.Errorf("creates = %d, want 0", got)
 		}
-		if polls != 1 {
-			t.Errorf("polls = %d, want 1", polls)
+		if got := polls.Load(); got != 1 {
+			t.Errorf("polls = %d, want 1", got)
 		}
 	})
 
@@ -245,14 +253,14 @@ func TestPersistModelMatchAdopted(t *testing.T) {
 		mgr, key := newPersistTestManager(t, mock, store)
 		store.Save(key, activeSlot("inst-A", "model/A"))
 
-		creates := 0
+		var creates atomic.Int32
 		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
 			case http.MethodGet:
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-A","model":"model/A","expiresAt":"2030-01-01T00:00:00Z"}`)
 			case http.MethodPost:
-				creates++
+				creates.Add(1)
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-X","expiresAt":"2030-01-01T00:00:00Z"}`)
 			default:
@@ -267,8 +275,8 @@ func TestPersistModelMatchAdopted(t *testing.T) {
 		if instance != "inst-A" {
 			t.Errorf("instance = %q, want inst-A (default-model request adopts)", instance)
 		}
-		if creates != 0 {
-			t.Errorf("creates = %d, want 0", creates)
+		if got := creates.Load(); got != 0 {
+			t.Errorf("creates = %d, want 0", got)
 		}
 	})
 }
@@ -370,18 +378,21 @@ func TestPersistStoreNotConsultedOnLiveRefresh(t *testing.T) {
 	store := NewStore(filepath.Join(t.TempDir(), "state.json"))
 	mgr, key := newPersistTestManager(t, mock, store)
 
-	polls := 0
+	var polls atomic.Int32
+	var mu sync.Mutex
 	var createdModels []string
 	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			polls++
+			polls.Add(1)
 			// Compatible with any requested model: adopted whenever the
 			// store is consulted.
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-store","expiresAt":"2030-01-01T00:00:00Z"}`)
 		case http.MethodPost:
+			mu.Lock()
 			createdModels = append(createdModels, r.Header.Get("x-freebuff-model"))
+			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-created","model":"`+r.Header.Get("x-freebuff-model")+`","expiresAt":"2030-01-01T00:00:00Z"}`)
 		default:
@@ -399,8 +410,8 @@ func TestPersistStoreNotConsultedOnLiveRefresh(t *testing.T) {
 	if instance != "inst-store" {
 		t.Errorf("first call instance = %q, want inst-store (fresh manager adopts)", instance)
 	}
-	if polls != 1 {
-		t.Errorf("polls after first call = %d, want 1", polls)
+	if got := polls.Load(); got != 1 {
+		t.Errorf("polls after first call = %d, want 1", got)
 	}
 
 	// Live manager, model mismatch: the store must NOT be consulted even
@@ -414,10 +425,13 @@ func TestPersistStoreNotConsultedOnLiveRefresh(t *testing.T) {
 	if instance != "inst-created" {
 		t.Errorf("mismatch refresh instance = %q, want inst-created (created, not adopted)", instance)
 	}
-	if polls != 1 {
-		t.Errorf("polls after mismatch refresh = %d, want still 1 (store not consulted)", polls)
+	if got := polls.Load(); got != 1 {
+		t.Errorf("polls after mismatch refresh = %d, want still 1 (store not consulted)", got)
 	}
-	if len(createdModels) != 1 || createdModels[0] != "model/B" {
-		t.Errorf("created models = %v, want [model/B]", createdModels)
+	mu.Lock()
+	gotModels := append([]string(nil), createdModels...)
+	mu.Unlock()
+	if len(gotModels) != 1 || gotModels[0] != "model/B" {
+		t.Errorf("created models = %v, want [model/B]", gotModels)
 	}
 }

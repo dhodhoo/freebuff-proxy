@@ -360,18 +360,19 @@ func TestStoreReadErrorDoesNotClobberFile(t *testing.T) {
 	// The Save fails gracefully (temp creation is blocked) and leaves the
 	// on-disk file untouched instead of replacing it with an empty view.
 	store.Save("b", &cachedState{status: "active", instanceID: "inst-b", expiresAt: time.Now().Add(time.Hour)})
+
+	// Restore access before reading the file back (the deferred restore is
+	// only a safety net for temp-dir cleanup).
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
 	after, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(after, before) {
 		t.Fatalf("Save clobbered an unreadable file: got %d bytes, want %d", len(after), len(before))
-	}
-
-	// Restore access before the final assertions; the deferred restore is
-	// only a safety net for temp-dir cleanup.
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
 	}
 
 	// Once access is restored the store must re-read the file (the failed
