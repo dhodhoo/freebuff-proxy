@@ -12,9 +12,25 @@ import (
 	"time"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/egress"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/upstream"
 )
+
+// egressRegionRow renders the doctor's egress region line from the direct
+// probe cache entry: "Egress region: <country> (<ip>)" on success, an
+// "(unavailable)" warning when the probe failed or no result is cached.
+func egressRegionRow(cache *egress.Cache) (line string, warn bool) {
+	r, ok := cache.Get("direct")
+	if !ok || r.Err != nil || r.Country == "" || r.IP == "" {
+		reason := "no direct probe result"
+		if ok && r.Err != nil {
+			reason = fmt.Sprintf("direct probe failed: %v", r.Err)
+		}
+		return fmt.Sprintf("Egress region: unavailable (%s)", reason), true
+	}
+	return fmt.Sprintf("Egress region: %s (%s)", r.Country, r.IP), false
+}
 
 // runTokenTest probes the first configured token with a real session
 // handshake (the same path the pool uses) and exits 0 on success, 1 on
@@ -131,6 +147,21 @@ func runDoctor(configPath string) {
 	} else {
 		_ = tlsConn.Close()
 		ok(fmt.Sprintf("TLS connection to %s:443 succeeded", targetHost))
+	}
+
+	// Egress region check: one live probe of the direct outbound path
+	// through a plain dialer, read back from the cache the doctor shares
+	// with the runtime. A failed probe is a warning, not a doctor failure —
+	// the proxy keeps working, only the region readout is missing.
+	egressCache := egress.NewCache()
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	res := egress.Probe(probeCtx, egress.DirectDialer(5*time.Second), 5*time.Second)
+	probeCancel()
+	egressCache.Set("direct", res)
+	if line, isWarn := egressRegionRow(egressCache); isWarn {
+		warn(line)
+	} else {
+		ok(line)
 	}
 
 	// Registry test

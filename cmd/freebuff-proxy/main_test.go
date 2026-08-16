@@ -7,6 +7,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"freebuff-proxy/internal/egress"
 )
 
 // TestHoldForExitIfConsolePipedStderrNoHang guards the console hold: with
@@ -103,5 +105,52 @@ func TestShutdownSignals(t *testing.T) {
 	}
 	if !has(syscall.SIGTERM) {
 		t.Error("shutdownSignals missing syscall.SIGTERM")
+	}
+}
+
+// TestEgressCacheGetSet guards the per-egress result cache: Set stores the
+// latest result, Get returns it, keys stay independent, and missing keys
+// report absent.
+func TestEgressCacheGetSet(t *testing.T) {
+	c := egress.NewCacheWithTTL(time.Minute)
+	if _, ok := c.Get("direct"); ok {
+		t.Fatal("empty cache returned a result for direct")
+	}
+	want := egress.Result{IP: "1.2.3.4", Country: "US"}
+	c.Set("direct", want)
+	got, ok := c.Get("direct")
+	if !ok {
+		t.Fatal("cached direct result not found")
+	}
+	if got != want {
+		t.Errorf("Get = %+v, want %+v", got, want)
+	}
+	// Overwrite replaces the previous result.
+	latest := egress.Result{IP: "5.6.7.8", Country: "DE"}
+	c.Set("direct", latest)
+	if got, _ := c.Get("direct"); got != latest {
+		t.Errorf("Get after overwrite = %+v, want %+v", got, latest)
+	}
+	// Keys are independent.
+	if _, ok := c.Get("proxy-0"); ok {
+		t.Error("proxy-0 returned a result that was never set")
+	}
+}
+
+// TestEgressCacheTTL guards the freshness window: an entry must not be
+// returned after its TTL elapses, and a re-Set refreshes the timestamp.
+func TestEgressCacheTTL(t *testing.T) {
+	c := egress.NewCacheWithTTL(50 * time.Millisecond)
+	c.Set("direct", egress.Result{IP: "1.2.3.4", Country: "US"})
+	if _, ok := c.Get("direct"); !ok {
+		t.Fatal("fresh entry not returned")
+	}
+	time.Sleep(80 * time.Millisecond)
+	if _, ok := c.Get("direct"); ok {
+		t.Error("expired entry still returned")
+	}
+	c.Set("direct", egress.Result{IP: "1.2.3.4", Country: "US"})
+	if _, ok := c.Get("direct"); !ok {
+		t.Error("re-Set entry not returned")
 	}
 }

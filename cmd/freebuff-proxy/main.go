@@ -27,6 +27,7 @@ import (
 	_ "time/tzdata"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/egress"
 	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
@@ -160,6 +161,17 @@ func main() {
 	// Prewarm + the 60s maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)
 
+	// Egress probing: report the country/IP each outbound path appears to
+	// come from (ban-avoidance diagnostics). The direct path is always
+	// probed; SOCKS5_PROXIES entries are probed through their own dialer.
+	// Results are cached and refreshed every 10 minutes; failures are
+	// logged and cached with Err set (fail-open).
+	egressCache := egress.NewCache()
+	if paths := egressPaths(&cfg, logger); len(paths) > 0 {
+		go egress.RunLoop(ctx, logger, egressCache, paths, egress.ProbeTimeout, egress.DefaultTTL)
+		logger.Info("egress probes started", "paths", len(paths))
+	}
+
 	srv := server.New(&cfg, p, reg, logger, logringHandler, *configPath)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -285,6 +297,23 @@ func holdForExitIfConsole() {
 	}
 	fmt.Fprintln(os.Stderr, "Press Enter to exit.")
 	_, _ = fmt.Scanln()
+}
+
+// egressPaths returns the probe paths for the configured outbound routes:
+// index 0 is always the direct connection; each SOCKS5_PROXIES entry is
+// probed through its own SOCKS5 dialer. Unparseable proxy addresses are
+// skipped with a warning (fail-open); the direct probe always survives.
+func egressPaths(cfg *config.Config, logger *slog.Logger) []egress.Path {
+	paths := []egress.Path{{Key: "direct", Dialer: egress.DirectDialer(egress.ProbeTimeout)}}
+	for i, raw := range cfg.SOCKS5Proxies {
+		dialer, err := egress.Socks5Dialer(raw)
+		if err != nil {
+			logger.Warn("egress probe: skipping invalid SOCKS5 proxy", "index", i, "err", err)
+			continue
+		}
+		paths = append(paths, egress.Path{Key: fmt.Sprintf("proxy-%d", i), Dialer: dialer})
+	}
+	return paths
 }
 
 // refreshLoop refreshes the registry immediately, then every interval.
