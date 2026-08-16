@@ -95,6 +95,43 @@ func TestDefaults(t *testing.T) {
 	if cfg.CostMode != "free" {
 		t.Errorf("CostMode = %q, want free (default: omission routes requests as paid -> 402)", cfg.CostMode)
 	}
+	if cfg.SessionPersist {
+		t.Error("SessionPersist = true, want false (default: persistence opt-in)")
+	}
+	if cfg.SessionStateFile != ".freebuff-session-state.json" {
+		t.Errorf("SessionStateFile = %q, want %q", cfg.SessionStateFile, ".freebuff-session-state.json")
+	}
+}
+
+// TestSessionPersist pins the SESSION_PERSIST env parsing: an unrecognized
+// boolean value is silently ignored (the default stays false — no error),
+// and "true" enables persistence with the configured state file path. The
+// SESSION_PERSIST=true + empty SESSION_STATE_FILE validation error is only
+// reachable through the JSON/struct path (an env value of "" is treated as
+// unset and leaves the default), so it is pinned in TestValidate.
+func TestSessionPersist(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+
+	// garbage value is silently ignored, default (false) stands
+	t.Setenv("SESSION_PERSIST", "garbage")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (garbage): %v", err)
+	} else if cfg.SessionPersist {
+		t.Error("SessionPersist = true for SESSION_PERSIST=garbage, want false (unrecognized value ignored)")
+	}
+	t.Setenv("SESSION_PERSIST", "")
+
+	// recognized true value enables persistence and honors the state file
+	t.Setenv("SESSION_PERSIST", "true")
+	t.Setenv("SESSION_STATE_FILE", "custom-state.json")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (true): %v", err)
+	} else if !cfg.SessionPersist {
+		t.Error("SessionPersist = false for SESSION_PERSIST=true, want true")
+	} else if cfg.SessionStateFile != "custom-state.json" {
+		t.Errorf("SessionStateFile = %q, want %q", cfg.SessionStateFile, "custom-state.json")
+	}
 }
 
 func TestTransientRetries(t *testing.T) {
@@ -529,6 +566,7 @@ func TestValidate(t *testing.T) {
 		{"bad cost mode", func(c *Config) { c.CostMode = "Free" }},
 		{"bad proxy rotation", func(c *Config) { c.ProxyRotation = "round robin" }},
 		{"negative max messages", func(c *Config) { c.MaxMessagesPerDay = -1 }},
+		{"session persist with empty state file", func(c *Config) { c.SessionPersist = true; c.SessionStateFile = "" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

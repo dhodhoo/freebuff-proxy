@@ -165,6 +165,14 @@ type Pool struct {
 	// disables. Injected by the caller (main) via SetSessionStore so there
 	// is exactly one store shared by pooled and bridge entries.
 	store *session.Store
+
+	// storeSessionPersist and storeStateFile record the persistence config
+	// the store was created with (captured by SetSessionStore), so SetConfig
+	// can detect a reload that changes the persistence semantics — the live
+	// store cannot be swapped at runtime, so such a change only takes
+	// effect on the next restart.
+	storeSessionPersist bool
+	storeStateFile      string
 }
 
 type tokenEntry struct {
@@ -210,6 +218,21 @@ func New(cfg *config.Config, clients []*upstream.Client, sessions []*session.Man
 // Acquire/maintain pass without rebuilding the pool.
 func (p *Pool) SetConfig(cfg *config.Config) {
 	p.cfg.Store(cfg)
+
+	// Session persistence is decided at startup: the store is built from the
+	// boot config and injected once via SetSessionStore, so a reload cannot
+	// move the live store. Warn when the reloaded config changes the
+	// persistence semantics — otherwise operators get a silent no-op (the
+	// dashboard save / admin reload funnels through here).
+	persistChanged := cfg.SessionPersist != p.storeSessionPersist ||
+		(cfg.SessionPersist && cfg.SessionStateFile != p.storeStateFile)
+	if persistChanged {
+		p.logger.Warn("SESSION_PERSIST/SESSION_STATE_FILE changed via reload; takes effect on the next restart",
+			"old_session_persist", p.storeSessionPersist,
+			"new_session_persist", cfg.SessionPersist,
+			"old_state_file", p.storeStateFile,
+			"new_state_file", cfg.SessionStateFile)
+	}
 }
 
 // AddToken adds a token to the pool at runtime (dashboard action): builds
@@ -289,9 +312,20 @@ func (p *Pool) TokenCount() int {
 // SetSessionStore injects the shared session-state store used by runtime
 // token additions (AddToken) and bridge entries. Call before the pool
 // starts serving requests; the fixed-token session managers are built by the
-// caller and must use the same store instance.
+// caller and must use the same store instance. A nil store disables
+// persistence. The persistence config is captured here so SetConfig can warn
+// when a later reload tries to change it (that only takes effect on the next
+// restart, when the caller builds a fresh store).
 func (p *Pool) SetSessionStore(store *session.Store) {
 	p.store = store
+	if store == nil {
+		p.storeSessionPersist = false
+		p.storeStateFile = ""
+		return
+	}
+	cfg := p.cfg.Load()
+	p.storeSessionPersist = cfg.SessionPersist
+	p.storeStateFile = cfg.SessionStateFile
 }
 
 // Acquire resolves the model's agent, picks a start token round-robin, and

@@ -1,11 +1,14 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -949,6 +952,74 @@ func TestSetConfigReloadsDailyLimit(t *testing.T) {
 	}
 	if rle.Limit != 1 {
 		t.Errorf("quota limit = %v, want 1 (reloaded config)", rle.Limit)
+	}
+}
+
+// TestSetConfigWarnsOnPersistenceChange pins the reload warning: session
+// persistence is fixed at startup (the store is built from the boot config
+// and injected via SetSessionStore), so a reloaded config that changes
+// SESSION_PERSIST / SESSION_STATE_FILE must warn that it only takes effect
+// on the next restart instead of silently doing nothing.
+func TestSetConfigWarnsOnPersistenceChange(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	var buf bytes.Buffer
+	testLogger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	p := newTestPoolCfg(t, func(c *config.Config) {
+		c.SessionPersist = true
+		c.SessionStateFile = ".freebuff-session-state.json"
+	}, mock)
+	p.logger = testLogger // internal test: capture the pool's logger
+	p.SetSessionStore(session.NewStore(filepath.Join(t.TempDir(), "state.json")))
+
+	// Same persistence config on reload → no warning.
+	buf.Reset()
+	same := *p.cfg.Load()
+	p.SetConfig(&same)
+	if got := buf.String(); got != "" {
+		t.Fatalf("SetConfig with unchanged persistence logged: %q, want none", got)
+	}
+
+	// Persistence disabled → warn.
+	buf.Reset()
+	disabled := *p.cfg.Load()
+	disabled.SessionPersist = false
+	p.SetConfig(&disabled)
+	if got := buf.String(); !strings.Contains(got, "SESSION_PERSIST") {
+		t.Fatalf("SetConfig disabling persistence logged %q, want SESSION_PERSIST warning", got)
+	}
+
+	// Same persistence, different state file → warn.
+	buf.Reset()
+	moved := *p.cfg.Load()
+	moved.SessionPersist = true
+	moved.SessionStateFile = "elsewhere.json"
+	p.SetConfig(&moved)
+	if got := buf.String(); !strings.Contains(got, "SESSION_PERSIST") || !strings.Contains(got, "elsewhere.json") {
+		t.Fatalf("SetConfig moving the state file logged %q, want SESSION_PERSIST warning with new path", got)
+	}
+}
+
+// TestSetConfigWarnsWhenPersistenceTurnedOn covers the pre-injection state
+// (SetSessionStore never called, store nil): a reload that turns
+// SESSION_PERSIST on cannot build the store at runtime, so it must warn.
+func TestSetConfigWarnsWhenPersistenceTurnedOn(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	var buf bytes.Buffer
+	p := newTestPool(t, mock)
+	p.logger = slog.New(slog.NewTextHandler(&buf, nil))
+	// SetSessionStore never called: recorded persistence is off.
+
+	enabled := *p.cfg.Load()
+	enabled.SessionPersist = true
+	enabled.SessionStateFile = ".freebuff-session-state.json"
+	p.SetConfig(&enabled)
+	if got := buf.String(); !strings.Contains(got, "SESSION_PERSIST") {
+		t.Fatalf("SetConfig enabling persistence logged %q, want SESSION_PERSIST warning", got)
 	}
 }
 
