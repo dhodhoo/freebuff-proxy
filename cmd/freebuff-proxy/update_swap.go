@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 )
@@ -90,7 +89,7 @@ func installWindows(execPath, tempPath string) (string, error) {
 // cmd's incremental file reads); the marker is the source of truth and the
 // inert .bat is overwritten on the next run.
 func windowsUpdateScript(execPath, tempPath string, pid int) string {
-	markerBase := filepath.Base(updateResultMarker(execPath))
+	markerBase := winBase(updateResultMarker(execPath))
 	script := fmt.Sprintf(`@echo off
 setlocal
 set "TARGET_PID=%d"
@@ -125,9 +124,22 @@ goto cleanup
 :cleanup
 endlocal
 `, pid,
-		filepath.Base(tempPath), filepath.Base(execPath),
+		winBase(tempPath), winBase(execPath),
 		markerBase, markerBase, markerBase)
 	// Batch files must use CRLF line endings: cmd misparses LF-only files
 	// (goto labels and multi-line constructs break with "cannot be found").
 	return strings.ReplaceAll(script, "\n", "\r\n")
+}
+
+// winBase returns the final path element split on BOTH Windows and Unix
+// separators. The .bat template interpolates basenames (paths enter only as
+// %~dp0 + basename), and on a non-Windows build host filepath.Base would not
+// split backslashes — leaking a full non-ASCII Windows path into the batch
+// file, which cmd would mangle (console codepage) and the ASCII guard test
+// would reject.
+func winBase(p string) string {
+	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
