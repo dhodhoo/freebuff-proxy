@@ -39,6 +39,10 @@ archives:
         dst: start-proxy.sh
       - src: scripts/start-proxy.ps1
         dst: start-proxy.ps1
+      - src: scripts/gen-token.cmd
+        dst: gen-token.cmd
+      - src: scripts/start-proxy.cmd
+        dst: start-proxy.cmd
       - src: scripts/README.md
         dst: README.md
 checksum:

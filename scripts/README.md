@@ -27,7 +27,7 @@ The extracted folder contains `freebuff-proxy` (Linux/macOS) or
 Terminal**, then:
 
 ```powershell
-.\start-proxy.ps1
+.\start-proxy.cmd
 ```
 
 **Linux:** unzip, right-click the extracted folder → **Open in
@@ -43,6 +43,11 @@ missing) and runs in the foreground so logs are visible — press Ctrl+C
 to stop. You can also run the binary directly (`./freebuff-proxy` /
 `.\freebuff-proxy.exe`) from that terminal.
 
+> **Windows execution policy:** if PowerShell blocks a `.ps1` with "not
+> digitally signed", use the `.cmd` wrappers instead — `.\start-proxy.cmd`
+> and `.\gen-token.cmd` run with `-ExecutionPolicy Bypass` and are not
+> subject to the policy.
+
 ## Quick start — just run it
 
 Run the script with no arguments. It shows recommended options and the
@@ -56,25 +61,28 @@ auto-creating it from `.env.example` if it doesn't exist yet.
 
 ## Windows (PowerShell)
 
+Run the `.cmd` wrapper — it bypasses the execution policy that blocks
+unsigned `.ps1` files:
+
 ```powershell
 # Recommended: interactive menu — Enter appends to .\.env
-.\gen-freebuff-token.ps1
-
-# Non-interactive (piped/CI): auto-appends to .\.env
-.\gen-freebuff-token.ps1 < nul
+.\gen-token.cmd
 
 # Explicit modes (skip the menu):
-.\gen-freebuff-token.ps1 -ToClipboard
-.\gen-freebuff-token.ps1 -Save
-.\gen-freebuff-token.ps1 -Append
-.\gen-freebuff-token.ps1 -Append -EnvFile D:\path\to\.env
+.\gen-token.cmd -ToClipboard
+.\gen-token.cmd -Save
+.\gen-token.cmd -Append
+.\gen-token.cmd -Append -EnvFile D:\path\to\.env
 ```
 
-If PowerShell blocks the script with an execution-policy error, run the
-current session with the policy bypassed first:
+The `.cmd` wrapper invokes `gen-freebuff-token.ps1` with
+`-ExecutionPolicy Bypass`, so no policy changes are needed. If you
+prefer to call the `.ps1` directly and it is blocked, run the current
+session with the policy bypassed first:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
+.\gen-freebuff-token.ps1
 ```
 
 ## Linux / macOS (bash)
