@@ -852,10 +852,10 @@ func TestClassifyBanUnixMsResumesAt(t *testing.T) {
 			if !errors.As(err, &be) {
 				t.Fatalf("want *BanError, got %v", err)
 			}
-		if !be.ResumesAt.Equal(tc.want) {
-			t.Errorf("ResumesAt = %v, want %v", be.ResumesAt, tc.want)
-		}
-	})
+			if !be.ResumesAt.Equal(tc.want) {
+				t.Errorf("ResumesAt = %v, want %v", be.ResumesAt, tc.want)
+			}
+		})
 	}
 }
 

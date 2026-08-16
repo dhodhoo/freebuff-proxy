@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -75,7 +74,10 @@ func TestWindowsUpdateScriptASCIIOnlyWithRetry(t *testing.T) {
 	if strings.Contains(script, "张三") {
 		t.Error("helper script embeds the raw non-ASCII path")
 	}
-	if !strings.Contains(script, filepath.Base(exe)) || !strings.Contains(script, filepath.Base(tmp)) {
+	// Basenames must enter the script ASCII-only (winBase splits on both
+	// separators, so this holds on any build host — filepath.Base would not
+	// split backslashes on Linux).
+	if !strings.Contains(script, winBase(exe)) || !strings.Contains(script, winBase(tmp)) {
 		t.Error("helper script does not carry the ASCII file basenames")
 	}
 	// Sprintf escaping must collapse %% -> % (batch variable references).

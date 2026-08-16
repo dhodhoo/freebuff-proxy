@@ -697,7 +697,7 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 		RetryAfterMs           int64                    `json:"retryAfterMs"`
 		AvailableHours         string                   `json:"availableHours"`
 		Message                string                   `json:"message"`
-		LimitedModelOffers     []rawLimitedModelOffer    `json:"limitedModelOffers"`
+		LimitedModelOffers     []rawLimitedModelOffer   `json:"limitedModelOffers"`
 		RateLimitsByModel      map[string]rawModelQuota `json:"rateLimitsByModel"`
 	}
 	if err := json.Unmarshal([]byte(body), &raw); err == nil && raw.Status != "" {

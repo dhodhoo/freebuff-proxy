@@ -364,12 +364,12 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 // SessionSnapshot is a lock-free best-effort view of the cached session
 // state, for healthz-style reporting (pool.TokenSnapshot).
 type SessionSnapshot struct {
-	Status             string
-	InstanceID         string
-	Model              string
-	QueuePosition      int
-	QueueDepth         int
-	TierAccess         string
+	Status        string
+	InstanceID    string
+	Model         string
+	QueuePosition int
+	QueueDepth    int
+	TierAccess    string
 	// CountryCode is the admitted session's country ("" when absent).
 	CountryCode        string
 	TierCountry        string

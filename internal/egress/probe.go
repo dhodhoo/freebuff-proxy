@@ -74,7 +74,7 @@ func Probe(ctx context.Context, dialer func(ctx context.Context, network, addr s
 	if err != nil {
 		return Result{Err: err}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return Result{Err: fmt.Errorf("egress probe: %s returned %s", ProbeURL, resp.Status)}
 	}
