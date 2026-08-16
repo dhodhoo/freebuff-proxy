@@ -125,6 +125,8 @@ For multi-account management or multi-user API routing:
 
 `deepseek/deepseek-v4-flash` is the default. It is the most open model across all regions and tiers, which is why every example in this guide uses it.
 
+Only request models your account's tier and region actually offers: out-of-tier picks are refused or silently downgraded to `deepseek/deepseek-v4-flash`, and the requested model id is correlated with your egress IP's region.
+
 Query `http://localhost:3457/v1/models` for the full live catalog.
 
 ---

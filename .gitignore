@@ -4,7 +4,12 @@ reference/
 # ── local secrets / credentials ──
 .env
 .env.local
+.env.*
+!.env.example
+!.env.full-example
 config.json
+config.*.json
+!config.example.json
 *.pem
 *.key
 

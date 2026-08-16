@@ -14,6 +14,8 @@ Your coding tools expect an OpenAI-style endpoint (`/v1/chat/completions`). The 
 
 > **⚠️ Terms-of-service risk.** Using your FreeBuff token through this proxy conflicts with FreeBuff/Codebuff terms of service; upstream abuse detection can suspend or permanently ban accounts. Use `SAFE_MODE=true`, keep usage modest, and do not run unattended 24/7. See [Getting Started](docs/guides/getting-started.md).
 
+> **⚠️ Honest expectations.** FreeBuff's servers are strict, and this proxy **reduces** ban risk — it does not eliminate it. Nothing here can guarantee your account is never flagged or banned. Upstream detection is documented in the open-source FreeBuff client: per-request IP scoring (VPN/proxy/Tor/hosting egress → limited tier or terminal `country_blocked`), per-account trust levels with sticky caps (third-party-client flag, shared signup network, shared mailbox), daily spend ceilings ($0.50/day for restricted cohorts), and mass sweeps against known farm shapes (6,699 of 7,129 disposable-email accounts were already banned when the blocklist was compiled). This project is a local adapter that exposes FreeBuff's models as an OpenAI-compatible API for other coding agents (OpenCode, pi, hermes, openclaw, or any client that supports a custom endpoint). Your auth tokens are handled automatically by the gateway, which reimplements the official CLI's wire protocol (~99% parity); it is not the official client, and upstream changes can break it until adapted. Keep usage modest and follow the hygiene rules below; further improvements to session handling and ban avoidance are planned.
+
 ---
 
 ## Table of Contents
@@ -254,12 +256,34 @@ opt out). It enables essential anti-ban protections and presets:
   It does **not** aggressively round-robin healthy keys. Letting one account run until its
   daily quota is natural usage; rotating many healthy keys in rapid succession looks like
   account farming and can trigger upstream ban detection.
+- **Do not route through a VPN.** VPN / proxy / Tor / hosting egress is a hard-block signal:
+  it demotes the account to the limited tier or a terminal `country_blocked`, and restricted
+  cohorts are priced at a **$0.50/day spend ceiling** (≈1 session/day). The proxy's stealth
+  settings mask TLS fingerprints and proxy headers — they do **not** change your public IP.
+  Use a normal residential connection.
+- **Do not hammer many tokens at once from the same public IP.** Upstream caps how many
+  distinct users can hold an active free session on one egress IP (`ip_capped`, 429), and
+  accounts created from the same signup network (≥8 per /24) or mailbox (≥3) are permanently
+  capped at lower trust levels. Documented ban cohorts include single-IP rings and same-day
+  account mints. The pool already drains keys one at a time — do not add aggressive rotation
+  on top.
+- **Only request models your account's tier and region actually offers.** Out-of-tier picks
+  are silently downgraded to `deepseek/deepseek-v4-flash` or refused (`model_unavailable`,
+  `session_model_mismatch`). The requested model id is correlated with the egress IP's
+  resolved geo, so a premium model request from a VPN/hosting IP is a suspicious,
+  ToS-prohibited combination.
+- **Know the difference between a quota and a ban.** `429` (quota/waiting room, resets at
+  Pacific midnight) is the normal end-of-day signal — the proxy locks the token locally and
+  answers in `<1ms`, and routers fail over. Only `403` with `banned` / `country_blocked`
+  means the account itself is gone: stop using it and move to a fresh established account.
 - **For ~24h of continuous coding, budget 4–5 keys.** Each FreeBuff account has a daily
   session quota (≈6 sessions on the limited tier, ≈5 premium sessions/day). One key ≈ one
   day of moderate use. Configure `AUTH_TOKENS` with as many keys as you need and let the
   pool drain them one at a time.
 - **Register accounts with real email addresses** (e.g. Gmail). Disposable / temp-mail
-  registrations are flagged as not-legitimate users and are more likely to be banned.
+  registrations are a documented ban cohort: 6,699 of 7,129 accounts on flagged domains were
+  already banned when the blocklist was compiled. Accounts sharing one mailbox are capped at
+  lower trust levels.
 
 **Why `MAX_MESSAGES_PER_DAY` Defaults to `0` (Unlimited):**
 

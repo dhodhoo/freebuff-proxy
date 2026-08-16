@@ -97,6 +97,12 @@ the client sends:
 > mode. Expect the active account to surface a 429 (`reset at <next 00:00 PT>`) once its
 > daily quota is exhausted; that is the normal end-of-quota signal, not a ban, and 9router
 > auto-falls back to the next key.
+>
+> Also keep the **total account count per public IP modest**: upstream caps how many distinct
+> users can hold an active free session on one egress IP (`ip_capped`, 429), and accounts
+> created from the same signup network (≥8 per /24) or mailbox (≥3) are permanently capped at
+> lower trust levels. A large multi-key pool behind one IP can hit `ip_capped` even in
+> fallback order — spread keys across networks if you need many accounts.
 
 Verify with curl before touching 9router (no token needed for models/healthz):
 
