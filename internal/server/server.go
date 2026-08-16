@@ -592,17 +592,33 @@ func (s *Server) handleTokenFinish(w http.ResponseWriter, r *http.Request) {
 	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" runs finished.")
 }
 
+// probeModel returns the safest model to probe a token with: the fallback
+// default (deepseek-v4-flash — the model every account gets, incl. limited
+// tier) when it is in the catalog, else the first catalog model. Alphabetical
+// models[0] would otherwise pick anthropic/claude-fable-5, a capacity-gated
+// offer model that makes token tests/smoke fail on most accounts.
+func probeModel(reg *registry.Registry) string {
+	models := reg.Models()
+	if len(models) == 0 {
+		return ""
+	}
+	for _, id := range models {
+		if id == session.DefaultFallbackModel {
+			return id
+		}
+	}
+	return models[0]
+}
+
 // handleTokenTest probes a token with a real upstream session handshake
-// (create + end) against the first catalog model.
+// (create + end) against the fallback model.
 func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
 	id, err := tokenActionID(r)
 	var model string
 	if err == nil {
-		models := s.reg.Models()
-		if len(models) == 0 {
+		model = probeModel(s.reg)
+		if model == "" {
 			err = errors.New("registry has no models to probe")
-		} else {
-			model = models[0]
 		}
 	}
 	var instanceID string
@@ -624,11 +640,7 @@ func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
 // token gets a real session handshake with its own timeout; per-token results
 // are rendered as a fragment.
 func (s *Server) handleTokenTestAll(w http.ResponseWriter, r *http.Request) {
-	models := s.reg.Models()
-	var probeModel string
-	if len(models) > 0 {
-		probeModel = models[0]
-	}
+	probeModel := probeModel(s.reg)
 	count := 0
 	for _, snap := range s.pool.PoolSnapshot().Tokens {
 		i := snap.Token
@@ -690,12 +702,11 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	req.Prompt = strings.TrimSpace(req.Prompt)
 	req.Token = strings.TrimSpace(req.Token)
 	if req.Model == "" {
-		models := s.reg.Models()
-		if len(models) == 0 {
+		req.Model = probeModel(s.reg)
+		if req.Model == "" {
 			s.dash.RenderConfigResult(w, r, false, "No models in the registry to test.")
 			return
 		}
-		req.Model = models[0]
 	}
 	if req.Prompt == "" {
 		req.Prompt = "ping"
@@ -1137,14 +1148,14 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 
 	// Per-token validity probes (pooled and hybrid-with-tokens modes).
 	if !cfg.BridgeMode() {
-		models := s.reg.Models()
-		if len(models) == 0 {
+		probe := probeModel(s.reg)
+		if probe == "" {
 			checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Cannot probe tokens: registry has no models"})
 		} else {
 			for _, snap := range s.pool.PoolSnapshot().Tokens {
 				idx := snap.Token
 				probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
-				_, err := s.pool.TestToken(probeCtx, idx, models[0])
+				_, err := s.pool.TestToken(probeCtx, idx, probe)
 				probeCancel()
 				if err != nil {
 					checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
@@ -1706,9 +1717,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := s.started.Unix()
 	snaps := s.pool.Snapshot()
 	models := s.reg.Models()
+	hideUnavailable := s.cfg.Load().ModelsHideUnavailable
 	data := make([]map[string]any, 0, len(models))
 	for _, id := range models {
 		available, status, tier := modelAvailability(id, snaps)
+		if hideUnavailable && !available {
+			// MODELS_HIDE_UNAVAILABLE=true: prune region/tier/quota-locked
+			// models so picker clients never auto-select one. Off by default
+			// because a stale signal could hide a working model.
+			continue
+		}
 		data = append(data, map[string]any{
 			"id":                  id,
 			"object":              "model",
@@ -1726,11 +1744,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // modelAvailability derives the advisory per-model annotation from the pool
 // token snapshots. The snapshot does not carry the model of a live session,
 // so the signal set is: quotaByModel presence (the session admitted this
-// model), quota exhaustion (recent >= limit), and session-level locks. The
-// result is deliberately conservative: a model is never marked unavailable
-// from snapshot data alone — available defaults to true when no signal
-// exists, so a working model is never hidden. current_access_tier is the
-// first non-empty TierAccess across the pool ("" when unknown).
+// model), quota exhaustion (recent >= limit), session-level locks, and the
+// access tier. A token demoted to the 'limited' tier (region/privacy
+// demotion) can only use LimitedTierModels — every other model is marked
+// unavailable with status "region_limited" (kept in the list, never hidden,
+// so a stale tier can't strand a working model). available defaults to true
+// when no signal exists, so a working model is never hidden.
 func modelAvailability(id string, snaps []pool.TokenSnapshot) (available bool, status, tier string) {
 	available = true
 	status = "unknown"
@@ -1759,6 +1778,14 @@ func modelAvailability(id string, snaps []pool.TokenSnapshot) (available bool, s
 		status = "locked"
 	case quotaHit:
 		status = "available"
+	}
+	if status == "unknown" && tier == "limited" && !registry.LimitedTierModels[id] {
+		// Region/privacy demotion: the model is not on the limited tier's
+		// allowlist and the session never admitted it. Keep it listed but
+		// honest — clients that auto-pick on the available flag skip it,
+		// and a stale tier can never hide a model the session admitted
+		// (admission is ground truth, handled above).
+		return false, "region_limited", tier
 	}
 	return available, status, tier
 }

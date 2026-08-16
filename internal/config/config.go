@@ -22,34 +22,35 @@ import (
 
 // Config is the fully-resolved, validated runtime configuration.
 type Config struct {
-	ListenAddr          string
-	UpstreamBaseURL     string
-	AuthTokens          []string
-	RotationInterval    time.Duration
-	RequestTimeout      time.Duration
-	SessionCallTimeout  time.Duration
-	APIKeys             []string
-	AdminToken          string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
-	HTTPProxy           string
-	SOCKS5Proxy         string
-	SOCKS5Proxies       []string // comma-separated list of SOCKS5 proxies (#23)
-	ProxyRotation       string   // "per-token" (default), "round-robin", "random" (#23)
-	CostMode            string   // "" (omit) or "free"; A/B pending, PRD §8
-	TLSFingerprint      string   // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
-	RegistryRefresh     time.Duration
-	DebugDump           bool
-	LogFile             string
-	LogLevel            string            // "" (use -v/default) or debug|info|warn|error
-	MaxMessagesPerDay   int               // 0 = unlimited: per-token cap on successful chats per 24h
-	IdleRotationTimeout time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
-	SafeMode            bool              // true = apply recommended anti-ban safe defaults
-	HybridMode          bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
-	RequestJitter       time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
-	CLIVersion          string            // upstream CLI version string (default: 0.10.7)
-	ModelAliases        map[string]string // map model alias -> real model ID (#25)
-	TransientRetries    int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
-	DiscoveredSource    string            // auto-discovered credentials file path (if any)
-	DiscoveredEmail     string            // auto-discovered account email (if any)
+	ListenAddr            string
+	UpstreamBaseURL       string
+	AuthTokens            []string
+	RotationInterval      time.Duration
+	RequestTimeout        time.Duration
+	SessionCallTimeout    time.Duration
+	APIKeys               []string
+	AdminToken            string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
+	HTTPProxy             string
+	SOCKS5Proxy           string
+	SOCKS5Proxies         []string // comma-separated list of SOCKS5 proxies (#23)
+	ProxyRotation         string   // "per-token" (default), "round-robin", "random" (#23)
+	CostMode              string   // "" (omit) or "free"; A/B pending, PRD §8
+	TLSFingerprint        string   // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
+	RegistryRefresh       time.Duration
+	DebugDump             bool
+	LogFile               string
+	LogLevel              string            // "" (use -v/default) or debug|info|warn|error
+	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
+	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
+	SafeMode              bool              // true = apply recommended anti-ban safe defaults
+	HybridMode            bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
+	ModelsHideUnavailable bool              // true = /v1/models prunes models marked unavailable (region/tier/quota)
+	RequestJitter         time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
+	CLIVersion            string            // upstream CLI version string (default: 0.10.7)
+	ModelAliases          map[string]string // map model alias -> real model ID (#25)
+	TransientRetries      int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
+	DiscoveredSource      string            // auto-discovered credentials file path (if any)
+	DiscoveredEmail       string            // auto-discovered account email (if any)
 }
 
 // BridgeMode reports whether the proxy runs without any AUTH_TOKENS: every
@@ -83,30 +84,31 @@ type rawConfig struct {
 	// explicitly-empty AUTH_TOKENS means the operator chose bridge mode, so
 	// CLI auto-discovery must not refill it (runtime mode switch persists
 	// "AUTH_TOKENS=" to .env and relies on this).
-	AuthTokensSet       bool     `json:"-"`
-	RotationInterval    string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout      string   `json:"REQUEST_TIMEOUT"`
-	SessionCallTimeout  string   `json:"SESSION_CALL_TIMEOUT"`
-	APIKeys             []string `json:"API_KEYS"`
-	AdminToken          string   `json:"ADMIN_TOKEN"`
-	HTTPProxy           string   `json:"HTTP_PROXY"`
-	SOCKS5Proxy         string   `json:"SOCKS5_PROXY"`
-	SOCKS5Proxies       []string `json:"SOCKS5_PROXIES"`
-	ProxyRotation       string   `json:"PROXY_ROTATION"`
-	CostMode            string   `json:"COST_MODE"`
-	TLSFingerprint      string   `json:"TLS_FINGERPRINT"`
-	RegistryRefresh     string   `json:"REGISTRY_REFRESH"`
-	DebugDump           bool     `json:"DEBUG_DUMP"`
-	LogFile             string   `json:"LOG_FILE"`
-	LogLevel            string   `json:"LOG_LEVEL"`
-	MaxMessagesPerDay   *int     `json:"MAX_MESSAGES_PER_DAY"`
-	IdleRotationTimeout string   `json:"IDLE_ROTATION_TIMEOUT"`
-	SafeMode            bool     `json:"SAFE_MODE"`
-	HybridMode          bool     `json:"HYBRID_MODE"`
-	RequestJitter       string   `json:"REQUEST_JITTER"`
-	CLIVersion          string   `json:"CLI_VERSION"`
-	ModelAliases        string   `json:"MODEL_ALIASES"`
-	TransientRetries    *int     `json:"TRANSIENT_RETRIES"`
+	AuthTokensSet         bool     `json:"-"`
+	RotationInterval      string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout        string   `json:"REQUEST_TIMEOUT"`
+	SessionCallTimeout    string   `json:"SESSION_CALL_TIMEOUT"`
+	APIKeys               []string `json:"API_KEYS"`
+	AdminToken            string   `json:"ADMIN_TOKEN"`
+	HTTPProxy             string   `json:"HTTP_PROXY"`
+	SOCKS5Proxy           string   `json:"SOCKS5_PROXY"`
+	SOCKS5Proxies         []string `json:"SOCKS5_PROXIES"`
+	ProxyRotation         string   `json:"PROXY_ROTATION"`
+	CostMode              string   `json:"COST_MODE"`
+	TLSFingerprint        string   `json:"TLS_FINGERPRINT"`
+	RegistryRefresh       string   `json:"REGISTRY_REFRESH"`
+	DebugDump             bool     `json:"DEBUG_DUMP"`
+	LogFile               string   `json:"LOG_FILE"`
+	LogLevel              string   `json:"LOG_LEVEL"`
+	MaxMessagesPerDay     *int     `json:"MAX_MESSAGES_PER_DAY"`
+	IdleRotationTimeout   string   `json:"IDLE_ROTATION_TIMEOUT"`
+	SafeMode              bool     `json:"SAFE_MODE"`
+	HybridMode            bool     `json:"HYBRID_MODE"`
+	ModelsHideUnavailable bool     `json:"MODELS_HIDE_UNAVAILABLE"`
+	RequestJitter         string   `json:"REQUEST_JITTER"`
+	CLIVersion            string   `json:"CLI_VERSION"`
+	ModelAliases          string   `json:"MODEL_ALIASES"`
+	TransientRetries      *int     `json:"TRANSIENT_RETRIES"`
 }
 
 func defaultRawConfig() rawConfig {
@@ -175,6 +177,7 @@ func Load(configPath string) (Config, error) {
 	overrideString(&raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
 	overrideBool(&raw.SafeMode, "SAFE_MODE")
 	overrideBool(&raw.HybridMode, "HYBRID_MODE")
+	overrideBool(&raw.ModelsHideUnavailable, "MODELS_HIDE_UNAVAILABLE")
 	overrideString(&raw.RequestJitter, "REQUEST_JITTER")
 	overrideString(&raw.CLIVersion, "CLI_VERSION")
 	overrideString(&raw.ModelAliases, "MODEL_ALIASES")
@@ -245,32 +248,33 @@ func Load(configPath string) (Config, error) {
 	}
 
 	cfg := Config{
-		ListenAddr:          strings.TrimSpace(raw.ListenAddr),
-		UpstreamBaseURL:     upstreamBaseURL,
-		AuthTokens:          dedupeStrings(raw.AuthTokens),
-		RotationInterval:    rotationInterval,
-		RequestTimeout:      requestTimeout,
-		SessionCallTimeout:  sessionCallTimeout,
-		APIKeys:             dedupeStrings(raw.APIKeys),
-		AdminToken:          strings.TrimSpace(raw.AdminToken),
-		HTTPProxy:           strings.TrimSpace(raw.HTTPProxy),
-		SOCKS5Proxy:         strings.TrimSpace(raw.SOCKS5Proxy),
-		SOCKS5Proxies:       dedupeStrings(raw.SOCKS5Proxies),
-		ProxyRotation:       strings.TrimSpace(raw.ProxyRotation),
-		CostMode:            strings.TrimSpace(raw.CostMode),
-		TLSFingerprint:      strings.TrimSpace(raw.TLSFingerprint),
-		RegistryRefresh:     registryRefresh,
-		DebugDump:           raw.DebugDump,
-		LogFile:             strings.TrimSpace(raw.LogFile),
-		LogLevel:            strings.TrimSpace(raw.LogLevel),
-		MaxMessagesPerDay:   maxMessagesPerDay,
-		IdleRotationTimeout: idleRotationTimeout,
-		SafeMode:            raw.SafeMode,
-		HybridMode:          raw.HybridMode,
-		RequestJitter:       requestJitter,
-		CLIVersion:          strings.TrimSpace(raw.CLIVersion),
-		ModelAliases:        parseMap(raw.ModelAliases),
-		TransientRetries:    transientRetries,
+		ListenAddr:            strings.TrimSpace(raw.ListenAddr),
+		UpstreamBaseURL:       upstreamBaseURL,
+		AuthTokens:            dedupeStrings(raw.AuthTokens),
+		RotationInterval:      rotationInterval,
+		RequestTimeout:        requestTimeout,
+		SessionCallTimeout:    sessionCallTimeout,
+		APIKeys:               dedupeStrings(raw.APIKeys),
+		AdminToken:            strings.TrimSpace(raw.AdminToken),
+		HTTPProxy:             strings.TrimSpace(raw.HTTPProxy),
+		SOCKS5Proxy:           strings.TrimSpace(raw.SOCKS5Proxy),
+		SOCKS5Proxies:         dedupeStrings(raw.SOCKS5Proxies),
+		ProxyRotation:         strings.TrimSpace(raw.ProxyRotation),
+		CostMode:              strings.TrimSpace(raw.CostMode),
+		TLSFingerprint:        strings.TrimSpace(raw.TLSFingerprint),
+		RegistryRefresh:       registryRefresh,
+		DebugDump:             raw.DebugDump,
+		LogFile:               strings.TrimSpace(raw.LogFile),
+		LogLevel:              strings.TrimSpace(raw.LogLevel),
+		MaxMessagesPerDay:     maxMessagesPerDay,
+		IdleRotationTimeout:   idleRotationTimeout,
+		SafeMode:              raw.SafeMode,
+		HybridMode:            raw.HybridMode,
+		ModelsHideUnavailable: raw.ModelsHideUnavailable,
+		RequestJitter:         requestJitter,
+		CLIVersion:            strings.TrimSpace(raw.CLIVersion),
+		ModelAliases:          parseMap(raw.ModelAliases),
+		TransientRetries:      transientRetries,
 	}
 
 	// Auto-discover CLI token if no AUTH_TOKENS were explicitly configured
@@ -526,6 +530,7 @@ func applyDotenv(raw *rawConfig) error {
 	// read itself, so honoring it from .env would be circular).
 	overrideBoolFrom(&raw.SafeMode, get, "SAFE_MODE")
 	overrideBoolFrom(&raw.HybridMode, get, "HYBRID_MODE")
+	overrideBoolFrom(&raw.ModelsHideUnavailable, get, "MODELS_HIDE_UNAVAILABLE")
 	overrideStringFrom(&raw.RequestJitter, get, "REQUEST_JITTER")
 	overrideStringFrom(&raw.CLIVersion, get, "CLI_VERSION")
 	overrideStringFrom(&raw.ModelAliases, get, "MODEL_ALIASES")

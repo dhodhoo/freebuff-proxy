@@ -34,9 +34,11 @@ const (
 	// a pathological upstream (always-expired or never-advancing queue)
 	// cannot spin forever.
 	maxOuterIterations = 10
-	// defaultFallbackModel is the guaranteed-available model used when a
-	// requested model is temporarily unavailable upstream.
-	defaultFallbackModel = "deepseek/deepseek-v4-flash"
+	// DefaultFallbackModel is the guaranteed-available model used when a
+	// requested model is temporarily unavailable upstream, and the default
+	// probe target for token tests / smoke: every account (including
+	// limited tier) can use it, unlike an alphabetical-first catalog pick.
+	DefaultFallbackModel = "deepseek/deepseek-v4-flash"
 )
 
 // WaitingRoomError is returned when the session is queued and pollAt has not
@@ -349,8 +351,8 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 			slog.Debug("session released on model lock, retrying", "current", st.CurrentModel, "target", targetModel)
 		case "model_unavailable":
 			// Requested model is not available; fall back to default model.
-			slog.Warn("session: model unavailable upstream, falling back to default", "requested", targetModel, "fallback", defaultFallbackModel)
-			targetModel = defaultFallbackModel
+			slog.Warn("session: model unavailable upstream, falling back to default", "requested", targetModel, "fallback", DefaultFallbackModel)
+			targetModel = DefaultFallbackModel
 			m.mu.Lock()
 			m.state = nil
 			m.mu.Unlock()

@@ -766,6 +766,133 @@ func TestModelsAnnotationWithQuota(t *testing.T) {
 	}
 }
 
+// TestModelsRegionLimited verifies the tier-aware annotation: with a token in
+// the 'limited' tier (region/privacy demotion), a model outside the limited
+// allowlist with no admission signal is marked available=false +
+// status=region_limited, while an allowlisted model (deepseek-v4-flash) stays
+// available. An admitted model keeps its available status (admission is
+// ground truth).
+func TestModelsRegionLimited(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	ts, _ := newTestServer(t, nil, mock)
+
+	// Admit a session so the token's snapshot carries tier=limited. The
+	// admitted model (modelA) becomes available by admission.
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/v1/models", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Data []struct {
+			ID        string `json:"id"`
+			Available bool   `json:"available"`
+			Status    string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("models is not JSON: %v: %s", err, data)
+	}
+	byID := map[string]struct {
+		Available bool
+		Status    string
+	}{}
+	for _, m := range out.Data {
+		byID[m.ID] = struct {
+			Available bool
+			Status    string
+		}{m.Available, m.Status}
+	}
+	// deepseek-v4-flash is on the limited allowlist -> available.
+	if m, ok := byID["deepseek/deepseek-v4-flash"]; !ok || !m.Available {
+		t.Errorf("deepseek-v4-flash = %+v, want available:true on limited tier", m)
+	}
+	// anthropic/claude-fable-5 is NOT on the limited allowlist and was never
+	// admitted -> available:false + region_limited.
+	if m, ok := byID["anthropic/claude-fable-5"]; !ok {
+		t.Errorf("fable-5 missing from /v1/models")
+	} else if m.Available {
+		t.Errorf("fable-5 available = true, want false on limited tier")
+	} else if m.Status != "region_limited" {
+		t.Errorf("fable-5 status = %q, want region_limited", m.Status)
+	}
+}
+
+// TestModelsHideUnavailable verifies MODELS_HIDE_UNAVAILABLE=true prunes
+// region-limited models from the list so picker clients cannot select them.
+func TestModelsHideUnavailable(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	ts, _ := newTestServerCfg(t, nil, func(c *config.Config) {
+		c.ModelsHideUnavailable = true
+	}, mock)
+
+	// Admit a session so the token snapshot carries tier=limited.
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/v1/models", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("models is not JSON: %v: %s", err, data)
+	}
+	for _, m := range out.Data {
+		if m.ID == "anthropic/claude-fable-5" {
+			t.Errorf("fable-5 present in /v1/models with MODELS_HIDE_UNAVAILABLE=true")
+		}
+	}
+	found := false
+	for _, m := range out.Data {
+		if m.ID == "deepseek/deepseek-v4-flash" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("deepseek-v4-flash pruned, want kept (limited allowlist)")
+	}
+}
+
+// TestSmokeDefaultsToFallbackModel verifies the smoke test with no explicit
+// model probes the guaranteed fallback (deepseek-v4-flash), not the
+// alphabetical-first catalog model (anthropic/claude-fable-5, a gated offer).
+func TestSmokeDefaultsToFallbackModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-sm", 1, `"choices":[{"index":0,"delta":{"content":"ping"},"finish_reason":"stop"}]`))
+	ts, _ := newTestServer(t, nil, mock)
+
+	// Smoke with no model field: server picks the fallback.
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/admin/smoke", []byte(`{"prompt":"ping"}`), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("smoke status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if len(mock.RecordedChatHeaders) == 0 {
+		t.Fatal("no upstream chat recorded")
+	}
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "deepseek/deepseek-v4-flash" {
+		t.Errorf("smoke probe model = %q, want deepseek/deepseek-v4-flash", got)
+	}
+}
+
 // TestHealthzModeTierCountry verifies healthz surfaces the effective routing
 // mode plus the per-token tier/country from the session admission.
 func TestHealthzModeTierCountry(t *testing.T) {

@@ -45,6 +45,16 @@ const fetchTimeout = 30 * time.Second
 // than this fails the fetch, which keeps the previous registry state.
 const maxFetchBytes = 2 << 20
 
+// LimitedTierModels is the model set available to 'limited' access-tier
+// accounts (egress region demotion, privacy-signal demotion). Mirrors the
+// upstream LIMITED_FREEBUFF_MODEL_IDS constant
+// (freebuff/common/src/constants/freebuff-models.ts): deepseek-v4-flash +
+// mimo-v2.5. Used to annotate /v1/models availability per token tier.
+var LimitedTierModels = map[string]bool{
+	"deepseek/deepseek-v4-flash": true,
+	"mimo/mimo-v2.5":             true,
+}
+
 // fallbackAgents is the hardcoded model→agent fallback used when the sources
 // are unreachable. Ported verbatim from registry.js (lines 14-41), entry
 // order preserved: first-seen assignment decides which agent owns models that

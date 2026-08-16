@@ -35,6 +35,24 @@ func egressRegionRow(cache *egress.Cache) (line string, warn bool) {
 // runTokenTest probes the first configured token with a real session
 // handshake (the same path the pool uses) and exits 0 on success, 1 on
 // failure. Exposed as -test-token for installers and scripts.
+// probeModel returns the safest model to probe a token with: the fallback
+// default (deepseek-v4-flash — the model every account gets, incl. limited
+// tier) when in the catalog, else the first catalog model. The alphabetical
+// first model (anthropic/claude-fable-5) is a capacity-gated offer model
+// that makes token tests fail on most accounts.
+func probeModel(reg *registry.Registry) string {
+	models := reg.Models()
+	if len(models) == 0 {
+		return ""
+	}
+	for _, id := range models {
+		if id == "deepseek/deepseek-v4-flash" {
+			return id
+		}
+	}
+	return models[0]
+}
+
 func runTokenTest(configPath string) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -47,8 +65,8 @@ func runTokenTest(configPath string) {
 	}
 	reg := registry.New(&cfg, &http.Client{Timeout: 10 * time.Second})
 	reg.LoadFallback()
-	models := reg.Models()
-	if len(models) == 0 {
+	model := probeModel(reg)
+	if model == "" {
 		fmt.Fprintln(os.Stderr, "freebuff-proxy: -test-token: registry has no models to probe against")
 		os.Exit(1)
 	}
@@ -60,7 +78,7 @@ func runTokenTest(configPath string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	st, err := client.CreateSessionForModel(ctx, models[0])
+	st, err := client.CreateSessionForModel(ctx, model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: token rejected upstream: %v\n", err)
 		os.Exit(1)
@@ -68,7 +86,7 @@ func runTokenTest(configPath string) {
 	endCtx, endCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_ = client.EndSession(endCtx, st.InstanceID)
 	endCancel()
-	fmt.Printf("freebuff-proxy: token OK (%s, session %s)\n", models[0], st.InstanceID)
+	fmt.Printf("freebuff-proxy: token OK (%s, session %s)\n", model, st.InstanceID)
 	os.Exit(0)
 }
 
@@ -179,8 +197,8 @@ func runDoctor(configPath string) {
 	// through the same client path the pool uses. This is the check that
 	// catches expired/revoked tokens before the first chat 401s.
 	if !cfg.BridgeMode() {
-		models := reg.Models()
-		if len(models) == 0 {
+		probe := probeModel(reg)
+		if probe == "" {
 			warn("Cannot probe tokens: registry has no models")
 		} else {
 			for i, tok := range cfg.AuthTokens {
@@ -191,7 +209,7 @@ func runDoctor(configPath string) {
 					continue
 				}
 				probeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-				st, err := client.CreateSessionForModel(probeCtx, models[0])
+				st, err := client.CreateSessionForModel(probeCtx, probe)
 				cancel()
 				if err != nil {
 					fail(fmt.Sprintf("Token #%d validity probe failed: %v (re-run the upstream CLI to refresh the token)", i+1, err))

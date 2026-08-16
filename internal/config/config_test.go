@@ -707,6 +707,21 @@ func TestDotenvEnvWins(t *testing.T) {
 	}
 }
 
+// TestModelsHideUnavailableEnv verifies MODELS_HIDE_UNAVAILABLE loads from
+// env and lands in Config.
+func TestModelsHideUnavailableEnv(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("MODELS_HIDE_UNAVAILABLE", "true")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ModelsHideUnavailable {
+		t.Error("ModelsHideUnavailable = false, want true (from env)")
+	}
+}
+
 func TestDotenvJSONWins(t *testing.T) {
 	clearEnv(t)
 
