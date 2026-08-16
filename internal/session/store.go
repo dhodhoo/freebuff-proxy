@@ -14,6 +14,10 @@ import (
 // a stale file is ignored instead of mis-parsed.
 const storeVersion = 1
 
+// maxStoreFileSize caps the on-disk store file; anything larger is treated
+// as empty instead of being read into memory wholesale.
+const maxStoreFileSize = 8 << 20 // 8 MiB
+
 // persistedState is the on-disk shape of one token's cached session. The
 // instance id + expiry are the fields that matter for restart-resume; the
 // rest are carried so a resumed session keeps its tier/country/queue view.
@@ -60,28 +64,54 @@ func (s *Store) loadLocked() {
 	if s.loaded {
 		return
 	}
-	s.loaded = true
 	s.data = make(map[string]persistedState)
+
+	// Reject oversized files before reading them into memory.
+	if fi, err := os.Stat(s.path); err == nil && fi.Size() > maxStoreFileSize {
+		slog.Warn("session store: file too large, ignoring", "path", s.path, "bytes", fi.Size())
+		s.loaded = true
+		return
+	}
 
 	data, err := os.ReadFile(s.path)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("session store: read failed", "path", s.path, "err", err)
+		if errors.Is(err, os.ErrNotExist) {
+			// First run: a missing file is a valid empty store.
+			s.loaded = true
+		} else {
+			// Leave loaded=false so the next Load (or Save) retries the
+			// read instead of permanently freezing an empty view that a
+			// later Save would flush over the on-disk file, destroying
+			// other tokens' persisted sessions.
+			slog.Warn("session store: read failed, will retry on next access", "path", s.path, "err", err)
 		}
 		return
 	}
 	var file storeFile
 	if err := json.Unmarshal(data, &file); err != nil {
+		// The file is genuinely bad: remember that so we stop re-parsing it
+		// and proceed empty (a later Save replaces it).
 		slog.Warn("session store: parse failed, ignoring", "path", s.path, "err", err)
+		s.loaded = true
 		return
 	}
 	if file.Version != storeVersion {
 		slog.Warn("session store: version mismatch, ignoring", "path", s.path, "version", file.Version)
+		s.loaded = true
 		return
 	}
 	if file.Sessions != nil {
-		s.data = file.Sessions
+		for key, ps := range file.Sessions {
+			// An "active" entry without an instance id cannot be resumed and
+			// would poison the resume path; drop it on load.
+			if ps.Status == "active" && ps.InstanceID == "" {
+				slog.Warn("session store: dropping active entry with empty instance id", "path", s.path, "key", key)
+				continue
+			}
+			s.data[key] = ps
+		}
 	}
+	s.loaded = true
 }
 
 // Load returns the persisted cached state for key, or nil when absent or
@@ -148,8 +178,26 @@ func (s *Store) Save(key string, cs *cachedState) {
 }
 
 // Remove drops key from the store (session invalidated/ended at runtime).
-func (s *Store) Remove(key string) {
-	s.Save(key, nil)
+// When expectedInstanceID is non-empty the entry is only removed if its
+// stored instance id matches, so a stale invalidation cannot clobber a newer
+// resumed session; an empty expectedInstanceID removes unconditionally.
+func (s *Store) Remove(key, expectedInstanceID string) {
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadLocked()
+
+	ps, ok := s.data[key]
+	if !ok {
+		return
+	}
+	if expectedInstanceID != "" && ps.InstanceID != expectedInstanceID {
+		return
+	}
+	delete(s.data, key)
+	s.flushLocked()
 }
 
 // flushLocked writes the current map atomically. Caller holds s.mu.
@@ -162,19 +210,43 @@ func (s *Store) flushLocked() {
 	}
 
 	dir := filepath.Dir(s.path)
-	if dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			slog.Warn("session store: mkdir failed", "dir", dir, "err", err)
-			return
-		}
+	if dir == "" {
+		dir = "."
+	} else if err := os.MkdirAll(dir, 0o700); err != nil {
+		slog.Warn("session store: mkdir failed", "dir", dir, "err", err)
+		return
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+
+	// Write a temp file in the target directory, then rename it over the
+	// target so a crash mid-write never leaves a truncated state file.
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(s.path)+".tmp*")
+	if err != nil {
+		slog.Warn("session store: temp create failed", "dir", dir, "err", err)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		slog.Warn("session store: write failed", "path", s.path, "err", err)
 		return
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		slog.Warn("session store: close failed", "path", s.path, "err", err)
+		return
+	}
+	if err := os.Rename(tmpName, s.path); err != nil {
+		if _, statErr := os.Stat(s.path); statErr == nil {
+			// The target exists but rename-over-existing failed (e.g.
+			// Windows without MOVEFILE_REPLACE_EXISTING): fall back to
+			// removing the target first, then renaming.
+			_ = os.Remove(s.path)
+			if err := os.Rename(tmpName, s.path); err == nil {
+				return
+			}
+		}
+		_ = os.Remove(tmpName)
 		slog.Warn("session store: rename failed", "path", s.path, "err", err)
-		_ = os.Remove(tmp)
 	}
 }

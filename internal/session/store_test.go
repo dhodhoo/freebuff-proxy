@@ -1,10 +1,14 @@
 package session
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,7 +65,7 @@ func TestStoreRoundtrip(t *testing.T) {
 		t.Errorf("expiresAt = %v, want %v", got.expiresAt, expiry)
 	}
 
-	store.Remove("key")
+	store.Remove("key", "")
 	if got := NewStore(path).Load("key"); got != nil {
 		t.Errorf("Load after Remove = %+v, want nil", got)
 	}
@@ -210,5 +214,206 @@ func TestStoreFileMode(t *testing.T) {
 		if perm := fi.Mode().Perm(); perm != 0o600 {
 			t.Errorf("state file mode = %o, want 600", perm)
 		}
+	}
+}
+
+func TestStoreRemoveCAS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore(path)
+	expiry := time.Now().Add(time.Hour).UTC()
+	store.Save("key", &cachedState{status: "active", instanceID: "inst-1", expiresAt: expiry})
+
+	// Wrong instance id: the entry must survive untouched.
+	store.Remove("key", "inst-other")
+	if got := store.Load("key"); got == nil || got.instanceID != "inst-1" {
+		t.Fatalf("Remove with wrong instance = %+v, want inst-1", got)
+	}
+	// A fresh store over the same file must agree (no-op must not flush).
+	if got := NewStore(path).Load("key"); got == nil || got.instanceID != "inst-1" {
+		t.Fatalf("fresh Load after wrong-instance Remove = %+v, want inst-1", got)
+	}
+
+	// Matching instance id: the entry is removed.
+	store.Remove("key", "inst-1")
+	if got := store.Load("key"); got != nil {
+		t.Fatalf("Remove with matching instance = %+v, want nil", got)
+	}
+	if got := NewStore(path).Load("key"); got != nil {
+		t.Fatalf("fresh Load after matching Remove = %+v, want nil", got)
+	}
+
+	// Empty expected instance id removes unconditionally.
+	store.Save("key2", &cachedState{status: "active", instanceID: "inst-2", expiresAt: expiry})
+	store.Remove("key2", "")
+	if got := store.Load("key2"); got != nil {
+		t.Fatalf("unconditional Remove = %+v, want nil", got)
+	}
+
+	// Removing an absent key is a no-op, not an error.
+	store.Remove("absent", "anything")
+}
+
+func TestStoreConcurrentSaveLoadRemove(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore(path)
+
+	const workers = 16
+	const keysPerWorker = 8
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for k := 0; k < keysPerWorker; k++ {
+				key := fmt.Sprintf("w%d-k%d", w, k)
+				store.Save(key, &cachedState{
+					status:     "active",
+					instanceID: "inst-" + key,
+					expiresAt:  time.Now().Add(time.Hour),
+				})
+				if got := store.Load(key); got == nil || got.instanceID != "inst-"+key {
+					t.Errorf("Load(%q) after Save = %+v", key, got)
+				}
+				// Even keys are removed again by their own writer; the CAS
+				// matches, so the removal must stick.
+				if k%2 == 0 {
+					store.Remove(key, "inst-"+key)
+					if got := store.Load(key); got != nil {
+						t.Errorf("Load(%q) after Remove = %+v, want nil", key, got)
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// A fresh store over the final file must see exactly the keys that were
+	// saved but not removed: the odd keys of every worker.
+	fresh := NewStore(path)
+	for w := 0; w < workers; w++ {
+		for k := 0; k < keysPerWorker; k++ {
+			key := fmt.Sprintf("w%d-k%d", w, k)
+			got := fresh.Load(key)
+			if k%2 == 0 {
+				if got != nil {
+					t.Errorf("fresh Load(%q) = %+v, want nil (removed)", key, got)
+				}
+			} else if got == nil || got.instanceID != "inst-"+key {
+				t.Errorf("fresh Load(%q) = %+v, want inst-%s", key, got, key)
+			}
+		}
+	}
+}
+
+func TestStoreCorruptFileLoadAndOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte("{not valid json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(path)
+	if got := store.Load("key"); got != nil {
+		t.Fatalf("Load on corrupt file = %+v, want nil", got)
+	}
+
+	// A Save after a corrupt read must succeed and replace the broken file
+	// with a valid one carrying the new entry.
+	store.Save("key", &cachedState{status: "active", instanceID: "inst-1", expiresAt: time.Now().Add(time.Hour)})
+	if got := NewStore(path).Load("key"); got == nil || got.instanceID != "inst-1" {
+		t.Fatalf("Load after Save over corrupt file = %+v, want inst-1", got)
+	}
+}
+
+func TestStoreReadErrorDoesNotClobberFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are not enforced on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	seed := NewStore(path)
+	seed.Save("a", &cachedState{status: "active", instanceID: "inst-a", expiresAt: time.Now().Add(time.Hour)})
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Block access to the directory so both the read and the later write
+	// fail: a Save must not clobber a file it could not read.
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Errorf("restoring dir perms: %v", err)
+		}
+	}()
+
+	store := NewStore(path)
+	if got := store.Load("a"); got != nil {
+		t.Fatalf("Load on unreadable store = %+v, want nil", got)
+	}
+	// The Save fails gracefully (temp creation is blocked) and leaves the
+	// on-disk file untouched instead of replacing it with an empty view.
+	store.Save("b", &cachedState{status: "active", instanceID: "inst-b", expiresAt: time.Now().Add(time.Hour)})
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("Save clobbered an unreadable file: got %d bytes, want %d", len(after), len(before))
+	}
+
+	// Restore access before the final assertions; the deferred restore is
+	// only a safety net for temp-dir cleanup.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Once access is restored the store must re-read the file (the failed
+	// read must not have been cached as an empty store) and see the seed.
+	if got := store.Load("a"); got == nil || got.instanceID != "inst-a" {
+		t.Fatalf("Load after perms restored = %+v, want inst-a", got)
+	}
+}
+
+func TestStoreIgnoresOversizedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, make([]byte, maxStoreFileSize+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(path)
+	if got := store.Load("key"); got != nil {
+		t.Fatalf("Load on oversized file = %+v, want nil", got)
+	}
+}
+
+func TestStoreDropsActiveEntryWithoutInstanceID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	file := storeFile{
+		Version: storeVersion,
+		Sessions: map[string]persistedState{
+			"bad":  {Status: "active", InstanceID: "", ExpiresAt: time.Now().Add(time.Hour)},
+			"good": {Status: "active", InstanceID: "inst-1", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(path)
+	if got := store.Load("bad"); got != nil {
+		t.Errorf("Load of invalid active entry = %+v, want nil", got)
+	}
+	if got := store.Load("good"); got == nil || got.instanceID != "inst-1" {
+		t.Errorf("Load of valid entry = %+v, want inst-1", got)
 	}
 }
