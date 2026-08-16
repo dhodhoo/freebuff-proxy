@@ -160,6 +160,19 @@ type Pool struct {
 	bridgeMu    sync.Mutex
 	bridge      map[string]*bridgeEntry
 	bridgeOrder []string
+
+	// store persists session state across restarts (SESSION_PERSIST); nil
+	// disables. Injected by the caller (main) via SetSessionStore so there
+	// is exactly one store shared by pooled and bridge entries.
+	store *session.Store
+
+	// storeSessionPersist and storeStateFile record the persistence config
+	// the store was created with (captured by SetSessionStore), so SetConfig
+	// can detect a reload that changes the persistence semantics — the live
+	// store cannot be swapped at runtime, so such a change only takes
+	// effect on the next restart.
+	storeSessionPersist bool
+	storeStateFile      string
 }
 
 type tokenEntry struct {
@@ -205,6 +218,21 @@ func New(cfg *config.Config, clients []*upstream.Client, sessions []*session.Man
 // Acquire/maintain pass without rebuilding the pool.
 func (p *Pool) SetConfig(cfg *config.Config) {
 	p.cfg.Store(cfg)
+
+	// Session persistence is decided at startup: the store is built from the
+	// boot config and injected once via SetSessionStore, so a reload cannot
+	// move the live store. Warn when the reloaded config changes the
+	// persistence semantics — otherwise operators get a silent no-op (the
+	// dashboard save / admin reload funnels through here).
+	persistChanged := cfg.SessionPersist != p.storeSessionPersist ||
+		(cfg.SessionPersist && cfg.SessionStateFile != p.storeStateFile)
+	if persistChanged {
+		p.logger.Warn("SESSION_PERSIST/SESSION_STATE_FILE changed via reload; takes effect on the next restart",
+			"old_session_persist", p.storeSessionPersist,
+			"new_session_persist", cfg.SessionPersist,
+			"old_state_file", p.storeStateFile,
+			"new_state_file", cfg.SessionStateFile)
+	}
 }
 
 // AddToken adds a token to the pool at runtime (dashboard action): builds
@@ -218,7 +246,7 @@ func (p *Pool) AddToken(token string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("pool: add token: %w", err)
 	}
-	sess := session.NewManager(client)
+	sess := session.NewManagerWithStore(client, p.store)
 	entry := &tokenEntry{
 		session: sess,
 		runs:    runs.NewRunManager(client, sess, p.cfg.Load().RotationInterval),
@@ -279,6 +307,25 @@ func (p *Pool) RemoveAllTokens(ctx context.Context) {
 // TokenCount returns the current fixed-token count.
 func (p *Pool) TokenCount() int {
 	return len(*p.toks.Load())
+}
+
+// SetSessionStore injects the shared session-state store used by runtime
+// token additions (AddToken) and bridge entries. Call before the pool
+// starts serving requests; the fixed-token session managers are built by the
+// caller and must use the same store instance. A nil store disables
+// persistence. The persistence config is captured here so SetConfig can warn
+// when a later reload tries to change it (that only takes effect on the next
+// restart, when the caller builds a fresh store).
+func (p *Pool) SetSessionStore(store *session.Store) {
+	p.store = store
+	if store == nil {
+		p.storeSessionPersist = false
+		p.storeStateFile = ""
+		return
+	}
+	cfg := p.cfg.Load()
+	p.storeSessionPersist = cfg.SessionPersist
+	p.storeStateFile = cfg.SessionStateFile
 }
 
 // Acquire resolves the model's agent, picks a start token round-robin, and
@@ -871,8 +918,8 @@ func (p *Pool) Shutdown(ctx context.Context) {
 		if snap := entry.runs.Snapshot(); snap.ActiveRuns > 0 {
 			errs = append(errs, fmt.Sprintf("bridge %s: %d runs left after shutdown", entry.token, snap.ActiveRuns))
 		}
-		if err := entry.session.EndSession(entryCtx); err != nil {
-			errs = append(errs, fmt.Sprintf("bridge %s: end session: %v", entry.token, err))
+		if err := entry.session.Shutdown(entryCtx); err != nil {
+			errs = append(errs, fmt.Sprintf("bridge %s: shutdown session: %v", entry.token, err))
 		}
 		cancel()
 	}
@@ -1101,7 +1148,7 @@ func (p *Pool) bridgeEntryFor(clientToken string) (*bridgeEntry, error) {
 		return nil, fmt.Errorf("bridge: %w", err)
 	}
 	entry := &bridgeEntry{token: clientToken, client: client}
-	entry.session = session.NewManager(client)
+	entry.session = session.NewManagerWithStore(client, p.store)
 	entry.runs = runs.NewRunManager(client, entry.session, p.cfg.Load().RotationInterval)
 	entry.lastUsed = time.Now()
 

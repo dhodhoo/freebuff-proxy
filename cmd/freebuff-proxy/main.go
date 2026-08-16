@@ -135,7 +135,40 @@ func main() {
 	go refreshLoop(ctx, logger, reg, cfg.RegistryRefresh)
 
 	// One upstream client and session manager per token, bound into the pool
-	// together with a per-token run manager.
+	// together with a per-token run manager. When SESSION_PERSIST is enabled
+	// one shared store backs every session manager (fixed, runtime-added, and
+	// bridge entries), so a restart resumes unexpired sessions.
+	var store *session.Store
+	if cfg.SessionPersist {
+		// Log the absolute state-file path: a relative SESSION_STATE_FILE is
+		// resolved against the working directory, which is where the file
+		// actually appears on disk.
+		stateFile := cfg.SessionStateFile
+		if abs, err := filepath.Abs(stateFile); err == nil {
+			stateFile = abs
+		}
+		store = session.NewStore(stateFile)
+		logger.Info("session state persistence enabled", "file", stateFile)
+
+		// Same cwd-vs-exe trap as .env: on Windows launchers (Task
+		// Scheduler, shortcuts, services) the working directory is often not
+		// the executable's directory, so warn when a state file next to the
+		// executable is silently ignored for the same reason.
+		if !filepath.IsAbs(cfg.SessionStateFile) {
+			if cwd, err := os.Getwd(); err == nil {
+				exe, exeErr := os.Executable()
+				if exeErr == nil {
+					exeDir := filepath.Dir(exe)
+					if filepath.Clean(cwd) != exeDir {
+						if _, statErr := os.Stat(filepath.Join(exeDir, cfg.SessionStateFile)); statErr == nil {
+							logger.Warn("found session state file next to the executable, but SESSION_STATE_FILE is read from the working directory — that file is NOT used",
+								"cwd", cwd, "exe_dir", exeDir, "state_file", stateFile)
+						}
+					}
+				}
+			}
+		}
+	}
 	clients := make([]*upstream.Client, 0, len(cfg.AuthTokens))
 	sessions := make([]*session.Manager, 0, len(cfg.AuthTokens))
 	for i, token := range cfg.AuthTokens {
@@ -146,7 +179,7 @@ func main() {
 			os.Exit(1)
 		}
 		clients = append(clients, client)
-		sessions = append(sessions, session.NewManager(client))
+		sessions = append(sessions, session.NewManagerWithStore(client, store))
 	}
 	if cfg.DiscoveredSource != "" {
 		logger.Info("auto-discovered FreeBuff token from CLI login", "email", cfg.DiscoveredEmail, "file", cfg.DiscoveredSource)
@@ -157,6 +190,7 @@ func main() {
 		holdForExitIfConsole()
 		os.Exit(1)
 	}
+	p.SetSessionStore(store)
 
 	// Prewarm + the 60s maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)

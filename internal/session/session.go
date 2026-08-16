@@ -57,6 +57,12 @@ func (e *WaitingRoomError) Error() string {
 type Manager struct {
 	client *upstream.Client
 
+	// store, when non-nil, persists the cached session state across process
+	// restarts (SESSION_PERSIST). key is the stable store key derived from
+	// the client token (upstream.Client.TokenKey).
+	store *Store
+	key   string
+
 	mu         sync.Mutex
 	state      *cachedState
 	refreshCh  chan struct{} // closed by the in-flight refresher when done
@@ -88,7 +94,39 @@ type cachedState struct {
 
 // NewManager builds a session manager for the given upstream client.
 func NewManager(client *upstream.Client) *Manager {
-	return &Manager{client: client}
+	return NewManagerWithStore(client, nil)
+}
+
+// NewManagerWithStore builds a session manager that also persists its cached
+// state through store (nil disables persistence).
+func NewManagerWithStore(client *upstream.Client, store *Store) *Manager {
+	m := &Manager{client: client, store: store}
+	if client != nil {
+		m.key = client.TokenKey()
+	}
+	return m
+}
+
+// commit replaces the cached state and mirrors it into the store (when
+// configured). Caller must hold m.mu.
+//
+// A nil cs removes the store entry conditionally on the instance id being
+// dropped: the entry is only deleted while it still belongs to the session
+// being invalidated, so a stale commit cannot clobber a persisted slot that
+// was replaced concurrently (e.g. a restart re-adopting a different one).
+func (m *Manager) commit(cs *cachedState) {
+	oldInstance := ""
+	if m.state != nil {
+		oldInstance = m.state.instanceID
+	}
+	m.state = cs
+	if m.store != nil && m.key != "" {
+		if cs == nil {
+			m.store.Remove(m.key, oldInstance)
+		} else {
+			m.store.Save(m.key, cs)
+		}
+	}
 }
 
 // EnsureSession returns the session instance id for the default model, or ""
@@ -265,7 +303,20 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 		)
 		if cached != nil && cached.status == "queued" && cached.instanceID != "" {
 			st, err = m.client.GetSession(ctx, cached.instanceID)
+		} else if cached == nil {
+			// Fresh manager (first call or restart): resume a persisted
+			// session before creating a new one. A persisted active slot
+			// that is still alive upstream (and model-compatible) is adopted
+			// instead of burning a fresh session quota.
+			st, err = m.pollPersisted(ctx, targetModel)
+			if st == nil && err == nil {
+				st, err = m.client.CreateSessionForModel(ctx, targetModel)
+			}
 		} else {
+			// Live refresh (expired cache or model mismatch): never consult
+			// the store. Re-adopting a persisted slot here would pin the
+			// previous model's session on every refresh; always create for
+			// the requested model (baseline behavior).
 			st, err = m.client.CreateSessionForModel(ctx, targetModel)
 		}
 		if err != nil {
@@ -280,7 +331,7 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 				model = targetModel
 			}
 			m.mu.Lock()
-			m.state = &cachedState{
+			m.commit(&cachedState{
 				status:             "active",
 				instanceID:         st.InstanceID,
 				model:              model,
@@ -290,14 +341,14 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 				countryCode:        st.CountryCode,
 				countryBlockReason: st.CountryBlockReason,
 				quotaByModel:       st.RateLimitsByModel,
-			}
+			})
 			m.mu.Unlock()
 			slog.Debug("session created", "status", "active", "instance_id", st.InstanceID,
 				"model", model, "expires_at", st.ExpiresAt.Format(time.RFC3339))
 			return nil
 		case "disabled":
 			m.mu.Lock()
-			m.state = &cachedState{status: "disabled"}
+			m.commit(&cachedState{status: "disabled"})
 			m.mu.Unlock()
 			slog.Debug("session created", "status", "disabled", "instance_id", "")
 			return nil
@@ -318,21 +369,21 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 				model = targetModel
 			}
 			m.mu.Lock()
-			m.state = &cachedState{
+			m.commit(&cachedState{
 				status:     "queued",
 				instanceID: st.InstanceID,
 				model:      model,
 				position:   st.Position,
 				queueDepth: st.QueueDepth,
 				pollAt:     pollAt,
-			}
+			})
 			m.mu.Unlock()
 			slog.Debug("session queued", "instance_id", st.InstanceID, "model", model,
 				"position", st.Position, "queue_depth", st.QueueDepth, "poll_at", pollAt.Format(time.RFC3339))
 			return nil
 		case "ended", "superseded", "none":
 			m.mu.Lock()
-			m.state = nil
+			m.commit(nil)
 			m.mu.Unlock()
 			slog.Debug("session recreated", "reason", status, "instance_id", st.InstanceID)
 		case "banned", "country_blocked", "rate_limited", "ip_capped", "spend_limited":
@@ -345,7 +396,7 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 			if m.state != nil {
 				oldInstance = m.state.instanceID
 			}
-			m.state = nil
+			m.commit(nil)
 			m.mu.Unlock()
 			_ = m.client.EndSession(ctx, oldInstance)
 			slog.Debug("session released on model lock, retrying", "current", st.CurrentModel, "target", targetModel)
@@ -354,7 +405,7 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 			slog.Warn("session: model unavailable upstream, falling back to default", "requested", targetModel, "fallback", DefaultFallbackModel)
 			targetModel = DefaultFallbackModel
 			m.mu.Lock()
-			m.state = nil
+			m.commit(nil)
 			m.mu.Unlock()
 		default:
 			return fmt.Errorf("session: unknown upstream status %q", status)
@@ -442,7 +493,7 @@ func (m *Manager) Invalidate() {
 	if m.state != nil {
 		instanceID = m.state.instanceID
 	}
-	m.state = nil
+	m.commit(nil)
 	m.mu.Unlock()
 	slog.Debug("session invalidated", "instance_id", instanceID)
 }
@@ -454,7 +505,7 @@ func (m *Manager) EndSession(ctx context.Context) error {
 	if s := m.state; s != nil {
 		instanceID = s.instanceID
 	}
-	m.state = nil
+	m.commit(nil)
 	m.mu.Unlock()
 
 	if instanceID == "" {
@@ -465,6 +516,111 @@ func (m *Manager) EndSession(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// Shutdown handles session teardown at process shutdown. When persistence is
+// disabled it behaves exactly like EndSession (DELETE upstream). When
+// persistence is enabled, only a genuinely active + unexpired session is kept
+// alive — so a later restart can resume it — and its state is flushed to the
+// store. Every other state (nil, queued, disabled, expired-active, ended)
+// falls through to the normal EndSession path, which releases the upstream
+// slot and removes the store entry via the CAS commit. Runs are FINISHed
+// separately by the run manager.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	if m.store == nil {
+		return m.EndSession(ctx)
+	}
+	m.mu.Lock()
+	keepAlive := false
+	instanceID := ""
+	if s := m.state; s != nil && s.status == "active" && s.instanceID != "" &&
+		time.Now().Before(s.expiresAt.Add(-expiryMargin)) {
+		keepAlive = true
+		instanceID = s.instanceID
+		m.store.Save(m.key, s)
+		// Surface a failed flush: without the persisted entry a restart
+		// cannot resume the slot, so a write/rename failure must not be
+		// silent. Re-read the FILE through a fresh Store — the in-memory
+		// map is updated before the flush attempt and cannot verify disk.
+		if persisted := NewStore(m.store.path).Load(m.key); persisted == nil || persisted.instanceID != instanceID {
+			slog.Warn("session: keep-alive persist failed", "instance_id", instanceID)
+		}
+	}
+	m.mu.Unlock()
+	if keepAlive {
+		slog.Debug("session kept for restart", "instance_id", instanceID)
+		return nil
+	}
+	return m.EndSession(ctx)
+}
+
+// pollPersisted attempts to resume a persisted session before a fresh create
+// (restart reuse). requestedModel is the model the caller is about to create
+// for: a persisted slot bound to a different model is dropped instead of
+// adopted, so a model-mismatch refresh falls through to a create for the
+// requested model.
+//
+// It returns a non-nil SessionState when the persisted slot is still active
+// upstream and model-compatible (adopted), and (nil, nil) otherwise — either
+// there is no persisted slot, it is expired, it is model-incompatible, or it
+// is dead upstream (in which case it is removed from the store). Transport
+// errors are returned so the caller surfaces them like a failed create
+// instead of burning a fresh daily session slot on a merely-flaky upstream.
+func (m *Manager) pollPersisted(ctx context.Context, requestedModel string) (*upstream.SessionState, error) {
+	if m.store == nil || m.key == "" {
+		return nil, nil
+	}
+	cs := m.store.Load(m.key)
+	if cs == nil || cs.status != "active" || cs.instanceID == "" {
+		return nil, nil
+	}
+	// Only resume a slot that is still genuinely active (with the 5s safety
+	// margin). An expired-but-in-grace slot is draining; resume it is not
+	// worth the risk of admitting new work onto a dying session.
+	if cs.expiresAt.IsZero() || !time.Now().Before(cs.expiresAt.Add(-expiryMargin)) {
+		m.store.Remove(m.key, cs.instanceID)
+		return nil, nil
+	}
+	// Model gate (pre-flight): a persisted slot known to be bound to a
+	// different model must never be re-adopted for another model — that
+	// would pin the old model's session forever on every refresh.
+	if cs.model != "" && requestedModel != "" && cs.model != requestedModel {
+		m.store.Remove(m.key, cs.instanceID)
+		return nil, nil
+	}
+
+	st, err := m.client.GetSession(ctx, cs.instanceID)
+	if err != nil {
+		// Transport error: surface it instead of swallowing and falling
+		// through to a fresh create. The caller retries (single-flight /
+		// TRANSIENT_RETRIES); a create here would burn a session slot.
+		return nil, err
+	}
+	switch st.Status {
+	case "active":
+		// Model gate (post-flight): the upstream may have bound the resumed
+		// slot to a different model than requested. Adopt only when the
+		// resumed model is compatible; otherwise drop the slot and fall
+		// through to a create for the requested model.
+		if st.Model != "" && requestedModel != "" && st.Model != requestedModel {
+			m.store.Remove(m.key, st.InstanceID)
+			return nil, nil
+		}
+		slog.Debug("session resumed from store", "instance_id", st.InstanceID, "expires_at", st.ExpiresAt.Format(time.RFC3339))
+		return st, nil
+	case "ended", "superseded", "none", "banned":
+		m.store.Remove(m.key, st.InstanceID)
+		return nil, nil
+	case "country_blocked", "rate_limited", "ip_capped", "spend_limited":
+		// Terminal admission refusals: the persisted slot is dead upstream;
+		// drop it so a restart re-admits from scratch instead of re-polling.
+		m.store.Remove(m.key, st.InstanceID)
+		return nil, nil
+	default:
+		// queued or an unknown status: not resumable as an active slot, but
+		// non-terminal — keep the entry for a later restart.
+		return nil, nil
+	}
 }
 
 // Heartbeat sends a periodic compact GET with x-freebuff-heartbeat: 1 for active sessions,
@@ -489,7 +645,7 @@ func (m *Manager) Heartbeat(ctx context.Context) error {
 		if st.Status == "banned" {
 			m.mu.Lock()
 			if m.state != nil && m.state.instanceID == instanceID {
-				m.state = nil
+				m.commit(nil)
 				slog.Debug("session dropped during heartbeat", "reason", st.Status, "instance_id", instanceID)
 			}
 			m.mu.Unlock()
@@ -499,7 +655,7 @@ func (m *Manager) Heartbeat(ctx context.Context) error {
 	if st.Status == "ended" || st.Status == "superseded" || st.Status == "none" {
 		m.mu.Lock()
 		if m.state != nil && m.state.instanceID == instanceID {
-			m.state = nil
+			m.commit(nil)
 			slog.Debug("session ended during heartbeat", "reason", st.Status, "instance_id", instanceID)
 		}
 		m.mu.Unlock()
