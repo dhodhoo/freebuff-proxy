@@ -46,6 +46,13 @@ type MockUpstream struct {
 	// model id) so tests can exercise quota parsing end-to-end.
 	RateLimitsByModel map[string]any
 
+	// AccessTier / CountryCode / CountryBlockReason, when non-empty, are
+	// embedded in the active session body (wire shape parsed by upstream's
+	// sessionCall) so tests can exercise tier/region reporting end-to-end.
+	AccessTier         string
+	CountryCode        string
+	CountryBlockReason string
+
 	// RunIDs is the queue of run ids returned by agent-runs START.
 	RunIDs []string
 	runIdx int
@@ -205,6 +212,7 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 	position, depth, waitMs := m.QueuePosition, m.QueueDepth, m.EstimatedWaitMs
 	instanceID, expiresIn := m.InstanceID, m.ExpiresIn
 	limits := m.RateLimitsByModel
+	tier, countryCode, countryBlockReason := m.AccessTier, m.CountryCode, m.CountryBlockReason
 	m.mu.Unlock()
 
 	switch mode {
@@ -219,6 +227,15 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(limits) > 0 {
 			body["rateLimitsByModel"] = limits
+		}
+		if tier != "" {
+			body["accessTier"] = tier
+		}
+		if countryCode != "" {
+			body["countryCode"] = countryCode
+		}
+		if countryBlockReason != "" {
+			body["countryBlockReason"] = countryBlockReason
 		}
 		writeJSON(w, 200, body)
 	case "queued":
@@ -241,6 +258,16 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"status": "none"})
 	case "banned":
 		writeJSON(w, 200, map[string]any{"status": "banned"})
+	case "country_blocked":
+		// 403 with the region-block wire shape: classifyError maps it to
+		// upstream.CountryBlockedError (S1 contract), so pool tests can
+		// exercise the country-blocked failover bucket end-to-end.
+		writeJSON(w, 403, map[string]any{
+			"status":             "country_blocked",
+			"countryCode":        "CN",
+			"countryBlockReason": "region_restricted",
+			"ipPrivacySignals":   []string{"vpn"},
+		})
 	case "model_locked":
 		writeJSON(w, 200, map[string]any{"status": "model_locked"})
 	default:

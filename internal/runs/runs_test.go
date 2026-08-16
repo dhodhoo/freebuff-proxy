@@ -453,6 +453,59 @@ func TestRateLimitAndBanCooldowns(t *testing.T) {
 		t.Errorf("Snapshot.BanError = nil, want non-nil")
 	}
 }
+
+func TestCountryBlockCooldown(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+	cbe := &upstream.CountryBlockedError{CountryCode: "CN", CountryBlockReason: "region_restricted"}
+
+	mgr.CooldownCountryBlocked(cbe)
+
+	if got := mgr.CountryBlockedError(); got == nil || got.CountryCode != "CN" {
+		t.Fatalf("CountryBlockedError() = %v, want remembered CN block", got)
+	}
+	if until := mgr.CooldownUntil(); !time.Now().Before(until) || time.Until(until) > 16*time.Minute {
+		t.Errorf("cooldown until = %v, want ~15m country window", until)
+	}
+	// The country block clears any remembered rate-limit/ban state so the
+	// cooldown-skip surfaces the country error, not a stale 429.
+	if mgr.RateLimitError() != nil || mgr.BanError() != nil {
+		t.Errorf("rate/ban memory not cleared by country block")
+	}
+
+	// Acquire skips the token during the window (shared cooldown deadline).
+	if _, err := mgr.Acquire(context.Background(), agentA); err == nil {
+		t.Error("Acquire during country cooldown succeeded, want skip error")
+	}
+
+	// Expired country window unlocks like the rate-limit memory.
+	mgr.mu.Lock()
+	mgr.countryUntil = time.Now().Add(-1 * time.Second)
+	mgr.mu.Unlock()
+	if mgr.CountryBlockedError() != nil {
+		t.Errorf("CountryBlockedError() != nil for expired window, want automatic unlock")
+	}
+}
+
+func TestCountryBlockDoesNotDowngradeBan(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+	be := &upstream.BanError{Body: "banned", ResumesAt: time.Now().Add(2 * time.Hour)}
+	mgr.CooldownBan(be)
+	cbe := &upstream.CountryBlockedError{CountryCode: "CN", CountryBlockReason: "region_restricted"}
+	mgr.CooldownCountryBlocked(cbe)
+
+	// A ban outranks a country block (pool precedence ban > country): the
+	// ban memory and window must survive the country block.
+	if mgr.BanError() == nil {
+		t.Errorf("BanError() = nil after country block, ban must outrank country")
+	}
+	if mgr.CountryBlockedError() != nil {
+		t.Errorf("CountryBlockedError() != nil, country must not overwrite an active ban")
+	}
+}
 func TestInvalidateRun(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()

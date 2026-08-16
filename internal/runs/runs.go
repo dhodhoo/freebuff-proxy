@@ -29,6 +29,12 @@ import (
 // (PRD §5.3: "401 triggers 30-min token cooldown").
 const DefaultCooldown = 30 * time.Minute
 
+// countryBlockCooldown is the token cooldown applied when upstream reports a
+// region block (country_blocked): long enough to stop the request hammer
+// from re-hitting the blocked admission, short enough to re-probe after the
+// client switches egress/VPN.
+const countryBlockCooldown = 15 * time.Minute
+
 // shutdownTimeout bounds Shutdown when the caller passes a context without a
 // deadline (PRD §5: "10s force deadline").
 const shutdownTimeout = 10 * time.Second
@@ -77,6 +83,12 @@ type RunManager struct {
 	// remembered ban error until the unban time.
 	banUntil time.Time
 	ban      *upstream.BanError
+	// countryBlock is the last country-block error applied to this token's
+	// cooldown. It is surfaced by CountryBlockedError() so a region-blocked
+	// token keeps returning the block error instead of re-hitting upstream
+	// during the window (mirrors the rate-limit/ban memory).
+	countryBlock *upstream.CountryBlockedError
+	countryUntil time.Time
 	// totalRequests is the cumulative count of Acquire leases handed out.
 	// It is kept separate from the per-run counters because rotated runs
 	// that get FINISHed leave the active+draining sets and would otherwise
@@ -327,6 +339,7 @@ func (m *RunManager) Cooldown(d time.Duration) {
 	m.cooldownUntil = time.Now().Add(d)
 	m.rateLimit = nil
 	m.ban = nil
+	m.countryBlock = nil
 	m.mu.Unlock()
 }
 
@@ -338,6 +351,8 @@ func (m *RunManager) ClearCooldowns() {
 	m.rateLimit = nil
 	m.ban = nil
 	m.banUntil = time.Time{}
+	m.countryBlock = nil
+	m.countryUntil = time.Time{}
 	m.mu.Unlock()
 }
 
@@ -366,6 +381,7 @@ func (m *RunManager) CooldownRateLimit(rle *upstream.RateLimitError) {
 	}
 	m.rateLimit = rle
 	m.ban = nil
+	m.countryBlock = nil
 }
 
 // RateLimitError returns the remembered rate-limit error while its
@@ -397,6 +413,7 @@ func (m *RunManager) CooldownBan(be *upstream.BanError) {
 	// the cooldown-skip branch instead of re-hitting upstream).
 	m.cooldownUntil = m.banUntil
 	m.rateLimit = nil // a ban supersedes any rate-limit cooldown
+	m.countryBlock = nil
 	m.mu.Unlock()
 }
 
@@ -407,6 +424,43 @@ func (m *RunManager) BanError() *upstream.BanError {
 	defer m.mu.Unlock()
 	if time.Now().Before(m.banUntil) && m.ban != nil {
 		return m.ban
+	}
+	return nil
+}
+
+// CooldownCountryBlocked applies a country-block cooldown and remembers the
+// error so Acquires keep surfacing the region-block instead of re-hitting
+// upstream during the window (mirrors CooldownRateLimit/CooldownBan).
+func (m *RunManager) CooldownCountryBlocked(cbe *upstream.CountryBlockedError) {
+	if cbe == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// A ban outranks a country block (pool precedence ban > country): keep
+	// the ban window and its remembered error instead of downgrading to the
+	// shorter country cooldown.
+	if time.Now().Before(m.banUntil) && m.ban != nil {
+		return
+	}
+	m.countryBlock = cbe
+	m.countryUntil = time.Now().Add(countryBlockCooldown)
+	// The block also fills the shared cooldown deadline so Acquire skips
+	// the token entirely during the window (the remembered error is
+	// surfaced by the cooldown-skip branch instead of re-hitting upstream).
+	m.cooldownUntil = m.countryUntil
+	m.rateLimit = nil
+	m.ban = nil
+	m.banUntil = time.Time{}
+}
+
+// CountryBlockedError returns the remembered country-block error while its
+// cooldown window is active, nil otherwise.
+func (m *RunManager) CountryBlockedError() *upstream.CountryBlockedError {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if time.Now().Before(m.countryUntil) && m.countryBlock != nil {
+		return m.countryBlock
 	}
 	return nil
 }

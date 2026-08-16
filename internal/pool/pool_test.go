@@ -330,7 +330,13 @@ func TestAllFailedCombinedError(t *testing.T) {
 	}
 }
 
-func TestWaitingRoomOnlyWhenEveryTokenQueued(t *testing.T) {
+func TestWaitingRoomSurfacesOnAnyQueuedToken(t *testing.T) {
+	// Precedence-chain failover (ban > country > rate > waiting > daily)
+	// surfaces the waiting-room error as soon as ANY token is queued — a
+	// queued token is the only actionable signal — instead of requiring
+	// every token to be queued. Buckets lower than waiting (daily cap) and
+	// the generic fallback lose to it; here the second token's auth-reject
+	// is not a matrix bucket, so waiting wins.
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
 	mock0.SessionMode = "queued"
@@ -347,11 +353,11 @@ func TestWaitingRoomOnlyWhenEveryTokenQueued(t *testing.T) {
 		t.Fatal("want error")
 	}
 	var wr *session.WaitingRoomError
-	if errors.As(err, &wr) {
-		t.Fatalf("waiting-room error surfaced although only one token is queued: %v", err)
+	if !errors.As(err, &wr) {
+		t.Fatalf("want session.WaitingRoomError when any token is queued, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "unable to acquire run from any token") {
-		t.Errorf("error = %q, want combined error", err)
+	if wr.Position != 2 {
+		t.Errorf("waiting room position = %d, want 2", wr.Position)
 	}
 }
 
@@ -1111,6 +1117,170 @@ func TestMultiTokenRateLimitAndBanFailover(t *testing.T) {
 	_, err = p.Acquire(context.Background(), modelA)
 	if err == nil || !errors.Is(err, upstream.ErrBanned) {
 		t.Errorf("Acquire with all banned = %v, want ban error", err)
+	}
+}
+
+// TestAcquirePrecedenceBannedOverRateLimit pins the mixed-bucket precedence
+// chain: a banned token outranks a rate-limited one, so the pool surfaces
+// 403 banned instead of the generic 502 the historical all-or-nothing
+// aggregation produced.
+func TestAcquirePrecedenceBannedOverRateLimit(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+
+	be := &upstream.BanError{Body: "banned", ResumesAt: time.Now().Add(time.Hour)}
+	rle := &upstream.RateLimitError{Body: "rate limit", RetryAfter: 10 * time.Minute}
+	p.CooldownTokenBan(0, be)
+	p.CooldownTokenRateLimit(1, rle)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil || !errors.Is(err, upstream.ErrBanned) {
+		t.Fatalf("banned + rate-limited = %v, want ban (highest precedence)", err)
+	}
+}
+
+// TestAcquirePrecedenceCountryOverRateLimit pins country > rate: a
+// country-blocked token outranks a rate-limited one.
+func TestAcquirePrecedenceCountryOverRateLimit(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+
+	cbe := &upstream.CountryBlockedError{CountryCode: "CN", CountryBlockReason: "region_restricted"}
+	rle := &upstream.RateLimitError{Body: "rate limit", RetryAfter: 10 * time.Minute}
+	p.CooldownTokenCountryBlocked(0, cbe)
+	p.CooldownTokenRateLimit(1, rle)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil || !errors.Is(err, upstream.ErrCountryBlocked) {
+		t.Fatalf("country-blocked + rate-limited = %v, want country (precedence over rate)", err)
+	}
+}
+
+// TestAcquirePrecedenceRateOverWaiting pins rate > waiting: with one token
+// queued and another rate-limited, the remembered 429 wins.
+func TestAcquirePrecedenceRateOverWaiting(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "queued"
+	mock0.QueuePosition = 1
+	mock0.QueueDepth = 3
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	p := newTestPool(t, mock0, mock1)
+	p.CooldownTokenRateLimit(1, &upstream.RateLimitError{Body: "rate limit", RetryAfter: 10 * time.Minute})
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if err == nil || !errors.Is(err, upstream.ErrRateLimited) {
+		t.Fatalf("waiting + rate-limited = %v, want rate limit (precedence over waiting)", err)
+	}
+}
+
+// TestAcquireAllCountryBlocked drives the country bucket end-to-end through
+// the session layer: every token's admission returns a 403 country_blocked,
+// the pool cools each down ~15m, records the block for the snapshot, and
+// surfaces the CountryBlockedError (not a generic 502) while remembered.
+func TestAcquireAllCountryBlocked(t *testing.T) {
+	mock0 := testutil.NewMock()
+	defer mock0.Close()
+	mock0.SessionMode = "country_blocked"
+	mock1 := testutil.NewMock()
+	defer mock1.Close()
+	mock1.SessionMode = "country_blocked"
+	p := newTestPool(t, mock0, mock1)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	var cbe *upstream.CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want *upstream.CountryBlockedError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrCountryBlocked) {
+		t.Errorf("errors.Is(ErrCountryBlocked) = false")
+	}
+
+	// The token cooled down ~15m and the block is recorded in the snapshot
+	// even though the session never admitted (session snapshot is empty).
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.Before(time.Now().Add(14 * time.Minute)) {
+		t.Errorf("cooldown until = %v, want ~now+15m", snap.CooldownUntil)
+	}
+	if snap.CountryCode != "CN" || snap.CountryBlockReason != "region_restricted" {
+		t.Errorf("snapshot country = %q/%q, want CN/region_restricted (remembered block)", snap.CountryCode, snap.CountryBlockReason)
+	}
+
+	// The remembered error keeps surfacing on the cooldown skip, and the
+	// blocked tokens are not re-hit upstream.
+	creates := mock0.SessionCreates + mock1.SessionCreates
+	_, err = p.Acquire(context.Background(), modelA)
+	var cbe2 *upstream.CountryBlockedError
+	if !errors.As(err, &cbe2) {
+		t.Fatalf("second acquire: want *upstream.CountryBlockedError, got %v", err)
+	}
+	if got := mock0.SessionCreates + mock1.SessionCreates; got != creates {
+		t.Errorf("session creates after cooldown = %d, want %d (country-cooled tokens must not re-hit)", got, creates)
+	}
+}
+
+// TestTokenSnapshotTierAndCountry pins the TokenSnapshot region/tier fields
+// carried from the admitted session (healthz / /v1/models annotation).
+func TestTokenSnapshotTierAndCountry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.TierAccess != "limited" || lease.TierCountry != "US" {
+		t.Errorf("lease tier/country = %q/%q, want limited/US", lease.TierAccess, lease.TierCountry)
+	}
+	p.LeaseRelease(lease)
+
+	snap := p.Snapshot()[0]
+	if snap.TierAccess != "limited" || snap.CountryCode != "US" {
+		t.Errorf("snapshot tier/country = %q/%q, want limited/US", snap.TierAccess, snap.CountryCode)
+	}
+	if snap.CountryBlockReason != "" {
+		t.Errorf("CountryBlockReason = %q, want empty for an admitted session", snap.CountryBlockReason)
+	}
+}
+
+// TestAcquireBridgeCountryCooldown pins the bridge-mode country cooldown: a
+// country_blocked admission cools the entry ~15m, and the cooldown skip
+// surfaces the remembered block instead of re-hitting upstream.
+func TestAcquireBridgeCountryCooldown(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "country_blocked"
+	p := newBridgePool(t, mock)
+
+	_, err := p.AcquireBridge(context.Background(), "client-tok", modelA)
+	var cbe *upstream.CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want *upstream.CountryBlockedError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrCountryBlocked) {
+		t.Errorf("errors.Is(ErrCountryBlocked) = false")
+	}
+
+	// The entry cooled down: the next acquire skips it and surfaces the
+	// remembered block without a second admission attempt.
+	creates := mock.SessionCreates
+	_, err = p.AcquireBridge(context.Background(), "client-tok", modelA)
+	var cbe2 *upstream.CountryBlockedError
+	if !errors.As(err, &cbe2) {
+		t.Fatalf("second acquire: want *upstream.CountryBlockedError, got %v", err)
+	}
+	if mock.SessionCreates != creates {
+		t.Errorf("session creates = %d, want %d (country-cooled entry must not re-hit upstream)", mock.SessionCreates, creates)
 	}
 }
 

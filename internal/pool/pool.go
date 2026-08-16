@@ -8,11 +8,14 @@
 //   - 401 (ErrAuthRejected) from a token's run START → 30-min cooldown for
 //     that token, try the next.
 //   - session waiting room → remember the best position, try the next token;
-//     only when every token is queued does the pool surface the waiting-room
-//     error (503 + Retry-After upstream).
+//     when every token fails, the pool surfaces the highest-precedence
+//     non-empty error bucket (ban > country-blocked > rate-limit >
+//     waiting-room > daily cap) instead of a generic 502 — a queued token
+//     surfaces 503 + Retry-After as soon as no higher bucket is populated.
 //   - run-invalid / session-invalid recoveries are NOT handled here: the
 //     caller (server) retries once via a fresh Acquire after invalidating.
-//   - anything else → next token; all failed → combined error.
+//   - anything else → next token; all failed → combined error (only when no
+//     error-bucket matched any token).
 package pool
 
 import (
@@ -95,6 +98,13 @@ type TokenSnapshot struct {
 	DailyLimit           int    // configured MAX_MESSAGES_PER_DAY (0 = unlimited)
 	UsagePct             int    // percentage of daily limit used (0 when unlimited)
 	RiskLevel            string // "low", "moderate", "high", "critical" account safety indicator (#6)
+	// TierAccess / CountryCode / CountryBlockReason are the token's last
+	// known upstream session tier and region-block state. CountryBlockReason
+	// is non-empty when the account (or its egress region) is blocked;
+	// surfaced by /v1/models availability annotation and healthz.
+	TierAccess         string
+	CountryCode        string
+	CountryBlockReason string
 	// QuotaByModel is the live per-model session quota from the last
 	// admission (key = model id); empty until the session reports it.
 	// Entitlement is a top-level per-token view (empty: the upstream wire
@@ -281,6 +291,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	var waiting []*session.WaitingRoomError
 	var rateLimited []*upstream.RateLimitError
 	var banned []*upstream.BanError
+	var countryBlocked []*upstream.CountryBlockedError
 	var dailyLimited []*upstream.RateLimitError
 
 	for _, idx := range order {
@@ -293,11 +304,14 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		if until := tok.runs.CooldownUntil(); time.Now().Before(until) {
 			errs = append(errs, fmt.Sprintf("%s: cooling down until %s", name, until.Format(time.RFC3339)))
 			p.logger.Debug("pool: token skipped (cooldown)", "token", idx+1, "until", until.Format(time.RFC3339))
-			if rle := tok.runs.RateLimitError(); rle != nil {
-				rateLimited = append(rateLimited, rle)
-			}
 			if be := tok.runs.BanError(); be != nil {
 				banned = append(banned, be)
+			}
+			if cbe := tok.runs.CountryBlockedError(); cbe != nil {
+				countryBlocked = append(countryBlocked, cbe)
+			}
+			if rle := tok.runs.RateLimitError(); rle != nil {
+				rateLimited = append(rateLimited, rle)
 			}
 			continue
 		}
@@ -331,6 +345,10 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 				tok.runs.CooldownBan(be)
 				banned = append(banned, be)
 			}
+			if cbe := asCountryBlocked(err); cbe != nil {
+				tok.runs.CooldownCountryBlocked(cbe)
+				countryBlocked = append(countryBlocked, cbe)
+			}
 			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
@@ -349,6 +367,10 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 				tok.runs.CooldownBan(be)
 				banned = append(banned, be)
 			}
+			if cbe := asCountryBlocked(err); cbe != nil {
+				tok.runs.CooldownCountryBlocked(cbe)
+				countryBlocked = append(countryBlocked, cbe)
+			}
 			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
@@ -365,18 +387,27 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			TierAccess: ss.TierAccess, TierCountry: ss.TierCountry}, nil
 	}
 
-	if len(waiting) == len(*toks) && len(waiting) > 0 {
+	// Failover precedence (PRD §6 error matrix): when buckets are mixed the
+	// highest-precedence non-empty bucket wins — ban > country-blocked >
+	// rate-limit > waiting-room > daily cap. Each bucket contributes its
+	// best error (first ban, longest rate window, lowest queue position,
+	// earliest daily reset). Only when every bucket is empty — all tokens
+	// failed with errors outside the matrix — is the generic error surfaced.
+	if len(banned) > 0 {
+		return nil, banned[0]
+	}
+	if len(countryBlocked) > 0 {
+		return nil, countryBlocked[0]
+	}
+	if len(rateLimited) > 0 {
+		return nil, bestRateLimit(rateLimited)
+	}
+	if len(waiting) > 0 {
 		wr := bestWaitingRoom(waiting)
 		p.logger.Debug("pool: waiting room surfaced", "position", wr.Position, "queue_depth", wr.QueueDepth, "retry_after", wr.RetryAfter.String())
 		return nil, wr
 	}
-	if len(rateLimited) == len(*toks) && len(rateLimited) > 0 {
-		return nil, bestRateLimit(rateLimited)
-	}
-	if len(banned) == len(*toks) && len(banned) > 0 {
-		return nil, banned[0]
-	}
-	if len(dailyLimited) == len(*toks) && len(dailyLimited) > 0 {
+	if len(dailyLimited) > 0 {
 		return nil, bestDailyLimit(dailyLimited)
 	}
 	return nil, fmt.Errorf("unable to acquire run from any token: %s", strings.Join(errs, "; "))
@@ -482,14 +513,19 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 	}
 
 	// Cooldown: skip the entry during its window; surface the remembered
-	// rate-limit/ban error so the client keeps getting 429/403 instead of a
-	// generic failure (mirrors the fixed-token cooldown-skip branch).
+	// ban/country-block/rate-limit error so the client keeps getting 403/429
+	// instead of a generic failure (mirrors the fixed-token cooldown-skip
+	// branch). The remembered errors are mutually exclusive in the run
+	// manager; checked in pool precedence order.
 	if until := entry.runs.CooldownUntil(); time.Now().Before(until) {
-		if rle := entry.runs.RateLimitError(); rle != nil {
-			return nil, rle
-		}
 		if be := entry.runs.BanError(); be != nil {
 			return nil, be
+		}
+		if cbe := entry.runs.CountryBlockedError(); cbe != nil {
+			return nil, cbe
+		}
+		if rle := entry.runs.RateLimitError(); rle != nil {
+			return nil, rle
 		}
 		return nil, fmt.Errorf("bridge: token cooling down until %s", until.Format(time.RFC3339))
 	}
@@ -512,6 +548,9 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		if be := asBan(err); be != nil {
 			entry.runs.CooldownBan(be)
 		}
+		if cbe := asCountryBlocked(err); cbe != nil {
+			entry.runs.CooldownCountryBlocked(cbe)
+		}
 		return nil, err
 	}
 	run, err := entry.runs.Acquire(ctx, agentID)
@@ -525,6 +564,9 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		}
 		if be := asBan(err); be != nil {
 			entry.runs.CooldownBan(be)
+		}
+		if cbe := asCountryBlocked(err); cbe != nil {
+			entry.runs.CooldownCountryBlocked(cbe)
 		}
 		return nil, err
 	}
@@ -644,6 +686,17 @@ func (p *Pool) CooldownTokenBan(token int, be *upstream.BanError) {
 	(*toks)[token].runs.CooldownBan(be)
 }
 
+// CooldownTokenCountryBlocked applies a country-block cooldown to token
+// (remembered so Acquire surfaces the region-block error during the ~15m
+// window instead of re-hitting upstream).
+func (p *Pool) CooldownTokenCountryBlocked(token int, cbe *upstream.CountryBlockedError) {
+	toks := p.toks.Load()
+	if token < 0 || token >= len(*toks) || cbe == nil {
+		return
+	}
+	(*toks)[token].runs.CooldownCountryBlocked(cbe)
+}
+
 // InvalidateBridgeSession drops the cached free session of the bridge
 // entry so the next AcquireBridge re-creates it (session-invalid recovery).
 func (p *Pool) InvalidateBridgeSession(lease *Lease) {
@@ -687,6 +740,16 @@ func (p *Pool) CooldownBridgeBan(lease *Lease, be *upstream.BanError) {
 		return
 	}
 	lease.Bridge.runs.CooldownBan(be)
+}
+
+// CooldownBridgeCountryBlocked applies a country-block cooldown to the
+// bridge entry (remembered so AcquireBridge surfaces the region-block error
+// during the ~15m window instead of re-hitting upstream).
+func (p *Pool) CooldownBridgeCountryBlocked(lease *Lease, cbe *upstream.CountryBlockedError) {
+	if lease == nil || lease.Bridge == nil || cbe == nil {
+		return
+	}
+	lease.Bridge.runs.CooldownCountryBlocked(cbe)
 }
 
 // BridgeCount returns the number of cached bridge entries (healthz).
@@ -800,6 +863,20 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 		ss := tok.session.Snapshot()
 		msgs := p.usageCount(i)
 
+		// Region/tier view: the session snapshot carries the last admitted
+		// tier/country; an active country-block cooldown overrides it with
+		// the remembered block (the session never admitted after a block,
+		// so its snapshot would be empty for the blocked country).
+		countryCode, countryReason := ss.CountryCode, ss.CountryBlockReason
+		if cbe := tok.runs.CountryBlockedError(); cbe != nil {
+			if cbe.CountryCode != "" {
+				countryCode = cbe.CountryCode
+			}
+			if cbe.CountryBlockReason != "" {
+				countryReason = cbe.CountryBlockReason
+			}
+		}
+
 		usagePct := 0
 		if dailyLimit > 0 {
 			usagePct = (msgs * 100) / dailyLimit
@@ -842,6 +919,9 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 			SessionInstanceID:    ss.InstanceID,
 			SessionQueuePosition: ss.QueuePosition,
 			SessionQueueDepth:    ss.QueueDepth,
+			TierAccess:           ss.TierAccess,
+			CountryCode:          countryCode,
+			CountryBlockReason:   countryReason,
 			QuotaByModel:         ss.QuotaByModel,
 			Entitlement:          ss.Entitlement,
 			TransientRetries:     tok.client.TransientRetries(),
@@ -1356,6 +1436,16 @@ func asBan(err error) *upstream.BanError {
 	var be *upstream.BanError
 	if errors.As(err, &be) {
 		return be
+	}
+	return nil
+}
+
+// asCountryBlocked extracts a CountryBlockedError from err (nil when
+// absent).
+func asCountryBlocked(err error) *upstream.CountryBlockedError {
+	var cbe *upstream.CountryBlockedError
+	if errors.As(err, &cbe) {
+		return cbe
 	}
 	return nil
 }
