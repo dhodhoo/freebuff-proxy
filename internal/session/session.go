@@ -213,6 +213,37 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 	return "", errors.New("session: not ready after repeated refreshes")
 }
 
+// statusError maps an upstream session status to the typed error callers
+// use for recovery (token cooldown, region surfacing). st supplies the
+// fields carried by the error; non-error statuses return nil. Shared by
+// refresh and Heartbeat so both map the same way.
+func statusError(status string, st *upstream.SessionState) error {
+	switch status {
+	case "banned":
+		return &upstream.BanError{ResumesAt: st.ResumesAt, Body: st.Message}
+	case "country_blocked":
+		return &upstream.CountryBlockedError{
+			CountryCode:        st.CountryCode,
+			CountryBlockReason: st.CountryBlockReason,
+			IpPrivacySignals:   st.IpPrivacySignals,
+		}
+	case "rate_limited", "ip_capped", "spend_limited":
+		retryAfter := time.Duration(st.RetryAfterMs) * time.Millisecond
+		if retryAfter <= 0 {
+			retryAfter = time.Minute
+		}
+		return &upstream.RateLimitError{
+			Status:      status,
+			RetryAfter:  retryAfter,
+			ResetAt:     st.ResetAt,
+			Limit:       st.Limit,
+			RecentCount: st.RecentCount,
+			Body:        st.Message,
+		}
+	}
+	return nil
+}
+
 // refresh runs the create/poll status loop, updating cached state, until the
 // session is active, disabled, or the iteration budget is exhausted.
 func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
@@ -302,23 +333,8 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 			m.state = nil
 			m.mu.Unlock()
 			slog.Debug("session recreated", "reason", status, "instance_id", st.InstanceID)
-		case "banned":
-			return &upstream.BanError{ResumesAt: st.ResumesAt, Body: st.Message}
-		case "country_blocked":
-			return fmt.Errorf("session: country blocked upstream")
-		case "rate_limited", "ip_capped", "spend_limited":
-			retryAfter := time.Duration(st.RetryAfterMs) * time.Millisecond
-			if retryAfter <= 0 {
-				retryAfter = time.Minute
-			}
-			return &upstream.RateLimitError{
-				Status:      status,
-				RetryAfter:  retryAfter,
-				ResetAt:     st.ResetAt,
-				Limit:       st.Limit,
-				RecentCount: st.RecentCount,
-				Body:        st.Message,
-			}
+		case "banned", "country_blocked", "rate_limited", "ip_capped", "spend_limited":
+			return statusError(status, st)
 		case "model_locked":
 			// Previous session is locked to a different model.
 			// Release the old slot and retry with the desired model.
@@ -354,6 +370,8 @@ type SessionSnapshot struct {
 	QueuePosition      int
 	QueueDepth         int
 	TierAccess         string
+	// CountryCode is the admitted session's country ("" when absent).
+	CountryCode        string
 	TierCountry        string
 	CountryBlockReason string
 	ExpiresAt          time.Time
@@ -405,6 +423,7 @@ func (m *Manager) Snapshot() SessionSnapshot {
 		QueuePosition:      m.state.position,
 		QueueDepth:         m.state.queueDepth,
 		TierAccess:         m.state.accessTier,
+		CountryCode:        m.state.countryCode,
 		TierCountry:        m.state.countryCode,
 		CountryBlockReason: m.state.countryBlockReason,
 		ExpiresAt:          m.state.expiresAt,
@@ -460,6 +479,20 @@ func (m *Manager) Heartbeat(ctx context.Context) error {
 	st, err := m.client.GetSessionWithOpts(ctx, instanceID, true, true)
 	if err != nil {
 		return err
+	}
+	if serr := statusError(st.Status, st); serr != nil {
+		// A banned session is dead until the account unban: drop the cached
+		// admission (cooldown) so the token re-admits only after the pool's
+		// ban window, instead of heartbeat-ing a stale slot.
+		if st.Status == "banned" {
+			m.mu.Lock()
+			if m.state != nil && m.state.instanceID == instanceID {
+				m.state = nil
+				slog.Debug("session dropped during heartbeat", "reason", st.Status, "instance_id", instanceID)
+			}
+			m.mu.Unlock()
+		}
+		return serr
 	}
 	if st.Status == "ended" || st.Status == "superseded" || st.Status == "none" {
 		m.mu.Lock()

@@ -373,6 +373,37 @@ func TestBannedSessionReturnsError(t *testing.T) {
 	}
 }
 
+// TestCountryBlockedSessionReturnsTypedError verifies a country_blocked
+// admission surfaces as a CountryBlockedError with the parsed region fields
+// (the pre-change code returned a plain fmt.Errorf).
+func TestCountryBlockedSessionReturnsTypedError(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"country_blocked","countryCode":"US","countryBlockReason":"Free mode is not available in your country","ipPrivacySignals":["vpn"]}`)
+	}
+	mgr := newTestManager(t, mock)
+
+	_, err := mgr.EnsureSession(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var cbe *upstream.CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want *upstream.CountryBlockedError, got %v", err)
+	}
+	if cbe.CountryCode != "US" || cbe.CountryBlockReason != "Free mode is not available in your country" {
+		t.Errorf("country block fields = %+v", cbe)
+	}
+	if len(cbe.IpPrivacySignals) != 1 || cbe.IpPrivacySignals[0] != "vpn" {
+		t.Errorf("ipPrivacySignals = %v", cbe.IpPrivacySignals)
+	}
+	if !errors.Is(err, upstream.ErrCountryBlocked) {
+		t.Error("not unwrap-able to ErrCountryBlocked")
+	}
+}
+
 func TestModelLockedRecreates(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -585,6 +616,95 @@ func TestHeartbeat(t *testing.T) {
 		}
 		if snap := mgr.Snapshot(); snap.Status != "" {
 			t.Errorf("status = %q, want empty after invalidation", snap.Status)
+		}
+	})
+}
+
+// TestHeartbeatStatusErrors verifies Heartbeat maps terminal poll statuses
+// through the same statusError helper as refresh, so the pool sees typed
+// errors and can cool tokens down.
+func TestHeartbeatStatusErrors(t *testing.T) {
+	t.Run("banned returns BanError and clears cached admission", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"banned","resumes_at":"2026-08-16T12:00:00Z"}`)
+		}
+
+		err := mgr.Heartbeat(context.Background())
+		var be *upstream.BanError
+		if !errors.As(err, &be) {
+			t.Fatalf("want *upstream.BanError, got %v", err)
+		}
+		if !errors.Is(err, upstream.ErrBanned) {
+			t.Error("not unwrap-able to ErrBanned")
+		}
+		if be.ResumesAt.IsZero() {
+			t.Error("resumes_at not parsed into BanError")
+		}
+		if snap := mgr.Snapshot(); snap.Status != "" {
+			t.Errorf("status = %q, want cleared after ban cooldown", snap.Status)
+		}
+	})
+
+	t.Run("country_blocked returns CountryBlockedError", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"country_blocked","countryCode":"US","countryBlockReason":"region restricted","ipPrivacySignals":["proxy"]}`)
+		}
+
+		err := mgr.Heartbeat(context.Background())
+		var cbe *upstream.CountryBlockedError
+		if !errors.As(err, &cbe) {
+			t.Fatalf("want *upstream.CountryBlockedError, got %v", err)
+		}
+		if cbe.CountryCode != "US" || cbe.CountryBlockReason != "region restricted" {
+			t.Errorf("country block fields = %+v", cbe)
+		}
+		if !errors.Is(err, upstream.ErrCountryBlocked) {
+			t.Error("not unwrap-able to ErrCountryBlocked")
+		}
+	})
+
+	t.Run("rate_limited returns RateLimitError", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"rate_limited","retryAfterMs":45000,"limit":5,"recentCount":5}`)
+		}
+
+		err := mgr.Heartbeat(context.Background())
+		var rle *upstream.RateLimitError
+		if !errors.As(err, &rle) {
+			t.Fatalf("want *upstream.RateLimitError, got %v", err)
+		}
+		if !errors.Is(err, upstream.ErrRateLimited) {
+			t.Error("not unwrap-able to ErrRateLimited")
+		}
+		if rle.RetryAfter != 45*time.Second {
+			t.Errorf("RetryAfter = %s, want 45s", rle.RetryAfter)
 		}
 	})
 }

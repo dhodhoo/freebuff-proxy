@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"golang.org/x/net/proxy"
 
 	"freebuff-proxy/internal/config"
@@ -55,6 +56,16 @@ var (
 	// ErrBanned: the account is temporarily banned upstream (403 {"status":"banned"}).
 	// Cool the token down until BanError.ResumesAt.
 	ErrBanned = errors.New("upstream account banned")
+	// ErrCountryBlocked: free mode is not available from the account's IP
+	// region (403 {"status":"country_blocked"}). Surfaced so callers can
+	// diagnose the region gate instead of retrying blindly.
+	ErrCountryBlocked = errors.New("upstream country blocked")
+	// ErrFreeModeCLIRequired: the free tier refused the request because it
+	// did not carry the CLI request envelope (403 free_mode_cli_required).
+	ErrFreeModeCLIRequired = errors.New("upstream free mode requires CLI request envelope")
+	// ErrCredits: 402 payment required — the account has no credits / free
+	// quota left to spend.
+	ErrCredits = errors.New("upstream payment required")
 )
 
 // WaitRoom carries queue details for ErrWaitingRoom.
@@ -91,6 +102,10 @@ type UpstreamError struct {
 	Status     int
 	Body       string // truncated to 500 chars
 	RetryAfter time.Duration
+	// Retryable marks a refusal that is only temporarily unavailable but
+	// worth retrying later (e.g. deployment_outside_hours), unlike the
+	// default non-retryable UpstreamError.
+	Retryable bool
 }
 
 func (e *UpstreamError) Error() string {
@@ -145,6 +160,43 @@ func (e *BanError) Error() string {
 
 func (e *BanError) Unwrap() error { return ErrBanned }
 
+// CountryBlockedError is a 403 country_blocked response: free mode is not
+// available from the account's IP region. Fields are best-effort — compact
+// polls may omit them. Unwrap makes errors.Is(err, ErrCountryBlocked) work.
+type CountryBlockedError struct {
+	CountryCode        string
+	CountryBlockReason string
+	IpPrivacySignals   []string
+}
+
+func (e *CountryBlockedError) Error() string {
+	msg := "upstream country blocked"
+	if e.CountryCode != "" {
+		msg += " (" + e.CountryCode
+		if e.CountryBlockReason != "" {
+			msg += ": " + e.CountryBlockReason
+		}
+		msg += ")"
+	}
+	return msg
+}
+
+func (e *CountryBlockedError) Unwrap() error { return ErrCountryBlocked }
+
+// CreditsError is a 402 payment-required response (no credits / free quota
+// left). Mirrors UpstreamError's shape. Unwrap makes
+// errors.Is(err, ErrCredits) work.
+type CreditsError struct {
+	Status int
+	Body   string // truncated upstream body
+}
+
+func (e *CreditsError) Error() string {
+	return fmt.Sprintf("upstream %d: %s", e.Status, e.Body)
+}
+
+func (e *CreditsError) Unwrap() error { return ErrCredits }
+
 // SessionState is the parsed result of a free-session create/poll.
 type SessionState struct {
 	Status             string
@@ -172,6 +224,10 @@ type SessionState struct {
 	RetryAfterMs       int64
 	AvailableHours     string
 	Message            string
+	// LimitedModelOffers carries the limited-tier per-model allowances from
+	// limitedModelOffers (present on limited-tier admissions, absent on
+	// full-tier and compact poll responses; never required).
+	LimitedModelOffers []LimitedModelOffer
 	// RateLimitsByModel carries the live per-model session quotas from the
 	// admission/poll response (key = model id). Absent on compact polls and
 	// pre-join (none) responses; never required.
@@ -202,6 +258,28 @@ type rawModelQuota struct {
 	Period               string             `json:"period"`
 	ResetAt              any                `json:"resetAt"`
 	EntitlementBreakdown map[string]float64 `json:"entitlementBreakdown"`
+}
+
+// LimitedModelOffer is one model's limited-tier allowance from the upstream
+// limitedModelOffers array, per the official CLI wire shape
+// (reference/freebuff/common/src/types/freebuff-session.ts). UserResetAt is
+// the user-level quota reset; zero when the server omits it.
+type LimitedModelOffer struct {
+	Model         string
+	Remaining     float64
+	Total         float64
+	UserRemaining float64
+	UserResetAt   time.Time
+}
+
+// rawLimitedModelOffer mirrors one limitedModelOffers entry on the wire.
+// userResetAt is parsed with parseFlexTime.
+type rawLimitedModelOffer struct {
+	Model         string  `json:"model"`
+	Remaining     float64 `json:"remaining"`
+	Total         float64 `json:"total"`
+	UserRemaining float64 `json:"userRemaining"`
+	UserResetAt   any     `json:"userResetAt"`
 }
 
 // ChatOptions carries the envelope values for a chat completion request.
@@ -619,6 +697,7 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 		RetryAfterMs           int64                    `json:"retryAfterMs"`
 		AvailableHours         string                   `json:"availableHours"`
 		Message                string                   `json:"message"`
+		LimitedModelOffers     []rawLimitedModelOffer    `json:"limitedModelOffers"`
 		RateLimitsByModel      map[string]rawModelQuota `json:"rateLimitsByModel"`
 	}
 	if err := json.Unmarshal([]byte(body), &raw); err == nil && raw.Status != "" {
@@ -660,6 +739,21 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 		}
 		if state.ResumesAt, err = parseFlexTime(raw.ResumesAt); err != nil {
 			state.ResumesAt = time.Time{}
+		}
+		if len(raw.LimitedModelOffers) > 0 {
+			state.LimitedModelOffers = make([]LimitedModelOffer, 0, len(raw.LimitedModelOffers))
+			for _, o := range raw.LimitedModelOffers {
+				offer := LimitedModelOffer{
+					Model:         o.Model,
+					Remaining:     o.Remaining,
+					Total:         o.Total,
+					UserRemaining: o.UserRemaining,
+				}
+				if resetAt, perr := parseFlexTime(o.UserResetAt); perr == nil {
+					offer.UserResetAt = resetAt
+				}
+				state.LimitedModelOffers = append(state.LimitedModelOffers, offer)
+			}
 		}
 		if len(raw.RateLimitsByModel) > 0 {
 			state.RateLimitsByModel = make(map[string]ModelQuota, len(raw.RateLimitsByModel))
@@ -1056,6 +1150,14 @@ func wrapDecompress(resp *http.Response) error {
 		resp.Body = &decompressCloser{Reader: zr, underlying: underlying}
 	case "br":
 		resp.Body = &decompressCloser{Reader: brotli.NewReader(underlying), underlying: underlying}
+	case "zstd":
+		// The stealth profiles advertise zstd in Accept-Encoding, so the
+		// upstream may legitimately respond with it.
+		zr, err := zstd.NewReader(underlying, zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			return fmt.Errorf("zstd: %w", err)
+		}
+		resp.Body = &decompressCloser{Reader: zr, underlying: underlying}
 	default:
 		return fmt.Errorf("unsupported Content-Encoding %q", enc)
 	}
@@ -1195,6 +1297,12 @@ func classifyError(status int, body string, hdr http.Header) error {
 		return fmt.Errorf("%w: %d %s", ErrAuthRejected, status, truncate(body, 200))
 	case status == http.StatusServiceUnavailable:
 		return &WaitingRoomError{RetryAfter: retryAfter, Detail: truncate(body, 200)}
+	case status == http.StatusPaymentRequired:
+		return &CreditsError{Status: status, Body: truncate(body, 200)}
+	case status == http.StatusForbidden && strings.Contains(lower, "free_mode_cli_required"):
+		return fmt.Errorf("%w: %d %s", ErrFreeModeCLIRequired, status, truncate(body, 200))
+	case status == http.StatusForbidden && strings.Contains(lower, "country_blocked"):
+		return parseCountryBlock(body)
 	case containsAny(lower, "freebuff_update_required", "waiting_room_required", "waiting_room_queued",
 		"session_superseded", "session_expired", "session_model_mismatch", "model_locked"):
 		return fmt.Errorf("%w: %s%s", ErrSessionInvalid, truncate(body, 200), retryDetail(retryAfter))
@@ -1202,9 +1310,31 @@ func classifyError(status int, body string, hdr http.Header) error {
 		return fmt.Errorf("%w: %s", ErrRunInvalid, truncate(body, 200))
 	case status == http.StatusTooManyRequests || containsAny(lower, "rate_limited", "ip_capped", "spend_limited"):
 		return parseRateLimit(body, parseRetryAfter(hdr))
+	case strings.Contains(lower, "deployment_outside_hours"):
+		// Free tier is outside its operating hours: temporarily unavailable
+		// but worth a later retry, unlike the default hard failure.
+		return &UpstreamError{Status: status, Body: truncate(body, 500), RetryAfter: retryAfter, Retryable: true}
 	default:
 		return &UpstreamError{Status: status, Body: truncate(body, 500), RetryAfter: retryAfter}
 	}
+}
+
+// parseCountryBlock builds a CountryBlockedError from a 403 country_blocked
+// body, extracting countryCode/countryBlockReason/ipPrivacySignals
+// best-effort (absent fields are tolerated).
+func parseCountryBlock(body string) error {
+	cbe := &CountryBlockedError{}
+	var parsed struct {
+		CountryCode        string   `json:"countryCode"`
+		CountryBlockReason string   `json:"countryBlockReason"`
+		IpPrivacySignals   []string `json:"ipPrivacySignals"`
+	}
+	if err := json.Unmarshal([]byte(body), &parsed); err == nil {
+		cbe.CountryCode = parsed.CountryCode
+		cbe.CountryBlockReason = parsed.CountryBlockReason
+		cbe.IpPrivacySignals = parsed.IpPrivacySignals
+	}
+	return cbe
 }
 
 // NextPacificMidnight returns the upcoming 00:00 Pacific Time in UTC

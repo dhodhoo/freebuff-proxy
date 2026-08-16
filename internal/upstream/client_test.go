@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/stealth"
@@ -261,7 +262,7 @@ func TestErrorClassification(t *testing.T) {
 		{"waiting room 503", 503, `{"error":"waiting_room_queued"}`, ErrWaitingRoom},
 		{"waiting room body", 429, `{"error":"waiting_room_required"}`, ErrSessionInvalid},
 		{"generic", 500, `{"error":"boom"}`, &UpstreamError{Status: 500}},
-		{"402 out of credits", 402, `{"error":"out of credits"}`, &UpstreamError{Status: 402}},
+		{"402 out of credits", 402, `{"error":"out of credits"}`, ErrCredits},
 	}
 
 	for _, tc := range cases {
@@ -415,6 +416,54 @@ func TestSessionCallParsesRateLimitsByModel(t *testing.T) {
 	}
 	if q.Model != "z-ai/glm-5.2" {
 		t.Errorf("quota model = %q", q.Model)
+	}
+}
+
+// TestSessionCallParsesLimitedModelOffers verifies the limited-tier per-model
+// allowances from an admission response are parsed into SessionState,
+// including flex-time userResetAt.
+func TestSessionCallParsesLimitedModelOffers(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123","accessTier":"limited","limitedModelOffers":[{"model":"deepseek/deepseek-v4-flash","remaining":3,"total":5,"userRemaining":3,"userResetAt":"2026-08-16T07:00:00.000Z"}]}`)
+	}
+
+	client, _ := New("tok", testConfig(mock.URL(), nil))
+	st, err := client.CreateSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.LimitedModelOffers) != 1 {
+		t.Fatalf("LimitedModelOffers len = %d, want 1: %+v", len(st.LimitedModelOffers), st.LimitedModelOffers)
+	}
+	offer := st.LimitedModelOffers[0]
+	if offer.Model != "deepseek/deepseek-v4-flash" {
+		t.Errorf("model = %q", offer.Model)
+	}
+	if offer.Remaining != 3 || offer.Total != 5 || offer.UserRemaining != 3 {
+		t.Errorf("offer = %+v, want remaining=3 total=5 userRemaining=3", offer)
+	}
+	wantReset := time.Date(2026, 8, 16, 7, 0, 0, 0, time.UTC)
+	if !offer.UserResetAt.Equal(wantReset) {
+		t.Errorf("UserResetAt = %v, want %v", offer.UserResetAt, wantReset)
+	}
+}
+
+// TestSessionCallIgnoresMissingLimitedModelOffers verifies a full-tier or
+// compact admission without limitedModelOffers parses cleanly (nil slice).
+func TestSessionCallIgnoresMissingLimitedModelOffers(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	client, _ := New("tok", testConfig(mock.URL(), nil))
+	st, err := client.CreateSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LimitedModelOffers != nil {
+		t.Errorf("LimitedModelOffers = %+v, want nil when absent", st.LimitedModelOffers)
 	}
 }
 
@@ -694,7 +743,14 @@ func TestWrapDecompress(t *testing.T) {
 			_ = zw.Close()
 			return buf.Bytes()
 		}, ""},
-		{"unsupported encoding", "zstd", nil, "unsupported Content-Encoding"},
+		{"zstd", "zstd", func(b []byte) []byte {
+			var buf bytes.Buffer
+			zw, _ := zstd.NewWriter(&buf)
+			_, _ = zw.Write(b)
+			_ = zw.Close()
+			return buf.Bytes()
+		}, ""},
+		{"unsupported encoding", "lz4", nil, "unsupported Content-Encoding"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -796,10 +852,105 @@ func TestClassifyBanUnixMsResumesAt(t *testing.T) {
 			if !errors.As(err, &be) {
 				t.Fatalf("want *BanError, got %v", err)
 			}
-			if !be.ResumesAt.Equal(tc.want) {
-				t.Errorf("ResumesAt = %v, want %v", be.ResumesAt, tc.want)
-			}
-		})
+		if !be.ResumesAt.Equal(tc.want) {
+			t.Errorf("ResumesAt = %v, want %v", be.ResumesAt, tc.want)
+		}
+	})
+	}
+}
+
+// TestClassifyCredits verifies a 402 payment-required response maps to a
+// CreditsError unwrapping to ErrCredits (fresh free accounts hit this before
+// the free tier kicks in, so it must NOT fall through to a generic
+// UpstreamError).
+func TestClassifyCredits(t *testing.T) {
+	err := classifyError(402, `{"error":"insufficient credits"}`, http.Header{})
+	var credErr *CreditsError
+	if !errors.As(err, &credErr) {
+		t.Fatalf("want CreditsError, got %v", err)
+	}
+	if credErr.Status != 402 {
+		t.Errorf("status = %d, want 402", credErr.Status)
+	}
+	if !errors.Is(err, ErrCredits) {
+		t.Error("not unwrap-able to ErrCredits")
+	}
+}
+
+// TestClassifyFreeModeCLIRequired verifies the free-tier gate refusal is
+// typed, so the gateway can distinguish "envelope missing" from a hard 403.
+func TestClassifyFreeModeCLIRequired(t *testing.T) {
+	body := `{"error":{"status":"free_mode_cli_required","message":"CLI fingerprint required for free tier"}}`
+	err := classifyError(403, body, http.Header{})
+	if !errors.Is(err, ErrFreeModeCLIRequired) {
+		t.Fatalf("errors.Is(ErrFreeModeCLIRequired) = false, got %v", err)
+	}
+}
+
+// TestClassifyCountryBlocked verifies a 403 country_blocked response maps to
+// a CountryBlockedError carrying the parsed region fields.
+func TestClassifyCountryBlocked(t *testing.T) {
+	body := `{"status":"country_blocked","countryCode":"US","countryBlockReason":"Free mode is not available in your country","ipPrivacySignals":["vpn","proxy"]}`
+	err := classifyError(403, body, http.Header{})
+	var cbe *CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want CountryBlockedError, got %v", err)
+	}
+	if cbe.CountryCode != "US" {
+		t.Errorf("countryCode = %q, want US", cbe.CountryCode)
+	}
+	if cbe.CountryBlockReason != "Free mode is not available in your country" {
+		t.Errorf("countryBlockReason = %q", cbe.CountryBlockReason)
+	}
+	if len(cbe.IpPrivacySignals) != 2 || cbe.IpPrivacySignals[0] != "vpn" || cbe.IpPrivacySignals[1] != "proxy" {
+		t.Errorf("ipPrivacySignals = %v", cbe.IpPrivacySignals)
+	}
+	if !errors.Is(err, ErrCountryBlocked) {
+		t.Error("not unwrap-able to ErrCountryBlocked")
+	}
+}
+
+// TestClassifyCountryBlockedToleratesAbsentFields verifies a bare
+// country_blocked body (compact poll) still classifies without panicking and
+// leaves the optional fields zero.
+func TestClassifyCountryBlockedToleratesAbsentFields(t *testing.T) {
+	err := classifyError(403, `{"status":"country_blocked"}`, http.Header{})
+	var cbe *CountryBlockedError
+	if !errors.As(err, &cbe) {
+		t.Fatalf("want CountryBlockedError, got %v", err)
+	}
+	if cbe.CountryCode != "" || cbe.CountryBlockReason != "" || len(cbe.IpPrivacySignals) != 0 {
+		t.Errorf("expected zero optional fields, got %+v", cbe)
+	}
+	if !errors.Is(err, ErrCountryBlocked) {
+		t.Error("not unwrap-able to ErrCountryBlocked")
+	}
+}
+
+// TestClassifyDeploymentOutsideHoursRetryable verifies a
+// deployment_outside_hours body (when no other classifier claims it) maps to
+// an UpstreamError marked Retryable, not a hard failure.
+func TestClassifyDeploymentOutsideHoursRetryable(t *testing.T) {
+	err := classifyError(500, `{"status":"deployment_outside_hours","message":"Free mode is only available during operating hours"}`, http.Header{})
+	var upErr *UpstreamError
+	if !errors.As(err, &upErr) {
+		t.Fatalf("want UpstreamError, got %v", err)
+	}
+	if !upErr.Retryable {
+		t.Error("Retryable = false, want true")
+	}
+	if upErr.Status != 500 {
+		t.Errorf("status = %d, want 500", upErr.Status)
+	}
+
+	// Ordinary 500s stay non-retryable.
+	errPlain := classifyError(500, `{"error":"boom"}`, http.Header{})
+	var plain *UpstreamError
+	if !errors.As(errPlain, &plain) {
+		t.Fatalf("want UpstreamError, got %v", errPlain)
+	}
+	if plain.Retryable {
+		t.Error("plain UpstreamError must not be Retryable")
 	}
 }
 
