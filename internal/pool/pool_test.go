@@ -727,7 +727,7 @@ func TestStartPrewarmsAndShutdownDrains(t *testing.T) {
 // fallback registry (the pool does not export its registry).
 func (p *Pool) regAgentIDs(t *testing.T) []string {
 	t.Helper()
-	reg := registry.New(p.cfg, nil)
+	reg := registry.New(p.cfg.Load(), nil)
 	reg.LoadFallback()
 	return reg.AgentIDs()
 }
@@ -808,7 +808,9 @@ func TestDailyMessageCap(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
-	p.cfg.MaxMessagesPerDay = 2
+	cfg := p.cfg.Load()
+	cfg.MaxMessagesPerDay = 2
+	p.cfg.Store(cfg)
 
 	for i := 0; i < 2; i++ {
 		lease, err := p.Acquire(context.Background(), modelA)
@@ -852,7 +854,9 @@ func TestDailyMessageCapFailover(t *testing.T) {
 	mock1 := testutil.NewMock()
 	defer mock1.Close()
 	p := newTestPool(t, mock0, mock1)
-	p.cfg.MaxMessagesPerDay = 1
+	cfg := p.cfg.Load()
+	cfg.MaxMessagesPerDay = 1
+	p.cfg.Store(cfg)
 
 	// Round-robin: first acquire lands on token-1; cap it with a chat.
 	lease, err := p.Acquire(context.Background(), modelA)
@@ -911,11 +915,50 @@ func TestDailyMessageCapDisabled(t *testing.T) {
 	}
 }
 
+// TestSetConfigReloadsDailyLimit is the regression guard for the P1 stale
+// config bug: the pool kept the *config.Config it was built with, so a
+// reloaded config (dashboard save / admin reload) never took effect for
+// the daily message cap. SetConfig must swap the pointer the pool reads.
+func TestSetConfigReloadsDailyLimit(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// One successful chat under the default (unlimited) config.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatOnce(t, p, lease)
+	p.LeaseRelease(lease)
+
+	// Reload a config with a daily cap of 1.
+	newCfg := *p.cfg.Load()
+	newCfg.MaxMessagesPerDay = 1
+	p.SetConfig(&newCfg)
+
+	// The next acquire must respect the NEW limit: one chat is already on
+	// the books, so the cap bites immediately.
+	_, err = p.Acquire(context.Background(), modelA)
+	var rle *upstream.RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("want *upstream.RateLimitError after SetConfig cap, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrRateLimited) {
+		t.Error("errors.Is(ErrRateLimited) = false")
+	}
+	if rle.Limit != 1 {
+		t.Errorf("quota limit = %v, want 1 (reloaded config)", rle.Limit)
+	}
+}
+
 func TestIdleRotationFinishesRuns(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
-	p.cfg.IdleRotationTimeout = 10 * time.Millisecond
+	cfg := p.cfg.Load()
+	cfg.IdleRotationTimeout = 10 * time.Millisecond
+	p.cfg.Store(cfg)
 
 	lease, err := p.Acquire(context.Background(), modelA)
 	if err != nil {
@@ -959,6 +1002,42 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 	p.LeaseRelease(lease)
 	if got := mock.StartedRunsSnapshot(); len(got) != 2 {
 		t.Errorf("started runs = %v, want 2 (re-created on demand)", got)
+	}
+}
+
+// TestIdleRotationSkipsInflight is the regression guard for the P1 idle
+// rotation bug: the idle FINISH pass used to FinishAllRuns every token,
+// killing in-flight chats. Tokens holding a lease must be skipped — their
+// runs stay live until the lease drains (mirrors the bridge idle sweep's
+// busy-entry rule).
+func TestIdleRotationSkipsInflight(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+	cfg := p.cfg.Load()
+	cfg.IdleRotationTimeout = 10 * time.Millisecond
+	p.cfg.Store(cfg)
+
+	// Acquire a lease and HOLD it: the run stays in the run manager.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.LeaseRelease(lease)
+	if got := mock.StartedRunsSnapshot(); len(got) != 1 {
+		t.Fatalf("started runs = %v, want 1", got)
+	}
+
+	// Past the idle threshold: an idle pass must NOT FINISH the held run.
+	time.Sleep(30 * time.Millisecond)
+	p.maintainTick(context.Background())
+	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+		t.Fatalf("finished runs = %v, want none (in-flight lease held)", got)
+	}
+
+	// The held lease's run is still live in the manager.
+	if got := p.Snapshot()[0].ActiveRuns; got != 1 {
+		t.Errorf("ActiveRuns = %d, want 1 (run not finished)", got)
 	}
 }
 
@@ -1671,7 +1750,9 @@ func TestIdleFinishAllRunsHonorsMaintainCtx(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
-	p.cfg.IdleRotationTimeout = time.Millisecond
+	cfg := p.cfg.Load()
+	cfg.IdleRotationTimeout = time.Millisecond
+	p.cfg.Store(cfg)
 
 	lease, err := p.Acquire(context.Background(), modelA)
 	if err != nil {

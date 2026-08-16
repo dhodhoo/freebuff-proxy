@@ -333,9 +333,12 @@ type Client struct {
 }
 
 // cliUserAgent mirrors the official CLI / SDK user agent. The upstream
-// free-tier gate (403 free_mode_cli_required) requires requests to carry the
-// AI-SDK user agent; random browser UAs are rejected. Kept as a fixed
-// constant so the envelope is identical on every request.
+// free-tier gate (403 free_mode_cli_required) keys on the CLI request
+// envelope (x-freebuff-* headers, codebuff_metadata, forced streaming and
+// the cb_easp stop sentinel — see the package comment), NOT the User-Agent,
+// so the stealth path may carry a browser UA matched to its TLS fingerprint
+// without tripping the gate. This constant is applied on the non-stealth
+// path so the request signature stays identical on every request.
 const cliUserAgent = "ai-sdk/openai-compatible/0.10.7/codebuff"
 
 // New builds the client for one token.

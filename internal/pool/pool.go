@@ -120,7 +120,10 @@ type TokenSnapshot struct {
 
 // Pool balances requests across the configured tokens.
 type Pool struct {
-	cfg *config.Config
+	// cfg is the pool's effective configuration. It is an atomic pointer so
+	// the dashboard can swap in a reloaded config at runtime (SetConfig);
+	// every reader Load()s once per call instead of caching the pointer.
+	cfg atomic.Pointer[config.Config]
 	reg *registry.Registry
 	// toks is the fixed-token list. It is an atomic pointer so the dashboard
 	// can add/remove tokens at runtime (AddToken/RemoveLastToken/
@@ -182,7 +185,8 @@ func New(cfg *config.Config, clients []*upstream.Client, sessions []*session.Man
 		return nil, fmt.Errorf("pool: %d sessions for %d tokens", len(sessions), len(cfg.AuthTokens))
 	}
 
-	p := &Pool{cfg: cfg, reg: reg, logger: slog.Default(), bridge: make(map[string]*bridgeEntry)}
+	p := &Pool{reg: reg, logger: slog.Default(), bridge: make(map[string]*bridgeEntry)}
+	p.cfg.Store(cfg)
 	p.msgsPerToken = make([][]time.Time, len(cfg.AuthTokens))
 	toks := make([]*tokenEntry, 0, len(cfg.AuthTokens))
 	for i := range cfg.AuthTokens {
@@ -196,6 +200,13 @@ func New(cfg *config.Config, clients []*upstream.Client, sessions []*session.Man
 	return p, nil
 }
 
+// SetConfig swaps in a reloaded configuration. The pool reads config
+// through an atomic pointer, so a config change takes effect on the next
+// Acquire/maintain pass without rebuilding the pool.
+func (p *Pool) SetConfig(cfg *config.Config) {
+	p.cfg.Store(cfg)
+}
+
 // AddToken adds a token to the pool at runtime (dashboard action): builds
 // the client/session/run-manager triple and appends it, returning the new
 // token index. The config must be updated separately (AUTH_TOKENS + reload)
@@ -203,14 +214,14 @@ func New(cfg *config.Config, clients []*upstream.Client, sessions []*session.Man
 func (p *Pool) AddToken(token string) (int, error) {
 	toks := p.toks.Load()
 	idx := len(*toks)
-	client, err := upstream.NewWithIndex(token, idx, p.cfg)
+	client, err := upstream.NewWithIndex(token, idx, p.cfg.Load())
 	if err != nil {
 		return 0, fmt.Errorf("pool: add token: %w", err)
 	}
 	sess := session.NewManager(client)
 	entry := &tokenEntry{
 		session: sess,
-		runs:    runs.NewRunManager(client, sess, p.cfg.RotationInterval),
+		runs:    runs.NewRunManager(client, sess, p.cfg.Load().RotationInterval),
 		client:  client,
 	}
 	next := make([]*tokenEntry, 0, len(*toks)+1)
@@ -275,6 +286,7 @@ func (p *Pool) TokenCount() int {
 // a lease on success. Registry misses (unknown model) are returned as-is.
 func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	toks := p.toks.Load()
+	cfg := p.cfg.Load()
 	if len(*toks) == 0 {
 		return nil, errors.New("pool: no auth tokens configured")
 	}
@@ -333,10 +345,10 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		// MAX_MESSAGES_PER_DAY successful chats in the last 24h is skipped
 		// like a cooldown; when every token is capped, the pool surfaces a
 		// 429 with the earliest window reset.
-		if p.cfg.MaxMessagesPerDay > 0 && p.usageCount(idx) >= p.cfg.MaxMessagesPerDay {
+		if cfg.MaxMessagesPerDay > 0 && p.usageCount(idx) >= cfg.MaxMessagesPerDay {
 			dailyLimited = append(dailyLimited, p.dailyLimitError(idx))
-			errs = append(errs, fmt.Sprintf("%s: daily message limit (%d) reached", name, p.cfg.MaxMessagesPerDay))
-			p.logger.Debug("pool: token skipped (daily message limit)", "token", idx+1, "limit", p.cfg.MaxMessagesPerDay)
+			errs = append(errs, fmt.Sprintf("%s: daily message limit (%d) reached", name, cfg.MaxMessagesPerDay))
+			p.logger.Debug("pool: token skipped (daily message limit)", "token", idx+1, "limit", cfg.MaxMessagesPerDay)
 			continue
 		}
 
@@ -435,6 +447,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 // prefer a hot token whose session already serves it (sessions are shared
 // across models in practice, so the match is not a requirement).
 func (p *Pool) acquireOrder(toks *[]*tokenEntry, start int, model string) []int {
+	cfg := p.cfg.Load()
 	// eligible mirrors the per-token checks the failover loop applies:
 	// not cooling down and (when configured) under the daily message cap.
 	eligible := func(idx int) bool {
@@ -442,7 +455,7 @@ func (p *Pool) acquireOrder(toks *[]*tokenEntry, start int, model string) []int 
 		if time.Now().Before(tok.runs.CooldownUntil()) {
 			return false
 		}
-		if p.cfg.MaxMessagesPerDay > 0 && p.usageCount(idx) >= p.cfg.MaxMessagesPerDay {
+		if cfg.MaxMessagesPerDay > 0 && p.usageCount(idx) >= cfg.MaxMessagesPerDay {
 			return false
 		}
 		return true
@@ -514,6 +527,7 @@ func tokenHasLiveSession(tok *tokenEntry) bool {
 // is returned as-is. Registry misses pass through.
 func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*Lease, error) {
 	clientToken = strings.TrimSpace(clientToken)
+	cfg := p.cfg.Load()
 	if clientToken == "" {
 		return nil, errors.New("bridge: empty client token")
 	}
@@ -546,8 +560,8 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 	}
 
 	// Daily rolling cap, per client token (mirrors the fixed-token path).
-	if p.cfg.MaxMessagesPerDay > 0 && p.bridgeUsageCount(entry) >= p.cfg.MaxMessagesPerDay {
-		p.logger.Debug("pool: bridge entry daily message limit", "limit", p.cfg.MaxMessagesPerDay)
+	if cfg.MaxMessagesPerDay > 0 && p.bridgeUsageCount(entry) >= cfg.MaxMessagesPerDay {
+		p.logger.Debug("pool: bridge entry daily message limit", "limit", cfg.MaxMessagesPerDay)
 		return nil, p.bridgeDailyLimitError(entry)
 	}
 
@@ -872,7 +886,7 @@ func (p *Pool) Shutdown(ctx context.Context) {
 func (p *Pool) Snapshot() []TokenSnapshot {
 	toks := p.toks.Load()
 	out := make([]TokenSnapshot, 0, len(*toks))
-	dailyLimit := p.cfg.MaxMessagesPerDay
+	dailyLimit := p.cfg.Load().MaxMessagesPerDay
 	for i, tok := range *toks {
 		rs := tok.runs.Snapshot()
 		ss := tok.session.Snapshot()
@@ -1037,7 +1051,7 @@ func (p *Pool) usageCount(token int) int {
 func (p *Pool) dailyLimitError(token int) *upstream.RateLimitError {
 	return &upstream.RateLimitError{
 		RetryAfter:  p.usageResetIn(token),
-		Limit:       float64(p.cfg.MaxMessagesPerDay),
+		Limit:       float64(p.cfg.Load().MaxMessagesPerDay),
 		RecentCount: float64(p.usageCount(token)),
 		Body:        "daily message limit reached",
 	}
@@ -1081,14 +1095,14 @@ func (p *Pool) bridgeEntryFor(clientToken string) (*bridgeEntry, error) {
 		return entry, nil
 	}
 
-	client, err := upstream.New(clientToken, p.cfg)
+	client, err := upstream.New(clientToken, p.cfg.Load())
 	if err != nil {
 		p.bridgeMu.Unlock()
 		return nil, fmt.Errorf("bridge: %w", err)
 	}
 	entry := &bridgeEntry{token: clientToken, client: client}
 	entry.session = session.NewManager(client)
-	entry.runs = runs.NewRunManager(client, entry.session, p.cfg.RotationInterval)
+	entry.runs = runs.NewRunManager(client, entry.session, p.cfg.Load().RotationInterval)
 	entry.lastUsed = time.Now()
 
 	p.bridge[clientToken] = entry
@@ -1226,7 +1240,7 @@ func (p *Pool) bridgeUsageResetIn(entry *bridgeEntry) time.Duration {
 func (p *Pool) bridgeDailyLimitError(entry *bridgeEntry) *upstream.RateLimitError {
 	return &upstream.RateLimitError{
 		RetryAfter:  p.bridgeUsageResetIn(entry),
-		Limit:       float64(p.cfg.MaxMessagesPerDay),
+		Limit:       float64(p.cfg.Load().MaxMessagesPerDay),
 		RecentCount: float64(p.bridgeUsageCount(entry)),
 		Body:        "daily message limit reached",
 	}
@@ -1289,7 +1303,7 @@ func (p *Pool) prewarm(ctx context.Context, agentIDs []string) {
 	defer p.wg.Done()
 	toks := p.toks.Load()
 	for i, tok := range *toks {
-		preCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
+		preCtx, cancel := context.WithTimeout(ctx, p.cfg.Load().RequestTimeout)
 		tok.runs.Prewarm(preCtx, agentIDs)
 		cancel()
 		p.logger.Debug("pool: prewarm done", "token", i+1, "agents", len(agentIDs))
@@ -1323,7 +1337,8 @@ func (p *Pool) maintainLoop(ctx context.Context) {
 // minute-long ticker.
 func (p *Pool) maintainTick(ctx context.Context) {
 	toks := p.toks.Load()
-	if p.cfg.IdleRotationTimeout > 0 && p.idleFor() > p.cfg.IdleRotationTimeout {
+	cfg := p.cfg.Load()
+	if cfg.IdleRotationTimeout > 0 && p.idleFor() > cfg.IdleRotationTimeout {
 		// Past the idle threshold. If this is the first idle pass, FINISH
 		// every run so the token's rotation/refresh activity stops
 		// upstream; sessions are left untouched. Later passes skip the
@@ -1332,6 +1347,12 @@ func (p *Pool) maintainTick(ctx context.Context) {
 			return
 		}
 		for _, tok := range *toks {
+			// Skip tokens with outstanding leases: FINISHing this run
+			// would kill an in-flight chat; leave it for rotation once the
+			// lease drains (same rule as the bridge idle sweep).
+			if tok.runs.InflightCount() > 0 {
+				continue
+			}
 			// Thread the maintain ctx: Pool.Shutdown cancels it first, so a
 			// mid-drain FINISH must abort on cancel instead of blocking
 			// shutdown for the full upstream call timeout.
@@ -1347,7 +1368,7 @@ func (p *Pool) maintainTick(ctx context.Context) {
 		if time.Now().Before(tok.runs.CooldownUntil()) {
 			continue
 		}
-		mCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
+		mCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 		tok.runs.Maintain(mCtx)
 		// Advance queued sessions (GET poll) and send heartbeats for active sessions.
 		snap := tok.session.Snapshot()
@@ -1377,6 +1398,7 @@ func (p *Pool) maintainTick(ctx context.Context) {
 // aged runs and advance queued sessions, bounded by the same RequestTimeout
 // ctx as the fixed-token loop.
 func (p *Pool) bridgeMaintain(ctx context.Context) {
+	cfg := p.cfg.Load()
 	var toEvict []*bridgeEntry
 	var toMaintain []*bridgeEntry
 
@@ -1406,7 +1428,7 @@ func (p *Pool) bridgeMaintain(ctx context.Context) {
 		// upstream session, so a dropped idle entry does not leak its
 		// session upstream. Bounded by the same RequestTimeout ctx as the
 		// per-token maintain work so a hung upstream cannot stall the loop.
-		eCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
+		eCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 		entry.runs.FinishAllRuns(eCtx)
 		_ = entry.session.EndSession(eCtx)
 		cancel()
@@ -1417,7 +1439,7 @@ func (p *Pool) bridgeMaintain(ctx context.Context) {
 		if time.Now().Before(entry.runs.CooldownUntil()) {
 			continue
 		}
-		mCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
+		mCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 		entry.runs.Maintain(mCtx)
 		snap := entry.session.Snapshot()
 		switch snap.Status {

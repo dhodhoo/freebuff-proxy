@@ -852,6 +852,7 @@ func (s *Server) syncTokensAfterMutation(tokens []string) error {
 	}
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
+	s.pool.SetConfig(&newCfg)
 	return nil
 }
 
@@ -1014,6 +1015,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		}
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
+		s.pool.SetConfig(&newCfg)
 		s.pool.RemoveAllTokens(r.Context())
 		s.logger.Info("dashboard switched to bridge mode")
 		s.dash.RenderConfigResult(w, r, true, "Switched to bridge mode — AUTH_TOKENS cleared; clients now send their own token.")
@@ -1047,6 +1049,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		}
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
+		s.pool.SetConfig(&newCfg)
 		s.logger.Info("dashboard switched to pooled mode", "auth_tokens", len(newCfg.AuthTokens))
 		s.dash.RenderConfigResult(w, r, true, "Switched to pooled mode — HYBRID_MODE cleared; all requests now use the pool.")
 	case "hybrid":
@@ -1075,6 +1078,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		}
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
+		s.pool.SetConfig(&newCfg)
 		msg := "Switched to hybrid mode — clients with a token relay it; token-less requests use the pool."
 		if len(newCfg.AuthTokens) == 0 {
 			msg += " Warning: no AUTH_TOKENS — token-less requests will fail (502) until a token is added."
@@ -1223,6 +1227,7 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
+	s.pool.SetConfig(&newCfg)
 	s.logger.Info("dashboard config saved and reloaded",
 		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	s.dash.RenderConfigResult(w, r, true, "Saved and reloaded — effective configuration updated.")
@@ -1974,6 +1979,7 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
+	s.pool.SetConfig(&newCfg)
 	s.logger.Info("config reloaded successfully", "auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
