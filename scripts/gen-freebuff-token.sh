@@ -2,10 +2,11 @@
 # gen-freebuff-token.sh - Generate a FreeBuff auth token via headless login flow
 #
 # Usage:
-#   ./gen-freebuff-token.sh              # generate token and print to screen (default: NOT saved)
+#   ./gen-freebuff-token.sh              # interactive: recommends options; Enter = auto-append to ./.env
+#   ./gen-freebuff-token.sh --print      # generate token and print to screen only
 #   ./gen-freebuff-token.sh --clipboard  # copy to clipboard (xclip/pbcopy)
 #   ./gen-freebuff-token.sh --save       # save to ~/.config/manicode/credentials.json
-#   ./gen-freebuff-token.sh --append     # append to .env AUTH_TOKENS
+#   ./gen-freebuff-token.sh --append     # append to .env AUTH_TOKENS (auto-copies .env.example if missing)
 #   ./gen-freebuff-token.sh --env /path/.env  # target .env for --append
 #
 # Each run generates a unique fingerprintId. Log into a DIFFERENT GitHub
@@ -18,7 +19,7 @@ set -euo pipefail
 BASE_URL="${FREEBUFF_BASE_URL:-https://www.codebuff.com}"
 TIMEOUT=300
 POLL_INTERVAL=5
-MODE="print"  # print (default) | save | clipboard | append
+MODE="interactive"  # interactive (default) | print | save | clipboard | append
 ENV_FILE=""
 
 while [ $# -gt 0 ]; do
@@ -49,6 +50,30 @@ c "FreeBuff Token Generator"
 warn "WARNING: Using tokens through a proxy violates FreeBuff ToS."
 warn "Accounts may be suspended or banned. You accept this risk."
 echo ""
+
+# --- 0.5 mode selection (recommend options for easier usage) -----------------
+if [ "$MODE" = "interactive" ]; then
+  if [ ! -t 0 ]; then
+    # Non-interactive (piped/CI): auto-append to the current .env
+    MODE="append"
+  else
+    c "Recommended options:"
+    echo "  [Enter]  Append token to ./.env (auto-copy .env.example if missing)"
+    echo "  1)       Copy token to clipboard"
+    echo "  2)       Save to ~/.config/manicode/credentials.json"
+    echo "  3)       Print token only"
+    printf "Choose [Enter]: "
+    read -r CHOICE
+    case "$CHOICE" in
+      ""|append|a) MODE="append" ;;
+      1|clipboard|c) MODE="clipboard" ;;
+      2|save|s) MODE="save" ;;
+      3|print|p) MODE="print" ;;
+      *) warn "Unknown choice '$CHOICE'; using recommended (append)."; MODE="append" ;;
+    esac
+    echo ""
+  fi
+fi
 
 # --- 1. generate fingerprint + request login URL -----------------------------
 FINGERPRINT_ID="enhanced-$(openssl rand -base64 32 | tr -d '+/=' | head -c 43)"
@@ -173,24 +198,36 @@ case "$MODE" in
     ok "  Copied to clipboard!"
     ;;
   append)
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    TARGET_ENV="${ENV_FILE:-$(dirname "$SCRIPT_DIR")/.env}"
-    if [ -f "$TARGET_ENV" ]; then
-      if grep -q '^AUTH_TOKENS=' "$TARGET_ENV"; then
-        EXISTING=$(grep '^AUTH_TOKENS=' "$TARGET_ENV" | head -1 | cut -d= -f2-)
-        TMP_ENV="$(mktemp)"
-        if [ -n "$EXISTING" ]; then
-          sed "s|^AUTH_TOKENS=.*|AUTH_TOKENS=${EXISTING},${AUTH_TOKEN}|" "$TARGET_ENV" > "$TMP_ENV" && mv "$TMP_ENV" "$TARGET_ENV"
-        else
-          sed "s|^AUTH_TOKENS=.*|AUTH_TOKENS=${AUTH_TOKEN}|" "$TARGET_ENV" > "$TMP_ENV" && mv "$TMP_ENV" "$TARGET_ENV"
-        fi
+    TARGET_ENV="${ENV_FILE:-$PWD/.env}"
+    # Ensure .env exists: copy .env.example if available, else create empty
+    if [ ! -f "$TARGET_ENV" ]; then
+      SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      EXAMPLE=""
+      for cand in "$SCRIPT_DIR/.env.example" "$(dirname "$SCRIPT_DIR")/.env.example" "$PWD/.env.example"; do
+        if [ -f "$cand" ]; then EXAMPLE="$cand"; break; fi
+      done
+      if [ -n "$EXAMPLE" ]; then
+        cp "$EXAMPLE" "$TARGET_ENV"
+        warn "  No .env found; created $TARGET_ENV from $EXAMPLE"
       else
-        echo "AUTH_TOKENS=$AUTH_TOKEN" >> "$TARGET_ENV"
+        touch "$TARGET_ENV"
+        warn "  No .env found; created empty $TARGET_ENV"
+      fi
+    fi
+    if [ -n "$AUTH_TOKEN" ] && grep -qF "$AUTH_TOKEN" "$TARGET_ENV"; then
+      gray "  Token already present in $TARGET_ENV; skipped."
+    elif grep -q '^AUTH_TOKENS=' "$TARGET_ENV"; then
+      EXISTING=$(grep '^AUTH_TOKENS=' "$TARGET_ENV" | head -1 | cut -d= -f2-)
+      TMP_ENV="$(mktemp)"
+      if [ -n "$EXISTING" ]; then
+        sed "s|^AUTH_TOKENS=.*|AUTH_TOKENS=${EXISTING},${AUTH_TOKEN}|" "$TARGET_ENV" > "$TMP_ENV" && mv "$TMP_ENV" "$TARGET_ENV"
+      else
+        sed "s|^AUTH_TOKENS=.*|AUTH_TOKENS=${AUTH_TOKEN}|" "$TARGET_ENV" > "$TMP_ENV" && mv "$TMP_ENV" "$TARGET_ENV"
       fi
       ok "  Appended to: $TARGET_ENV"
     else
-      warn "  .env not found at $TARGET_ENV"
-      echo "  Token: $AUTH_TOKEN"
+      echo "AUTH_TOKENS=$AUTH_TOKEN" >> "$TARGET_ENV"
+      ok "  Appended to: $TARGET_ENV"
     fi
     ;;
 esac

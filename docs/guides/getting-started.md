@@ -64,12 +64,12 @@ Follow the prompts to pick your token or enable bridge mode.
 
 #### How to obtain your FreeBuff token (`authToken`):
 
-Fastest path: run the bundled gen script. It opens a browser OAuth login and prints the token to the terminal without saving it:
+Fastest path: run the bundled gen script. It opens a browser OAuth login; run with no flags for an interactive menu whose recommended default (Enter) appends the token to `.env`, auto-creating it from `.env.example` if missing:
 
-- Linux / macOS: `./scripts/gen-token.sh --clipboard`
-- Windows (PowerShell): `.\scripts\gen-token.ps1 -ToClipboard`
+- Linux / macOS: `./scripts/gen-token.sh`
+- Windows (PowerShell): `.\scripts\gen-token.ps1`
 
-`gen-token.*` is an alias for `gen-freebuff-token.*`, which also supports `--save` (store in the CLI credentials file), `--append` (add to `.env` `AUTH_TOKENS`), and `--env <path>`.
+`gen-token.*` is an alias for `gen-freebuff-token.*`, which also supports explicit modes that skip the menu: `--clipboard`, `--save` (store in the CLI credentials file), `--append` (add to `.env` `AUTH_TOKENS`), and `--env <path>`.
 
 Alternatively, log in with the official CLI: `npm i -g freebuff` and run `freebuff`. The CLI saves your `authToken` in `~/.config/manicode/credentials.json` (Windows: `C:\Users\<you>\.config\manicode\credentials.json`).
 

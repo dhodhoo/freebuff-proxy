@@ -157,21 +157,21 @@ docker compose up -d --build
 
 ### 2. Obtain an Auth Token
 
-Generate one headlessly (opens a browser OAuth login, prints the token to the terminal without saving):
+Generate one headlessly (opens a browser OAuth login). Run with no flags for an interactive menu — the recommended default (Enter) appends the token to `.env`, auto-creating it from `.env.example` if missing:
 
 **Windows (PowerShell):**
 
 ```powershell
-.\scripts\gen-token.ps1 -ToClipboard
+.\scripts\gen-token.ps1            # menu; Enter = append to .env (auto-create)
 ```
 
 **Linux / macOS (bash):**
 
 ```bash
-./scripts/gen-token.sh --clipboard
+./scripts/gen-token.sh             # menu; Enter = append to .env (auto-create)
 ```
 
-`gen-token.*` are aliases for `gen-freebuff-token.*`, which also supports `--save` (store in the CLI credentials file), `--append` (add to `.env` `AUTH_TOKENS`), and `--env <path>`.
+`gen-token.*` are aliases for `gen-freebuff-token.*`, which also supports explicit modes that skip the menu: `--clipboard`, `--save` (store in the CLI credentials file), `--append` (add to `.env` `AUTH_TOKENS`), and `--env <path>`.
 
 Alternatively, log in with the official CLI (`npm i -g freebuff && freebuff`): the proxy auto-discovers the token from its credentials file on startup.
 

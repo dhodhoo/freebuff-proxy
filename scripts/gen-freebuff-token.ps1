@@ -1,10 +1,10 @@
 # gen-freebuff-token.ps1 - Generate a FreeBuff auth token via headless login flow
 #
 # Usage:
-#   .\gen-freebuff-token.ps1                  # generate token and print to screen (default: NOT saved)
+#   .\gen-freebuff-token.ps1                  # interactive: recommends options; Enter = auto-append to .\.env
 #   .\gen-freebuff-token.ps1 -ToClipboard     # generate token and copy to clipboard
 #   .\gen-freebuff-token.ps1 -Save            # save to ~/.config/manicode/credentials.json
-#   .\gen-freebuff-token.ps1 -Append          # append to .env AUTH_TOKENS (comma-separated)
+#   .\gen-freebuff-token.ps1 -Append          # append to .env AUTH_TOKENS (auto-copies .env.example if missing)
 #   .\gen-freebuff-token.ps1 -EnvFile D:\.env # target .env file for -Append
 # Flow:
 #   1. POST /api/auth/cli/code  → gets loginUrl + fingerprintHash
@@ -47,12 +47,58 @@ function Get-CredentialsPath {
     return Join-Path (Get-ConfigDir) "credentials.json"
 }
 
+function Ensure-EnvFile {
+    param([string]$Path)
+    if (Test-Path $Path) { return }
+    $scriptDir = $PSScriptRoot
+    $candidates = @(
+        (Join-Path $scriptDir ".env.example"),
+        (Join-Path (Split-Path -Parent $scriptDir) ".env.example"),
+        (Join-Path (Get-Location) ".env.example")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            Copy-Item $candidate $Path
+            Write-Host "  No .env found; created $Path from $candidate" -ForegroundColor Yellow
+            return
+        }
+    }
+    New-Item -ItemType File -Path $Path -Force | Out-Null
+    Write-Host "  No .env found; created empty $Path" -ForegroundColor Yellow
+}
+
 # --- 0. warning --------------------------------------------------------------
 Write-Host ""
 Write-Host "FreeBuff Token Generator" -ForegroundColor Cyan
 Write-Host "WARNING: Using tokens through a proxy violates FreeBuff ToS." -ForegroundColor Yellow
 Write-Host "Accounts may be suspended or banned. You accept this risk." -ForegroundColor Yellow
 Write-Host ""
+
+# --- 0.5 recommend options for easier usage ----------------------------------
+if (-not $Save -and -not $ToClipboard -and -not $Append) {
+    if ([Console]::IsInputRedirected) {
+        # Non-interactive (piped/CI): auto-append to the current .env
+        $Append = $true
+    } else {
+        Write-Host "Recommended options:" -ForegroundColor Cyan
+        Write-Host "  [Enter]  Append token to .\.env (auto-copy .env.example if missing)" -ForegroundColor Green
+        Write-Host "  1)       Copy token to clipboard" -ForegroundColor Gray
+        Write-Host "  2)       Save to ~/.config/manicode/credentials.json" -ForegroundColor Gray
+        Write-Host "  3)       Print token only" -ForegroundColor Gray
+        $choice = Read-Host "Choose [Enter]"
+        switch ($choice.Trim().ToLower()) {
+            { $_ -in "", "append", "a" } { $Append = $true }
+            { $_ -in "1", "clipboard", "c" } { $ToClipboard = $true }
+            { $_ -in "2", "save", "s" } { $Save = $true }
+            { $_ -in "3", "print", "p" } { }
+            default {
+                Write-Host "Unknown choice '$choice'; using recommended (append)." -ForegroundColor Yellow
+                $Append = $true
+            }
+        }
+        Write-Host ""
+    }
+}
 
 # --- 1. generate fingerprint + request login URL -----------------------------
 $fingerprintId = Generate-FingerprintId
@@ -166,27 +212,27 @@ if ($ToClipboard) {
 }
 
 if ($Append) {
-    $targetEnv = if ($EnvFile) { $EnvFile } else {
-        Join-Path (Split-Path $PSScriptRoot) ".env"
+    $targetEnv = if ($EnvFile) { $EnvFile } else { Join-Path (Get-Location) ".env" }
+    if (-not (Test-Path $targetEnv)) {
+        Ensure-EnvFile -Path $targetEnv
     }
-    if (Test-Path $targetEnv) {
-        $content = Get-Content $targetEnv -Raw
-        if ($content -match '(?m)^AUTH_TOKENS=(.*)$') {
-            $existing = $Matches[1].Trim()
-            if ($existing -and $existing -ne "") {
-                $newValue = "$existing,$authToken"
-            } else {
-                $newValue = $authToken
-            }
-            $content = $content -replace '(?m)^AUTH_TOKENS=.*$', "AUTH_TOKENS=$newValue"
+    $content = [System.IO.File]::ReadAllText($targetEnv, [System.Text.Encoding]::UTF8)
+    if ($authToken -and $content -like "*$authToken*") {
+        Write-Host "  Token already present in $targetEnv; skipped." -ForegroundColor DarkGray
+    } elseif ($content -match '(?m)^AUTH_TOKENS=(.*)$') {
+        $existing = $Matches[1].Trim()
+        if ($existing -and $existing -ne "") {
+            $newValue = "$existing,$authToken"
         } else {
-            $content += "`nAUTH_TOKENS=$authToken`n"
+            $newValue = $authToken
         }
+        $content = $content -replace '(?m)^AUTH_TOKENS=.*$', "AUTH_TOKENS=$newValue"
         [System.IO.File]::WriteAllText($targetEnv, $content, (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "  Appended to: $targetEnv" -ForegroundColor Green
     } else {
-        Write-Host "  .env not found at $targetEnv (create it first)" -ForegroundColor Yellow
-        Write-Host "  Token: $authToken" -ForegroundColor White
+        $content += "`nAUTH_TOKENS=$authToken`n"
+        [System.IO.File]::WriteAllText($targetEnv, $content, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "  Appended to: $targetEnv" -ForegroundColor Green
     }
 }
 

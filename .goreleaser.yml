@@ -29,6 +29,9 @@ archives:
     files:
       - LICENSE
       - .env.example
+      - scripts/gen-freebuff-token.sh
+      - scripts/gen-freebuff-token.ps1
+      - scripts/README.md
 checksum:
   name_template: "checksums.txt"
 
