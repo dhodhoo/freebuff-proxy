@@ -1096,7 +1096,7 @@ func TestNormalizeRequestNonMapToolsEndTurn(t *testing.T) {
 			"tools": []any{map[string]any{
 				"type": "function",
 				"function": map[string]any{
-					"name": "end_turn",
+					"name":       "end_turn",
 					"parameters": map[string]any{"type": "object"},
 				},
 			}},

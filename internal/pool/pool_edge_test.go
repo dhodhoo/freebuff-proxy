@@ -828,7 +828,7 @@ func TestAcquireHotSessionModelTiebreak(t *testing.T) {
 		t.Fatalf("modelB lease token = %d, want 1", lease.Token)
 	}
 	p.LeaseRelease(lease)
-	p.UnlockToken(0)
+	_ = p.UnlockToken(0)
 
 	// Both tokens are hot; the modelB request must prefer token 2 (its
 	// session already serves modelB) over token 1.

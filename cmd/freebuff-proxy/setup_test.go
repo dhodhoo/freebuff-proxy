@@ -665,7 +665,10 @@ func TestMergeAiderConfigDuplicateKey(t *testing.T) {
 // case-insensitively, anything else (n, empty, garbage, EOF) declines, and
 // autoYes returns true WITHOUT reading stdin at all.
 func TestPromptYesNo(t *testing.T) {
-	cases := []struct{ name, input string; want bool }{
+	cases := []struct {
+		name, input string
+		want        bool
+	}{
 		{"y", "y\n", true},
 		{"Y uppercase", "Y\n", true},
 		{"yes", "yes\n", true},

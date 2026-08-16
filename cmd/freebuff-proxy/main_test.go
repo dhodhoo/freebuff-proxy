@@ -260,9 +260,9 @@ func TestVersionFlagPrintsVersion(t *testing.T) {
 // first flag then runs), at most one set prints nothing.
 func TestModeFlagsExclusiveWarning(t *testing.T) {
 	cases := []struct {
-		name                   string
+		name                             string
 		doctor, update, setup, testToken bool
-		want                   string
+		want                             string
 	}{
 		{"none", false, false, false, false, ""},
 		{"single", false, false, true, false, ""},

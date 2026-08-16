@@ -2712,7 +2712,7 @@ func (s *socks5TestServer) serve() {
 }
 
 func (s *socks5TestServer) handle(c net.Conn) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	br := bufio.NewReader(c)
 
 	hdr := make([]byte, 2)
@@ -2806,7 +2806,7 @@ func (s *socks5TestServer) handle(c net.Conn) {
 		_, _ = c.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	defer up.Close()
+	defer func() { _ = up.Close() }()
 	if _, err := c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}
@@ -3089,7 +3089,7 @@ func TestChatRetriesRealDialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	bodies := make(chan []byte, 2)
 	sse := testutil.SSEEvent(`{"id":"c0","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`) +
@@ -3241,7 +3241,7 @@ func TestConnectTunnelStealthRealSockets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	proxyAddr := ln.Addr().String()
 	authSeen := make(chan string, 1)
 	go func() {
@@ -3251,7 +3251,7 @@ func TestConnectTunnelStealthRealSockets(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				br := bufio.NewReader(c)
 				req, err := http.ReadRequest(br)
 				if err != nil {
@@ -3262,7 +3262,7 @@ func TestConnectTunnelStealthRealSockets(t *testing.T) {
 				if err != nil {
 					return
 				}
-				defer up.Close()
+				defer func() { _ = up.Close() }()
 				_, _ = io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n")
 				done := make(chan struct{}, 1)
 				go func() {

@@ -210,7 +210,7 @@ func (s *socks5TestServer) serve() {
 }
 
 func (s *socks5TestServer) handle(c net.Conn) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	br := bufio.NewReader(c)
 
 	hdr := make([]byte, 2)
@@ -305,7 +305,7 @@ func (s *socks5TestServer) handle(c net.Conn) {
 		_, _ = c.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0}) // connection refused
 		return
 	}
-	defer up.Close()
+	defer func() { _ = up.Close() }()
 	if _, err := c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}
@@ -470,7 +470,7 @@ func TestRunLoop(t *testing.T) {
 		var probes atomic.Int64
 		dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
 			probes.Add(1)
-			return DirectDialer(5 * time.Second)(ctx, network, addr)
+			return DirectDialer(5*time.Second)(ctx, network, addr)
 		}
 		cache := NewCache()
 		ctx, cancel := context.WithCancel(context.Background())
@@ -658,7 +658,7 @@ func TestProbeBodyAndCancelEdges(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer ln.Close()
+		defer func() { _ = ln.Close() }()
 		accepted := make(chan struct{})
 		go func() {
 			c, err := ln.Accept()

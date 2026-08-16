@@ -13,8 +13,8 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"reflect"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -298,7 +298,7 @@ func TestDialerSafariCustomSpec(t *testing.T) {
 			if err != nil {
 				t.Fatalf("handshake with custom spec failed: %v", err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 		})
 	}
 }
@@ -319,7 +319,7 @@ func TestDialerDoesNotMutateSharedSpec(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handshake through shared Safari18 spec failed: %v", err)
 		}
-		conn.Close()
+		_ = conn.Close()
 	}
 
 	if !specEqualIgnoringFuncs(specBefore, cloneSpec(ProfileSafari18.CustomSpec)) {
@@ -345,7 +345,7 @@ func valueEqualIgnoringFuncs(a, b reflect.Value) bool {
 		return true
 	case reflect.Interface:
 		return valueEqualIgnoringFuncs(a.Elem(), b.Elem())
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if a.IsNil() || b.IsNil() {
 			return a.IsNil() == b.IsNil()
 		}

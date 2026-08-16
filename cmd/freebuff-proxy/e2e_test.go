@@ -388,7 +388,7 @@ func TestE2EServeAndDrain(t *testing.T) {
 	iStart := strings.Index(stderrText, `msg="freebuff-proxy starting"`)
 	iShut := strings.Index(stderrText, `msg="shutting down"`)
 	iDone := strings.Index(stderrText, `msg="shutdown complete"`)
-	if iStart < 0 || iShut < 0 || iDone < 0 || !(iStart < iShut && iShut < iDone) {
+	if iStart < 0 || iShut < 0 || iDone < 0 || iStart >= iShut || iShut >= iDone {
 		t.Errorf("stderr missing or misordered lifecycle logs (start=%d shut=%d done=%d); stderr:\n%s", iStart, iShut, iDone, stderrText)
 	}
 	// Startup summary carries counts, never token values.
@@ -861,7 +861,7 @@ func TestE2EUpdateFakeRelease(t *testing.T) {
 			diag.WriteString("bat:\n" + string(bat) + "\n")
 		}
 		if exe, err := os.ReadFile(bin); err == nil {
-			diag.WriteString(fmt.Sprintf("exe(%d): %q\nnewBinary(%d): %q\n", len(exe), exe, len(newBinary), newBinary))
+			fmt.Fprintf(&diag, "exe(%d): %q\nnewBinary(%d): %q\n", len(exe), exe, len(newBinary), newBinary)
 		}
 		t.Fatalf("updated binary swap did not complete within 30s; dir contents:\n%s", diag.String())
 	}

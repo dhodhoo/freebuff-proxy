@@ -567,13 +567,13 @@ func TestIsUpToDate(t *testing.T) {
 		version, tag string
 		want         bool
 	}{
-		{"dev", "v9.9.9", false},        // dev builds are never up to date
-		{"dev", "dev", false},           // ... even against a "dev" tag
-		{"9.9.9", "v9.9.9", true},       // tag carries the v prefix
-		{"9.9.9", "9.9.9", true},        // exact match without prefix
-		{"9.9.8", "v9.9.9", false},      // older version
-		{"10.0.0", "v9.9.9", false},     // newer-but-different is not a match (no semver)
-		{"9.9.9", "v9.9.10", false},     // prefix mismatch must not match
+		{"dev", "v9.9.9", false},    // dev builds are never up to date
+		{"dev", "dev", false},       // ... even against a "dev" tag
+		{"9.9.9", "v9.9.9", true},   // tag carries the v prefix
+		{"9.9.9", "9.9.9", true},    // exact match without prefix
+		{"9.9.8", "v9.9.9", false},  // older version
+		{"10.0.0", "v9.9.9", false}, // newer-but-different is not a match (no semver)
+		{"9.9.9", "v9.9.10", false}, // prefix mismatch must not match
 	}
 	for _, tt := range tests {
 		if got := isUpToDate(tt.version, tt.tag); got != tt.want {
@@ -616,10 +616,10 @@ func TestVerifyChecksumFilenameBinding(t *testing.T) {
 	goodHash := hex.EncodeToString(sum[:])
 
 	tests := []struct {
-		name         string
-		checksums    string
+		name          string
+		checksums     string
 		assetFilename string
-		wantErr      bool
+		wantErr       bool
 	}{
 		{
 			name:          "hash and filename match",

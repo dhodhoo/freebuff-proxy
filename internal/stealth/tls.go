@@ -136,7 +136,7 @@ func cloneSpec(spec *utls.ClientHelloSpec) *utls.ClientHelloSpec {
 
 func cloneExtension(ext utls.TLSExtension) utls.TLSExtension {
 	v := reflect.ValueOf(ext)
-	if v.Kind() != reflect.Ptr || v.IsNil() {
+	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return ext
 	}
 	dst := reflect.New(v.Elem().Type())
@@ -149,7 +149,7 @@ func cloneExtension(ext utls.TLSExtension) utls.TLSExtension {
 // shared between the clone and the original.
 func deepCopyValue(dst, src reflect.Value) {
 	switch src.Kind() {
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if src.IsNil() {
 			return
 		}
