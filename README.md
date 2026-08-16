@@ -256,6 +256,12 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `SESSION_PERSIST` | `false` | Persist session state to disk so a restart resumes an unexpired session instead of burning a new daily slot |
 | `SESSION_STATE_FILE` | `.freebuff-session-state.json` | Path of the session state file (used when `SESSION_PERSIST=true`; token-keyed, `0600`) |
 
+When `SESSION_PERSIST=true`, the state file stores a SHA-256 hash of each
+active token plus its session metadata (instance id, expiry, tier/country) —
+including bridge-mode client tokens, since every session manager shares the
+one store. The raw token is never written, and the file is created with mode
+`0600`. Leave `SESSION_PERSIST` unset (or `false`) to opt out entirely.
+
 ### Safe Mode & Zero-Spam Quota Handling
 
 `SAFE_MODE=true` is the **default** for all setups (set `SAFE_MODE=false` to

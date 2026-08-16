@@ -140,8 +140,34 @@ func main() {
 	// bridge entries), so a restart resumes unexpired sessions.
 	var store *session.Store
 	if cfg.SessionPersist {
-		store = session.NewStore(cfg.SessionStateFile)
-		logger.Info("session state persistence enabled", "file", cfg.SessionStateFile)
+		// Log the absolute state-file path: a relative SESSION_STATE_FILE is
+		// resolved against the working directory, which is where the file
+		// actually appears on disk.
+		stateFile := cfg.SessionStateFile
+		if abs, err := filepath.Abs(stateFile); err == nil {
+			stateFile = abs
+		}
+		store = session.NewStore(stateFile)
+		logger.Info("session state persistence enabled", "file", stateFile)
+
+		// Same cwd-vs-exe trap as .env: on Windows launchers (Task
+		// Scheduler, shortcuts, services) the working directory is often not
+		// the executable's directory, so warn when a state file next to the
+		// executable is silently ignored for the same reason.
+		if !filepath.IsAbs(cfg.SessionStateFile) {
+			if cwd, err := os.Getwd(); err == nil {
+				exe, exeErr := os.Executable()
+				if exeErr == nil {
+					exeDir := filepath.Dir(exe)
+					if filepath.Clean(cwd) != exeDir {
+						if _, statErr := os.Stat(filepath.Join(exeDir, cfg.SessionStateFile)); statErr == nil {
+							logger.Warn("found session state file next to the executable, but SESSION_STATE_FILE is read from the working directory — that file is NOT used",
+								"cwd", cwd, "exe_dir", exeDir, "state_file", stateFile)
+						}
+					}
+				}
+			}
+		}
 	}
 	clients := make([]*upstream.Client, 0, len(cfg.AuthTokens))
 	sessions := make([]*session.Manager, 0, len(cfg.AuthTokens))
