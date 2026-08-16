@@ -5,10 +5,10 @@
 #   1. Open PowerShell (Windows Terminal / pwsh or powershell.exe)
 #   2. Run:
 #        irm https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/install-freebuff-proxy.ps1 | iex
-#   3. Read what it prints. It checks the tools you need (installing Node.js
-#      via winget if you want the freebuff CLI path), downloads the binary,
-#      creates .env from the example, and either pulls your token from the
-#      freebuff CLI login or asks you to paste it.
+#   3. Read what it prints. It reuses existing FreeBuff CLI credentials when
+#      found, otherwise opens a headless-browser OAuth login (zero extra
+#      dependencies), downloads the binary, creates .env from the example,
+#      and either stores the token or leaves AUTH_TOKENS empty for bridge mode.
 #
 # What it does NOT do: modify system paths, install services, or touch your
 # token except writing it into the local .env (gitignored).
@@ -73,9 +73,10 @@ if (-not $Dir) { $Dir = (Get-Location).Path }
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
 # --- 2. TOKEN PREREQUISITE (before downloading the proxy) --------------------
-# If no authToken exists, make sure the official CLI is installed, then launch
-# it so the user can log in. This fails early instead of installing a proxy that
-# can only return "Invalid API key" later.
+# Reuse existing CLI credentials when present; otherwise offer headless-browser
+# OAuth login, paste an existing token, or bridge mode (empty AUTH_TOKENS).
+# This fails early instead of installing a proxy that can only return
+# "Invalid API key" later.
 $token = $null
 $creds = Find-CredentialsFile
 if ($creds) { $token = Get-AuthToken $creds }
@@ -116,7 +117,8 @@ function Get-HeadlessToken {
   while (((Get-Date) - $start).TotalSeconds -lt 300) {
     Start-Sleep -Seconds 4
     try {
-      $statusUri = "https://www.codebuff.com/api/auth/cli/status?fingerprintId=$fingerprintId&fingerprintHash=$fingerprintHash&expiresAt=$expiresAt"
+      $query = "fingerprintId=$([Uri]::EscapeDataString($fingerprintId))&fingerprintHash=$([Uri]::EscapeDataString($fingerprintHash))&expiresAt=$([Uri]::EscapeDataString($expiresAt))"
+      $statusUri = "https://www.codebuff.com/api/auth/cli/status?$query"
       $statusResp = Invoke-RestMethod -Uri $statusUri -Method GET
       if ($statusResp.user -and $statusResp.user.authToken) {
         Write-Host "Authentication successful! Token acquired." -ForegroundColor Green

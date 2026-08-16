@@ -4,7 +4,7 @@ This guide shows how to connect `freebuff-proxy` to **9router** as a custom Open
 
 ```
 9router (localhost:20128)
-   │  /v1/chat/completions (Bearer api_key, model "freebuff/deepseek-v4-flash")
+   │  /v1/chat/completions (Bearer api_key, model "freebuff/deepseek/deepseek-v4-flash")
    ▼
 freebuff-proxy (localhost:3457)
    │  CLI session envelope & stealth headers
@@ -56,6 +56,9 @@ After creating the `freebuff` node, open it and click **Add API Key**:
 > **Connection Strategy with Multiple Keys (Bridge Mode)**:
 > If you add multiple FreeBuff accounts in 9router, set connection strategy to **Fallback / Priority (Fill the first)** — **NEVER Round-Robin**.
 > Round-robin drains all accounts simultaneously and triggers anti-farm ban detection. Fallback uses one account until its daily quota (`429`) is exhausted, then smoothly fails over to the next key.
+
+> [!NOTE]
+> **Keep the account count behind one public IP modest**: upstream caps distinct active users per egress IP (`ip_capped` → HTTP `429` admission). Accounts created from the same signup network (≥8 per /24) or sharing a mailbox (≥3) are permanently capped at a lower trust tier, so spread keys across different networks / egress IPs rather than stacking them on one connection. See the [Getting Started Guide](getting-started.md#important-safety-warning) for the full evidence-backed ban-avoidance rules.
 
 ---
 

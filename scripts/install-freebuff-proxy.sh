@@ -10,9 +10,9 @@
 #
 # Order of operations (fail fast on the token BEFORE downloading anything):
 #   1. pick the install method
-#   2. TOKEN PREREQUISITE: make sure the official freebuff CLI is installed
-#      (npm install -g freebuff) and logged in (run: freebuff), then read
-#      authToken from its credentials file. Paste-a-login-URL is the fallback.
+#   2. TOKEN PREREQUISITE: reuse the CLI credentials file if you already have
+#      one; otherwise 1-click browser login (headless OAuth), manual paste, or
+#      bridge mode - zero extra dependencies.
 #   3. install the proxy (release binary, or clone + docker compose)
 #   4. write .env - always, for every option: copied from .env.example (fetched
 #      from GitHub if the archive did not ship one), then filled with your token,
@@ -26,7 +26,8 @@
 #   --env-file=<path>             write .env to <path>
 #   --method=binary|docker|bridge skip the menu
 #   --no-prompt                   safe defaults, never read the terminal
-#   --no-cli-install              never install or wait for the freebuff CLI
+#   --no-cli-install              legacy no-op kept for compatibility; the
+#                                 installer never installs or waits for a CLI
 #   -h|--help                     this header
 #
 # What it does NOT do: modify system paths, install services, or touch your
@@ -191,9 +192,9 @@ if [ -z "$DIR" ]; then DIR="$(pwd)"; fi
 mkdir -p "$DIR"
 
 # --- 3. TOKEN PREREQUISITE (before installing anything) -----------------------
-# The proxy is useless without a FreeBuff token, and the supported way to mint
-# one is the official CLI. So: detect it, offer to install it, make sure it is
-# logged in, and read the token - all before we download the proxy.
+# The proxy is useless without a FreeBuff token. Order: reuse an existing
+# credentials.json if present, else 1-click headless browser OAuth, else manual
+# paste, else bridge mode - all before we download the proxy.
 CREDS_PATHS="$HOME/.config/manicode/credentials.json $HOME/.config/codebuff/credentials.json"
 [ -n "${USERPROFILE:-}" ] && CREDS_PATHS="$CREDS_PATHS $USERPROFILE/.config/manicode/credentials.json"
 
@@ -204,17 +205,7 @@ creds_file() {
 
 read_token() {
   local creds="$1" t=""
-  if command -v node >/dev/null 2>&1; then
-    t="$(node -e '
-      const fs = require("fs");
-      try {
-        const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        const acct = data.default || Object.values(data)[0];
-        if (acct && acct.authToken) process.stdout.write(acct.authToken);
-      } catch (e) {}
-    ' "$creds" 2>/dev/null || true)"
-  fi
-  if [ -z "$t" ] && command -v python3 >/dev/null 2>&1; then
+  if command -v python3 >/dev/null 2>&1; then
     t="$(python3 -c '
 import json, sys
 try:
@@ -239,7 +230,23 @@ token_from_creds() {
   return 0
 }
 
+# urlencode <str> - minimal percent-encoding for query-string values (no deps).
+urlencode() {
+  printf '%s' "$1" | sed \
+    -e 's/%/%25/g' \
+    -e 's/ /%20/g' \
+    -e 's/&/%26/g' \
+    -e 's/+/%2B/g' \
+    -e 's/=/%3D/g' \
+    -e 's/#/%23/g' \
+    -e 's/:/%3A/g' \
+    -e 's/,/%2C/g' \
+    -e 's|/|%2F|g' \
+    -e 's/?/%3F/g'
+}
+
 obtain_headless_token() {
+  [ "$NO_PROMPT" = "1" ] && { warn "Non-interactive mode: skipping browser login; AUTH_TOKENS stays empty."; return 1; }
   c "Requesting login URL for browser authentication..."
   local fp="enhanced-$(openssl rand -base64 32 2>/dev/null | tr -d '+/=' | head -c 43 || head -c 43 /dev/urandom | tr -dc 'a-zA-Z0-9')"
   local code_resp
@@ -255,6 +262,12 @@ obtain_headless_token() {
     warn "Could not obtain login URL from upstream server."
     return 1
   fi
+
+  # percent-encode the poll params (expiresAt is ISO-8601, may carry ':'/'+')
+  local enc_fp enc_hash enc_exp
+  enc_fp="$(urlencode "$fp")"
+  enc_hash="$(urlencode "$fp_hash")"
+  enc_exp="$(urlencode "$expires_at")"
 
   echo ""
   ok "Opening browser for FreeBuff GitHub login..."
@@ -278,7 +291,7 @@ obtain_headless_token() {
       return 1
     fi
     sleep 4
-    status_resp=$(curl -sS "https://www.codebuff.com/api/auth/cli/status?fingerprintId=$fp&fingerprintHash=$fp_hash&expiresAt=$expires_at" 2>/dev/null || true)
+    status_resp=$(curl -sS "https://www.codebuff.com/api/auth/cli/status?fingerprintId=$enc_fp&fingerprintHash=$enc_hash&expiresAt=$enc_exp" 2>/dev/null || true)
     tok=$(echo "$status_resp" | sed -n 's/.*"authToken": *"\([^"]*\)".*/\1/p')
     if [ -n "$tok" ] && [ "${#tok}" -gt 12 ]; then
       TOKEN_VALUE="$tok"
