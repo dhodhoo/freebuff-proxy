@@ -104,6 +104,7 @@ graph TD
 | **Model** | A catalog entry addressed as `provider/model` (e.g. `deepseek/deepseek-v4-flash`). The registry serves `/v1/models` and maps each model to the upstream agent that runs it. |
 | **Pooled mode** | You configure several tokens in `AUTH_TOKENS`. Requests stick to the token with a live session and fail over only when it is rate-limited or errors: a reactive drain, not aggressive rotation. Best for one user with several accounts who wants maximum uptime and quota headroom. |
 | **Bridge mode** | You configure no tokens. Each client sends its own token as `Authorization: Bearer <token>`, and the proxy relays with it, caching per-client state (LRU, max 32). Best for a shared router (e.g. 9router) serving many users who each bring their own account. |
+| **Hybrid mode** | You configure `HYBRID_MODE=true` with tokens in `AUTH_TOKENS`. Clients that send a `Bearer` token get bridge-style per-client relay; token-less requests are served from the pool. Best when some clients bring their own account while your own tooling uses the pool. |
 | **Safe mode** | Default-on anti-ban presets: TLS stealth, proxy-header sanitization, request jitter, and idle rotation. See [Safe Mode](#safe-mode--zero-spam-quota-handling). |
 | **Quota lock** | When a token hits its daily limit, the proxy parses the upstream `429` reset timestamp and refuses local requests for that token until reset, fast (`<1ms`), silent, and spam-free. |
 
@@ -209,6 +210,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `LISTEN_ADDR` | `127.0.0.1:3457` | Host and port to bind (loopback; containers set `:3457`) |
 | `UPSTREAM_BASE_URL` | `https://codebuff.com` | Upstream API endpoint (normalized to `www.codebuff.com`) |
 | `AUTH_TOKENS` | `""` | Comma-separated upstream tokens (empty = bridge mode) |
+| `HYBRID_MODE` | `false` | Run the pooled pool and bridge relay in one process: a client `Authorization: Bearer` token is relayed like bridge, token-less requests fall back to `AUTH_TOKENS` (pooled requests still require an `API_KEYS` match when `API_KEYS` is set) |
 | `AUTO_DISCOVER_TOKEN` | `true` | When `AUTH_TOKENS` is empty, read credentials from the official CLI login files (`false` disables) |
 | `API_KEYS` | `""` | Comma-separated client keys required for `/v1/*` (empty = open; ignored in bridge mode) |
 | `ADMIN_TOKEN` | `""` | Bearer token that `POST /admin/reload` requires when set (empty = unauthenticated in default deployments; a startup warning is logged). Also the login password for the [admin dashboard](#admin-dashboard): the same value unlocks the login page |
@@ -221,7 +223,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `HTTP_PROXY` | `""` | Outbound HTTP proxy for upstream requests |
 | `SOCKS5_PROXY` | `""` | Outbound SOCKS5 proxy for upstream requests |
 | `SOCKS5_PROXIES` | `""` | Per-token SOCKS5 proxies (comma-separated) |
-| `PROXY_ROTATION` | `per-token` | SOCKS5 binding mode: only `per-token` (bind by token index) is implemented; `round-robin`/`random` are accepted but currently inert |
+| `PROXY_ROTATION` | `per-token` | SOCKS5 binding mode: `per-token` (bind by token index), `round-robin`, or `random` per request |
 | `DEBUG_DUMP` | `false` | Persist redacted traffic dumps to `./dump/` (mode 0600) |
 | `LOG_FILE` | `""` | Append log lines to a file (e.g. `./logs/proxy.log`) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
@@ -282,7 +284,7 @@ opt out). It enables essential anti-ban protections and presets:
 | `POST /admin/config` | session cookie | Validate and persist the `.env` file, then hot-reload the config (rolls back on rejection) |
 | `POST /admin/smoke` | session cookie (loopback when `ADMIN_TOKEN` unset) | One real chat through the pool: reports model, token, latency, and a content preview (bridge mode needs a client token in the payload) |
 | `POST /admin/diag` | session cookie (loopback when `ADMIN_TOKEN` unset) | Dashboard diagnostics (same checks as `-doctor`): config state, DNS + TCP reachability, registry count, per-token validity probes |
-| `POST /admin/mode` | session cookie (loopback when `ADMIN_TOKEN` unset) | Runtime pooled↔bridge switch; `{"mode":"bridge"}` empties the pool and clears `AUTH_TOKENS` in `.env` |
+| `POST /admin/mode` | session cookie (loopback when `ADMIN_TOKEN` unset) | Runtime pooled↔bridge↔hybrid switch; `{"mode":"bridge"}` empties the pool and clears `AUTH_TOKENS` in `.env`, `{"mode":"hybrid"}` enables per-client relay alongside the pool |
 | `POST /admin/tokens/...` | session cookie (loopback when `ADMIN_TOKEN` unset) | Runtime pool management: `/add`, `/remove` (last token), `/test-all`, and per-token `/test`, `/unlock`, `/finish`, persisted to `.env` |
 
 ## Admin Dashboard

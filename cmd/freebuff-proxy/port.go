@@ -111,11 +111,15 @@ func unixPortPID(port string) string {
 		}
 		return ""
 	}
-	// busybox netstat -ltnp prints PIDs in the last field of LISTEN lines.
+	// busybox netstat -ltnp output:
+	//   tcp  0  0 0.0.0.0:3457 0.0.0.0:*  LISTEN  1234/program
+	// State is field 5; the last field is "PID/program" — strip the name.
 	for _, line := range strings.Split(execFirstOutput("netstat", "-ltnp"), "\n") {
 		f := strings.Fields(line)
-		if len(f) >= 7 && strings.Contains(f[0], "LISTEN") && strings.HasSuffix(f[3], ":"+port) {
-			return f[len(f)-1]
+		if len(f) >= 7 && strings.HasPrefix(f[0], "tcp") && strings.Contains(f[5], "LISTEN") && strings.HasSuffix(f[3], ":"+port) {
+			if pid, _, ok := strings.Cut(f[len(f)-1], "/"); ok && pid != "" {
+				return pid
+			}
 		}
 	}
 	return ""

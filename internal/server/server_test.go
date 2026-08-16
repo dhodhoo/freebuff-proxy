@@ -1323,6 +1323,69 @@ func TestHybridModeNoTokensRequiresPooledFallback(t *testing.T) {
 	}
 }
 
+// TestHybridModeXAPIKeyStaysPooled verifies hybrid routing never relays an
+// x-api-key upstream: x-api-key is the API_KEYS scheme for pooled clients,
+// and a Bearer token is the only bridge discriminator. A pooled client using
+// x-api-key must hit the pool (and fail API_KEYS auth when the key is not
+// configured) instead of having its key sent to the upstream service.
+func TestHybridModeXAPIKeyStaysPooled(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-h3", 3, `"choices":[{"index":0,"delta":{"content":"pooled"},"finish_reason":null}]`))
+	// API_KEYS configured: pooled requests must authenticate with them.
+	ts, _ := newTestServerCfg(t, []string{"sk-pooled"}, func(c *config.Config) {
+		c.HybridMode = true
+		c.UpstreamBaseURL = mock.URL()
+	}, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	// x-api-key with the configured pool key -> pooled path, 200.
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"x-api-key": "sk-pooled"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("x-api-key pooled status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	// x-api-key without a valid pool key -> 401 (API_KEYS gate), and the
+	// key must never reach the upstream as a bridge relay.
+	resp, data = doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"x-api-key": "sk-any"})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("x-api-key invalid status = %d, want 401: %s", resp.StatusCode, data)
+	}
+	// Bearer still relays as bridge.
+	resp, data = doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer client-hybrid-3"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bearer status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if len(mock.RecordedChatHeaders) != 2 {
+		t.Fatalf("upstream chat calls = %d, want 2 (pooled + bearer bridge)", len(mock.RecordedChatHeaders))
+	}
+	if got := mock.RecordedChatHeaders[0].Get("Authorization"); got != "Bearer tok-0" {
+		t.Errorf("x-api-key pooled upstream Authorization = %q, want %q", got, "Bearer tok-0")
+	}
+	for i, h := range mock.RecordedChatHeaders {
+		if v := h.Get("x-api-key"); v == "sk-pooled" || v == "sk-any" {
+			t.Errorf("upstream call %d carried an operator x-api-key %q upstream", i, v)
+		}
+	}
+}
+
+// TestUpstreamRetryableMapsTo503 verifies a Retryable UpstreamError
+// (deployment_outside_hours) surfaces as 503 upstream_retryable so clients
+// back off and retry later, not a hard 502.
+func TestUpstreamRetryableMapsTo503(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatStatus = http.StatusServiceUnavailable
+	mock.ChatErrorBody = `{"error":"deployment_outside_hours"}`
+	ts, _ := newTestServer(t, nil, mock)
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "upstream_retryable") {
+		t.Errorf("body = %s, want upstream_retryable code", data)
+	}
+}
+
 // TestBridgeModeHealthzReportsMode pins the healthz "mode" field in pure
 // bridge mode.
 func TestBridgeModeHealthzReportsMode(t *testing.T) {

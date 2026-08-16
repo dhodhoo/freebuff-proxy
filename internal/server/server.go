@@ -223,13 +223,18 @@ func remoteHost(r *http.Request) string {
 // are configured the handler passes through untouched; /healthz is always
 // exempt (the caller wires it without requireAuth). Bridge mode (no
 // AUTH_TOKENS) also passes through: the Authorization header IS the upstream
-// token there, and API_KEYS is meaningless. Hybrid mode passes through for
-// the same reason: a client-supplied token is relayed like bridge, while
-// token-less requests fall back to the pool.
+// token there, and API_KEYS is meaningless. Hybrid mode passes a Bearer
+// token through (bridge relay: the client's own FreeBuff credential), but
+// token-less requests fall back to the pool and must still pass the
+// API_KEYS gate — an x-api-key is the API_KEYS scheme, never a bridge token.
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfg.Load()
-		if len(cfg.APIKeys) == 0 || cfg.BridgeMode() || cfg.HybridMode {
+		if len(cfg.APIKeys) == 0 || cfg.BridgeMode() {
+			next(w, r)
+			return
+		}
+		if cfg.HybridMode && bearerToken(r) != "" {
 			next(w, r)
 			return
 		}
@@ -1166,6 +1171,18 @@ func clientToken(r *http.Request) string {
 	return strings.TrimSpace(provided)
 }
 
+// bearerToken returns only the Authorization: Bearer token. In hybrid mode
+// this is the discriminator between bridge traffic (client relays its own
+// FreeBuff token) and pooled traffic (no bearer; x-api-key is the API_KEYS
+// scheme and must never be relayed upstream as a FreeBuff credential).
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+}
+
 // --- chat ---
 
 // handleChat is the OpenAI chat-completions entry point: sanitize the
@@ -1237,14 +1254,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var up io.ReadCloser
 	var lease *pool.Lease
 	cfg := s.cfg.Load()
-	tok := clientToken(r)
+	// In hybrid, only an Authorization: Bearer token selects the bridge
+	// path — an x-api-key is the API_KEYS scheme for pooled clients and
+	// must never be relayed upstream as a FreeBuff credential.
+	tok := bearerToken(r)
 	bridge := false
 	switch {
 	case cfg.BridgeMode() && !cfg.HybridMode:
 		// Pure bridge: the client token is the only upstream credential.
 		bridge = true
+		tok = clientToken(r)
 	case cfg.HybridMode:
-		// Hybrid: a present client token is relayed like bridge.
+		// Hybrid: a Bearer token is relayed like bridge; token-less
+		// requests fall back to the pool.
 		bridge = tok != ""
 	}
 	if bridge {
@@ -1264,6 +1286,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			func(l *pool.Lease) { s.pool.CooldownBridge(l, runs.DefaultCooldown) },
 			s.pool.CooldownBridgeBan,
 			s.pool.CooldownBridgeRateLimit,
+			s.pool.CooldownBridgeCountryBlocked,
 		)
 	} else {
 		up, lease, err = s.chatAttempt(ctx, model, normalized,
@@ -1274,6 +1297,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			func(l *pool.Lease) { s.pool.CooldownToken(l.Token, runs.DefaultCooldown) },
 			func(l *pool.Lease, be *upstream.BanError) { s.pool.CooldownTokenBan(l.Token, be) },
 			func(l *pool.Lease, rle *upstream.RateLimitError) { s.pool.CooldownTokenRateLimit(l.Token, rle) },
+			func(l *pool.Lease, cbe *upstream.CountryBlockedError) {
+				s.pool.CooldownTokenCountryBlocked(l.Token, cbe)
+			},
 		)
 	}
 	if err != nil {
@@ -1378,6 +1404,7 @@ func (s *Server) chatAttempt(
 	cooldownAuth func(*pool.Lease),
 	cooldownBan func(*pool.Lease, *upstream.BanError),
 	cooldownRate func(*pool.Lease, *upstream.RateLimitError),
+	cooldownCountry func(*pool.Lease, *upstream.CountryBlockedError),
 ) (io.ReadCloser, *pool.Lease, error) {
 	lease, err := acquire(ctx, model)
 	if err != nil {
@@ -1436,6 +1463,16 @@ func (s *Server) chatAttempt(
 			var rle *upstream.RateLimitError
 			if errors.As(err, &rle) {
 				cooldownRate(lease, rle)
+			}
+			release()
+			return nil, nil, err
+		case errors.Is(err, upstream.ErrCountryBlocked):
+			// A chat-path country block cools the token like the admission
+			// path does: without it the cached session stays "active" and
+			// every request re-hits upstream run-start inside the window.
+			var cbe *upstream.CountryBlockedError
+			if errors.As(err, &cbe) {
+				cooldownCountry(lease, cbe)
 			}
 			release()
 			return nil, nil, err
@@ -1918,15 +1955,22 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message, retryAfter = uwr.Error(), uwr.RetryAfter
 	case errors.As(err, &ue):
-		status = ue.Status
-		if status != http.StatusPaymentRequired && status != http.StatusConflict && status != http.StatusTooManyRequests {
-			status = http.StatusBadGateway
+		if ue.Retryable {
+			// deployment_outside_hours etc.: temporarily unavailable, worth
+			// a later retry — 503 lets clients/9router back off instead of
+			// treating it as a hard failure.
+			status, code = http.StatusServiceUnavailable, "upstream_retryable"
+		} else {
+			status = ue.Status
+			if status != http.StatusPaymentRequired && status != http.StatusConflict && status != http.StatusTooManyRequests {
+				status = http.StatusBadGateway
+			}
 		}
 		message = ue.Body
 		if message == "" {
 			message = "upstream error"
 		}
-		code, retryAfter = "", ue.RetryAfter
+		retryAfter = ue.RetryAfter
 	case errors.Is(err, registry.ErrModelNotFound):
 		status, code = http.StatusBadRequest, "model_not_found"
 		message = err.Error() + "; available: " + strings.Join(s.reg.Models(), ", ")

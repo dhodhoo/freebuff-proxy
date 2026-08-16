@@ -1293,6 +1293,12 @@ func classifyError(status int, body string, hdr http.Header) error {
 	switch {
 	case status == http.StatusForbidden && (strings.Contains(lower, `"status":"banned"`) || strings.Contains(lower, "banned")):
 		return parseBan(body)
+	case strings.Contains(lower, "deployment_outside_hours"):
+		// Free tier is outside its operating hours: temporarily unavailable
+		// but worth a later retry. Checked before the status-driven 503/429
+		// cases because upstream can attach it to any status (reference:
+		// freebuff-reverse adapter.go classifies it Retryable by body first).
+		return &UpstreamError{Status: status, Body: truncate(body, 500), RetryAfter: retryAfter, Retryable: true}
 	case status == http.StatusUnauthorized:
 		return fmt.Errorf("%w: %d %s", ErrAuthRejected, status, truncate(body, 200))
 	case status == http.StatusServiceUnavailable:
@@ -1310,10 +1316,6 @@ func classifyError(status int, body string, hdr http.Header) error {
 		return fmt.Errorf("%w: %s", ErrRunInvalid, truncate(body, 200))
 	case status == http.StatusTooManyRequests || containsAny(lower, "rate_limited", "ip_capped", "spend_limited"):
 		return parseRateLimit(body, parseRetryAfter(hdr))
-	case strings.Contains(lower, "deployment_outside_hours"):
-		// Free tier is outside its operating hours: temporarily unavailable
-		// but worth a later retry, unlike the default hard failure.
-		return &UpstreamError{Status: status, Body: truncate(body, 500), RetryAfter: retryAfter, Retryable: true}
 	default:
 		return &UpstreamError{Status: status, Body: truncate(body, 500), RetryAfter: retryAfter}
 	}
