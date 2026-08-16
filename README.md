@@ -36,15 +36,23 @@ Your coding tools expect an OpenAI-style endpoint (`/v1/chat/completions`). The 
 
 ---
 
-## New here? Start here
+## New here? Start here (30-Second Quick Start)
 
-Freebuff-proxy makes the free AI models behind the FreeBuff/Codebuff CLI available to any OpenAI-compatible tool (OpenCode, pi, 9router, LiteLLM). If you are new, this is the whole flow:
+Freebuff-proxy makes the free AI models behind the FreeBuff/Codebuff CLI available to any OpenAI-compatible tool (Cursor, VS Code Continue/Cline, OpenCode, pi, 9router, Chatbox, LibreChat).
 
-1. **Get a FreeBuff account + token (`cb_...`).** You need a Codebuff/FreeBuff account; the token is what the proxy uses upstream. See [Obtain an Auth Token](#2-obtain-an-auth-token).
-2. **Install the proxy.** One command, no Go or Docker required. See [Quick Start](#quick-start).
-3. **Choose your mode.** One user with your own account(s) → **pooled** (`AUTH_TOKENS=cb_...`); a router serving many users → **bridge** (leave `AUTH_TOKENS=` empty). See [Key Concepts](#key-concepts).
-4. **Run and verify.** From the extracted folder, one command starts everything — creates `.env`, offers to generate a token if missing, then runs the proxy: `./start-proxy.sh` (Windows: `.\start-proxy.cmd`). Or run the binary directly: `./freebuff-proxy`, then `curl http://127.0.0.1:3457/healthz`.
-5. **Connect your AI tool.** Point OpenCode, pi, 9router, or LiteLLM at `http://127.0.0.1:3457/v1`, model `deepseek/deepseek-v4-flash`. See [Client Integration](docs/guides/client-integration.md).
+If you are a beginner, you don't need to write code or compile anything:
+
+1. **Download the pre-built Release**: Go to [**Releases**](https://github.com/trefeon/freebuff-proxy/releases) and download the ZIP for your OS (e.g. `freebuff-proxy_..._windows_amd64.zip`). *(Do not use the green "Code -> Download ZIP" button, which is raw source code)*.
+2. **Extract & Double-Click**: Unzip the folder.
+   - **Windows**: Double-click `start-proxy.cmd`.
+   - **Linux / macOS**: Open terminal in the extracted folder and run `./start-proxy.sh`.
+3. **Log in**: When prompted, press Enter to open your browser and sign in with your FreeBuff/GitHub account. Your token is saved automatically!
+4. **Open Web Dashboard**: Open [**http://localhost:3457/admin**](http://localhost:3457/admin) in your browser to view your live status, test chat, and manage tokens visually.
+5. **Connect your tool**: In Cursor, VS Code Continue/Cline, Chatbox, or OpenCode, set:
+   - **Base URL**: `http://localhost:3457/v1`
+   - **API Key**: `not-needed`
+   - **Model**: `deepseek/deepseek-v4-flash`
+   *(See [Client Integration Guide](docs/guides/client-integration.md) for 1-click config snippets)*.
 
 **Before you start — the rules (what you should / shouldn't do):**
 
