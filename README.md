@@ -38,11 +38,27 @@ Your coding tools expect an OpenAI-style endpoint (`/v1/chat/completions`). The 
 
 ## New here? Start here
 
-Freebuff-proxy makes the free AI models behind the FreeBuff/Codebuff CLI available to any OpenAI-compatible tool (OpenCode, pi, 9router, LiteLLM). If you are new:
+Freebuff-proxy makes the free AI models behind the FreeBuff/Codebuff CLI available to any OpenAI-compatible tool (OpenCode, pi, 9router, LiteLLM). If you are new, this is the whole flow:
 
-1. **Get a FreeBuff account + token.** You need a Codebuff/FreeBuff account; the token (`cb_...`) is what the proxy uses upstream. Get one with the official CLI or `scripts/gen-token.*`. See [Obtain an Auth Token](#2-obtain-an-auth-token).
+1. **Get a FreeBuff account + token (`cb_...`).** You need a Codebuff/FreeBuff account; the token is what the proxy uses upstream. See [Obtain an Auth Token](#2-obtain-an-auth-token).
 2. **Install the proxy.** One command, no Go or Docker required. See [Quick Start](#quick-start).
-3. **Connect your AI tool.** Point OpenCode, pi, 9router, or LiteLLM at `http://127.0.0.1:3457/v1`. See [Client Integration](docs/guides/client-integration.md).
+3. **Choose your mode.** One user with your own account(s) → **pooled** (`AUTH_TOKENS=cb_...`); a router serving many users → **bridge** (leave `AUTH_TOKENS=` empty). See [Key Concepts](#key-concepts).
+4. **Run and verify.** `./freebuff-proxy`, then `curl http://127.0.0.1:3457/healthz`.
+5. **Connect your AI tool.** Point OpenCode, pi, 9router, or LiteLLM at `http://127.0.0.1:3457/v1`, model `deepseek/deepseek-v4-flash`. See [Client Integration](docs/guides/client-integration.md).
+
+**Before you start — the rules (what you should / shouldn't do):**
+
+| ✅ Do | ❌ Don't |
+|---|---|
+| Use **one key until it is rate-limited** — the pool drains it naturally | **Don't rotate many healthy keys** — looks like account farming |
+| Use a **normal residential connection** | **Don't use a VPN / proxy / Tor** — hard-block signal: limited tier or `country_blocked` |
+| Register with a **real email** (e.g. Gmail) | **Don't use temp-mail** — documented ban cohort (6,699 of 7,129 accounts already banned) |
+| Request **only models your tier/region offers** (default Flash) | **Don't request out-of-region models** — refused/downgraded and correlated with your IP's geo |
+| Read a `429` as **quota, resets Pacific midnight** | **Don't confuse it with a ban** — only `403` `banned`/`country_blocked` is terminal |
+| Expect **reduced** risk, not immunity | **Don't run unattended 24/7** or expect zero ban risk |
+| Keep the pool **draining one key at a time** | **Don't hammer many tokens from one public IP** (`ip_capped`) |
+
+Full detail in [Key Hygiene & Ban Avoidance](#key-hygiene--ban-avoidance).
 
 For a guided walkthrough, read [Getting Started](docs/guides/getting-started.md) (5 minutes).
 

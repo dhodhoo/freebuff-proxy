@@ -17,17 +17,32 @@ This guide takes you from zero to a working OpenAI-compatible proxy connected to
 
 ---
 
+## What you'll do (the flow)
+
+Using freebuff-proxy is five steps, most of them one command:
+
+1. **Get a FreeBuff account + token (`cb_...`)** — the official CLI or `scripts/gen-token.*` does this for you.
+2. **Install the proxy** — one command (below).
+3. **Choose your mode** — one user with your own account(s) → **pooled** (`AUTH_TOKENS=cb_...`); a router serving many users → **bridge** (leave `AUTH_TOKENS=` empty).
+4. **Run and verify** — `./freebuff-proxy`, then `curl http://127.0.0.1:3457/healthz`.
+5. **Connect your AI tool** — point it at `http://127.0.0.1:3457/v1`, model `deepseek/deepseek-v4-flash`.
+
+---
+
 ## Important Safety Warning
 
 Using this proxy conflicts with Codebuff's terms of service. Upstream abuse detection scans for automation patterns and suspends accounts. Detection is documented in the open-source FreeBuff client: per-request IP scoring, per-account trust levels with sticky caps, daily spend ceilings, and mass sweeps against known farm shapes. The rules below are the evidence-backed dos and don'ts:
-- **Keep `SAFE_MODE=true`** (it is the default, set explicitly in `.env.example`). It enables anti-ban stealth (TLS fingerprint, header sanitization, request jitter, idle rotation).
-- Do **not** run 24/7 on heavy unattended automated tasks.
-- **Do not route through a VPN.** VPN / proxy / Tor / hosting egress is a hard-block signal: it demotes the account to the limited tier or a terminal `country_blocked`, and restricted cohorts get a $0.50/day spend ceiling (≈1 session/day). Stealth masks TLS fingerprints and headers, not your public IP — use a normal residential connection.
-- **Only request models your account's tier and region offers.** Out-of-tier picks are refused or silently downgraded to `deepseek/deepseek-v4-flash`, and the requested model id is correlated with your egress IP's region.
-- Keep one modest account; do not create spam clusters of accounts. Upstream caps distinct active sessions per egress IP (`ip_capped`), and accounts from the same signup network (≥8 per /24) or mailbox (≥3) are permanently capped at lower trust levels.
-- **Use one key until it is rate-limited.** The proxy prefers the token with a live session and only switches when it is exhausted. Don't rotate several healthy keys aggressively (farming signals).
-- **For 24h of coding, budget 4–5 keys**, each registered with a **real email address** (e.g. Gmail). Temp-mail registrations are a documented ban cohort: 6,699 of 7,129 accounts on flagged domains were already banned.
-- **429 ≠ ban.** `429` is quota/waiting room (resets at Pacific midnight) — the proxy locks the token locally and answers in `<1ms`. Only `403` with `banned` / `country_blocked` means the account is gone; use a new established account.
+
+| ✅ Do | ❌ Don't |
+|---|---|
+| **Keep `SAFE_MODE=true`** (default; anti-ban stealth: TLS fingerprint, header sanitization, request jitter, idle rotation) | **Don't** run 24/7 on heavy unattended automated tasks |
+| Use a **normal residential connection** | **Don't use a VPN / proxy / Tor** — hard-block signal: limited tier or terminal `country_blocked`, restricted cohorts get a $0.50/day spend ceiling (≈1 session/day) |
+| Request **only models your tier/region offers** | **Don't request out-of-region models** — refused or silently downgraded to `deepseek/deepseek-v4-flash`, and the model id is correlated with your egress IP's region |
+| Keep **one modest account** | **Don't create spam clusters** — upstream caps distinct active sessions per egress IP (`ip_capped`); accounts from the same signup network (≥8 per /24) or mailbox (≥3) are permanently capped at lower trust levels |
+| **Use one key until it is rate-limited** | **Don't rotate several healthy keys aggressively** (farming signal) |
+| Register with a **real email address** (e.g. Gmail) | **Don't use temp-mail** — documented ban cohort: 6,699 of 7,129 accounts on flagged domains already banned |
+| Read a `429` as **quota, resets Pacific midnight** (proxy locks the token locally, answers in `<1ms`) | **Don't confuse it with a ban** — only `403` `banned`/`country_blocked` means the account is gone; use a new established account |
+| Budget **4–5 keys for 24h of coding** | **Don't** expect more than one key ≈ one day of moderate use |
 
 ---
 
