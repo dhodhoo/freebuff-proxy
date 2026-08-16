@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1369,8 +1370,8 @@ func TestTransientRetriesNotCountedWhenRetryCannotFire(t *testing.T) {
 			releaseCancel(cancel)
 			t.Fatal("want error (no retry possible for nil GetBody)")
 		}
-		if rt.calls != 1 {
-			t.Errorf("upstream attempts = %d, want 1 (no retry for nil GetBody)", rt.calls)
+		if rt.calls.Load() != 1 {
+			t.Errorf("upstream attempts = %d, want 1 (no retry for nil GetBody)", rt.calls.Load())
 		}
 		if got := client.TransientRetries(); got != 0 {
 			t.Errorf("TransientRetries = %d, want 0", got)
@@ -1630,7 +1631,7 @@ func TestSessionCallStructured4xx(t *testing.T) {
 // rotation.
 type flakyRT struct {
 	failN       int
-	calls       int
+	calls       atomic.Int32
 	err         error
 	body        []byte
 	seen        [][]byte
@@ -1639,12 +1640,12 @@ type flakyRT struct {
 }
 
 func (f *flakyRT) RoundTrip(req *http.Request) (*http.Response, error) {
-	f.calls++
+	f.calls.Add(1)
 	b, _ := io.ReadAll(req.Body)
 	_ = req.Body.Close()
 	f.seen = append(f.seen, b)
 	f.seenHeaders = append(f.seenHeaders, req.Header.Clone())
-	if f.calls <= f.failN {
+	if int(f.calls.Load()) <= f.failN {
 		return nil, f.err
 	}
 	return &http.Response{
@@ -1733,8 +1734,8 @@ func TestChatCompletionsRetriesTransientFailure(t *testing.T) {
 	_, _ = io.ReadAll(rc)
 	_ = rc.Close()
 
-	if rt.calls != 2 {
-		t.Errorf("upstream attempts = %d, want 2 (1 failure + 1 retry)", rt.calls)
+	if rt.calls.Load() != 2 {
+		t.Errorf("upstream attempts = %d, want 2 (1 failure + 1 retry)", rt.calls.Load())
 	}
 	if got := client.TransientRetries(); got != 1 {
 		t.Errorf("TransientRetries = %d, want 1", got)
@@ -1762,8 +1763,8 @@ func TestChatCompletionsRetriesTwiceWhenAllowed(t *testing.T) {
 	_, _ = io.ReadAll(rc)
 	_ = rc.Close()
 
-	if rt.calls != 3 {
-		t.Errorf("upstream attempts = %d, want 3 (2 failures + 2 retries)", rt.calls)
+	if rt.calls.Load() != 3 {
+		t.Errorf("upstream attempts = %d, want 3 (2 failures + 2 retries)", rt.calls.Load())
 	}
 	if got := client.TransientRetries(); got != 2 {
 		t.Errorf("TransientRetries = %d, want 2", got)
@@ -1801,8 +1802,8 @@ func TestCreateSessionRetriesConnectionReset(t *testing.T) {
 	if st.Status != "active" || st.InstanceID != "inst-1" {
 		t.Errorf("session = %+v, want active inst-1", st)
 	}
-	if rt.calls != 2 {
-		t.Errorf("upstream attempts = %d, want 2 (1 failure + 1 retry)", rt.calls)
+	if rt.calls.Load() != 2 {
+		t.Errorf("upstream attempts = %d, want 2 (1 failure + 1 retry)", rt.calls.Load())
 	}
 	if got := client.TransientRetries(); got != 1 {
 		t.Errorf("TransientRetries = %d, want 1", got)
@@ -1872,8 +1873,8 @@ func TestTransientRetriesDisabledSingleAttempt(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error when every attempt fails")
 	}
-	if rt.calls != 1 {
-		t.Errorf("upstream attempts = %d, want exactly 1 (TRANSIENT_RETRIES=0)", rt.calls)
+	if rt.calls.Load() != 1 {
+		t.Errorf("upstream attempts = %d, want exactly 1 (TRANSIENT_RETRIES=0)", rt.calls.Load())
 	}
 	if got := client.TransientRetries(); got != 0 {
 		t.Errorf("TransientRetries = %d, want 0", got)
@@ -1905,8 +1906,8 @@ func TestRetryRotatesPinnedFingerprint(t *testing.T) {
 	}
 	// The retried request carried the rotated profile's browser headers:
 	// the first attempt used chrome126, the retry re-applied safari18.
-	if rt.calls != 2 {
-		t.Fatalf("upstream attempts = %d, want 2", rt.calls)
+	if rt.calls.Load() != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", rt.calls.Load())
 	}
 	if got := rt.seenHeaders[0].Get("User-Agent"); got != stealth.ProfileChrome126.UserAgent {
 		t.Errorf("attempt 1 User-Agent = %q, want chrome126", got)
@@ -2113,11 +2114,11 @@ func TestDoBackoffCancelAndDeadline(t *testing.T) {
 		}()
 		// Wait for the first (failed) attempt, then cancel mid-backoff.
 		deadline := time.Now().Add(5 * time.Second)
-		for rt.calls < 1 && time.Now().Before(deadline) {
+		for rt.calls.Load() < 1 && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
 		}
-		if rt.calls != 1 {
-			t.Fatalf("first attempt never ran (calls=%d)", rt.calls)
+		if rt.calls.Load() != 1 {
+			t.Fatalf("first attempt never ran (calls=%d)", rt.calls.Load())
 		}
 		cancel()
 		select {
@@ -2128,8 +2129,8 @@ func TestDoBackoffCancelAndDeadline(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("do() did not return after cancel during backoff")
 		}
-		if rt.calls != 1 {
-			t.Errorf("calls = %d after cancel, want 1 (no retry fired)", rt.calls)
+		if rt.calls.Load() != 1 {
+			t.Errorf("calls = %d after cancel, want 1 (no retry fired)", rt.calls.Load())
 		}
 	})
 
@@ -2166,8 +2167,8 @@ func TestDoBackoffCancelAndDeadline(t *testing.T) {
 		if !strings.Contains(err.Error(), "upstream:") {
 			t.Errorf("err = %v, want an upstream-wrapped error", err)
 		}
-		if rt.calls != 2 {
-			t.Errorf("calls = %d, want 2 (initial + 1 retry)", rt.calls)
+		if rt.calls.Load() != 2 {
+			t.Errorf("calls = %d, want 2 (initial + 1 retry)", rt.calls.Load())
 		}
 		if got := client.TransientRetries(); got != 1 {
 			t.Errorf("TransientRetries = %d, want 1", got)
