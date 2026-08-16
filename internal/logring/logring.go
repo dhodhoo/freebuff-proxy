@@ -122,12 +122,16 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 // dotted (group.subkey=value).
 func flatten(prefix string, a slog.Attr) []string {
 	if a.Value.Kind() == slog.KindGroup {
+		// Recurse with the GROUP's own key as the new prefix so
+		// slog.Group("http", slog.Int("status", 200)) renders
+		// "http.status=200" — the child keys extend the group, they do not
+		// replace it.
+		key := a.Key
+		if prefix != "" {
+			key = prefix + "." + key
+		}
 		var out []string
 		for _, child := range a.Value.Group() {
-			key := child.Key
-			if prefix != "" {
-				key = prefix + "." + key
-			}
 			out = append(out, flatten(key, child)...)
 		}
 		return out

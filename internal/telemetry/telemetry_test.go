@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
 	"net/http"
@@ -242,5 +243,37 @@ func TestColorizeWhenLogFileFailsToOpen(t *testing.T) {
 	})
 	if !strings.Contains(out, "\x1b[32mINFO\x1b[0m") {
 		t.Errorf("stderr lost colors after log file open failure: %q", out)
+	}
+}
+
+// TestAttrValueEscaping verifies that attr values containing newlines, tabs,
+// quotes or other control characters are quoted, so one log record always
+// writes exactly one line. Regression: values were concatenated via
+// a.Value.String() unescaped, so a client-controlled model name or URL path
+// containing "\nlevel=ERROR injected" forged a second log line.
+func TestAttrValueEscaping(t *testing.T) {
+	var buf bytes.Buffer
+	h := &textHandler{w: &buf, level: slog.LevelInfo}
+	logger := slog.New(h)
+	logger.Info("request handled",
+		"model", "codebuff-1\nlevel=ERROR injected",
+		"path", "/v1/chat/completions",
+		"user_agent", "tab\t\"quoted\"\x1b[31mred",
+	)
+
+	out := buf.String()
+	// The injected token must survive only in its strconv.Quote-escaped form
+	// inside the quoted value, never as a raw newline splitting the record.
+	if !strings.Contains(out, `model="codebuff-1\nlevel=ERROR injected"`) {
+		t.Errorf("model attr not escaped via strconv.Quote, got: %q", out)
+	}
+	if n := strings.Count(out, "\n"); n != 1 {
+		t.Errorf("record split across %d lines, want exactly 1: %q", n, out)
+	}
+	if !strings.Contains(out, `user_agent="tab\t\"quoted\"\x1b[31mred"`) {
+		t.Errorf("tab/quote/control chars not escaped, got: %q", out)
+	}
+	if !strings.Contains(out, "path=/v1/chat/completions") {
+		t.Errorf("clean attr value must stay unquoted, got: %q", out)
 	}
 }

@@ -7,11 +7,13 @@
 package upstream
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"context"
 	cryptoRand "crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -67,13 +69,6 @@ var (
 	// quota left to spend.
 	ErrCredits = errors.New("upstream payment required")
 )
-
-// WaitRoom carries queue details for ErrWaitingRoom.
-type WaitRoom struct {
-	Position   int
-	QueueDepth int
-	RetryAfter time.Duration
-}
 
 // WaitingRoomError is the concrete value behind ErrWaitingRoom; callers
 // unwrap it (errors.As) to surface 503 + Retry-After to the client.
@@ -383,11 +378,25 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	var baseDial func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	if len(cfg.SOCKS5Proxies) > 0 {
+	var stealthProf *stealth.Profile
+	if cfg.TLSFingerprint != "" {
+		profile, ok := stealth.Lookup(cfg.TLSFingerprint)
+		if !ok {
+			return nil, fmt.Errorf("upstream: unknown TLS_FINGERPRINT %q", cfg.TLSFingerprint)
+		}
+		stealthProf = profile
+	}
+
+	switch {
+	case len(cfg.SOCKS5Proxies) > 0:
 		// PROXY_ROTATION: the proxy is chosen per request (newRequest stashes
 		// the selected index) and this dialer reads the stash, so round-robin
 		// and random actually rotate the outbound connection. per-token is
 		// the default binding (token tokenIndex → proxy tokenIndex % n).
+		// The DefaultTransport clone inherits http.ProxyFromEnvironment;
+		// disable it so an operator HTTP_PROXY/HTTPS_PROXY env var never
+		// double-routes SOCKS5 traffic through a second proxy.
+		transport.Proxy = nil
 		for _, raw := range cfg.SOCKS5Proxies {
 			addr, err := parseProxyAddr(raw)
 			if err != nil {
@@ -403,8 +412,17 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return c.socksDialers[c.proxyIndexFor(ctx)].Dial(network, addr)
 		}
+		if len(c.socksProxies) > 1 {
+			// Rotation is defeated by connection reuse: Go's transport serves
+			// pooled idle connections (keyed on origin only) without re-invoking
+			// DialContext, so the per-request proxy choice would never be
+			// re-dialed on the typical single-stream workload. Disable
+			// keep-alives so every request dials through its assigned proxy;
+			// the single-proxy path keeps pooled connections.
+			transport.DisableKeepAlives = true
+		}
 		baseDial = transport.DialContext
-	} else if cfg.SOCKS5Proxy != "" {
+	case cfg.SOCKS5Proxy != "":
 		socksAddr, err := parseProxyAddr(cfg.SOCKS5Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("upstream: SOCKS5_PROXY: %w", err)
@@ -413,24 +431,30 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		if err != nil {
 			return nil, fmt.Errorf("upstream: SOCKS5 dialer: %w", err)
 		}
+		transport.Proxy = nil // same env-proxy isolation as SOCKS5_PROXIES
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialer.Dial(network, addr)
 		}
 		baseDial = transport.DialContext
-	} else if cfg.HTTPProxy != "" {
+	case cfg.HTTPProxy != "":
 		proxyURL, err := url.Parse(cfg.HTTPProxy)
 		if err != nil {
 			return nil, fmt.Errorf("upstream: HTTP_PROXY: %w", err)
 		}
-		transport.Proxy = http.ProxyURL(proxyURL)
-	}
-	var stealthProf *stealth.Profile
-	if cfg.TLSFingerprint != "" {
-		profile, ok := stealth.Lookup(cfg.TLSFingerprint)
-		if !ok {
-			return nil, fmt.Errorf("upstream: unknown TLS_FINGERPRINT %q", cfg.TLSFingerprint)
+		if stealthProf != nil {
+			// Go's transport ignores DialTLSContext for proxied HTTPS requests:
+			// it invokes the TLS dialer with the PROXY's address (not the
+			// origin), so transport.Proxy + DialTLSContext would hand the
+			// stealth ClientHello to the plain CONNECT proxy and break the
+			// tunnel. Instead, dial the proxy ourselves with CONNECT and let
+			// the stealth dialer wrap the origin TLS over the tunnel. Plain-HTTP
+			// upstreams in this combination go direct — a TLS fingerprint is
+			// meaningless without TLS, and the default upstream is HTTPS.
+			transport.Proxy = nil
+			baseDial = httpConnectDial(proxyURL)
+		} else {
+			transport.Proxy = http.ProxyURL(proxyURL)
 		}
-		stealthProf = profile
 	}
 
 	if stealthProf != nil {
@@ -440,10 +464,8 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		// and the next dial picks it up. For auto/random, newRequest resolves
 		// a concrete profile and stashes it so the browser headers and the
 		// ClientHello always match; dialProfileFor prefers that stash.
-		// NOTE: for HTTP_PROXY (CONNECT tunnel), Go uses Proxy + DialTLSContext
-		// transparently; the stealth dialer replaces the TLS layer. baseDial is
-		// nil when no SOCKS5 proxy is set; Dialer uses its internal default
-		// net.Dialer in that case.
+		// baseDial is the configured outbound path (SOCKS5 dialer or HTTP
+		// CONNECT tunnel); nil falls back to the default net.Dialer.
 		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return stealth.Dialer(c.dialProfileFor(ctx), baseDial, false)(ctx, network, addr)
 		}
@@ -454,6 +476,15 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
 				return errors.New("too many redirects")
+			}
+			// Go strips Authorization/Cookie on cross-host redirects but not
+			// x-codebuff-api-key, which carries the same raw token. Drop both
+			// when the redirect target is a different host so the token never
+			// leaks to a redirect target; same-host redirects (e.g. CDN or
+			// bare-host -> www) keep their credentials.
+			if !strings.EqualFold(via[0].URL.Host, req.URL.Host) {
+				req.Header.Del("Authorization")
+				req.Header.Del("x-codebuff-api-key")
 			}
 			return nil
 		},
@@ -1554,12 +1585,21 @@ func generateClientID() string {
 	var b [16]byte
 	if _, err := cryptoRand.Read(b[:]); err != nil {
 		// crypto/rand failure is unrecoverable in practice; fall back to a
-		// time-seeded value rather than panicking mid-request.
-		return strconv.FormatInt(time.Now().UnixNano(), 36)[:13]
+		// time-seeded value rather than panicking mid-request. UnixNano in
+		// base36 is only 12 digits today, so pad to the SDK's 13-char length
+		// (the old [:13] slice panicked on short values).
+		return padBase36(strconv.FormatInt(time.Now().UnixNano(), 36))
 	}
 	n := new(big.Int).SetBytes(b[:])
 	mod := new(big.Int).Exp(big.NewInt(36), big.NewInt(13), nil)
-	id := n.Mod(n, mod).Text(36)
+	return padBase36(n.Mod(n, mod).Text(36))
+}
+
+// padBase36 left-pads a base36 string with '0' to the SDK-faithful 13-char
+// client id length. Both the crypto/rand draw and the time-seeded fallback
+// need it: the latter is 12 digits, which would otherwise come out shorter
+// than the JS substring(2, 15) equivalent.
+func padBase36(id string) string {
 	for len(id) < 13 {
 		id = "0" + id
 	}
@@ -1585,6 +1625,68 @@ func parseProxyAddr(raw string) (string, error) {
 	}
 	return u.Host, nil
 }
+
+// httpConnectDial returns a dial function that reaches addr through an HTTP
+// CONNECT proxy: it dials the proxy, issues "CONNECT addr", and returns the
+// tunneled connection. Used when TLS_FINGERPRINT is pinned: Go's transport
+// ignores DialTLSContext for proxied HTTPS requests (it invokes the TLS
+// dialer with the proxy's address), so routing the origin TLS through
+// transport.Proxy would hand the stealth ClientHello to the plain CONNECT
+// proxy instead of the origin.
+func httpConnectDial(proxyURL *url.URL) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		conn, err := d.DialContext(ctx, network, proxyURL.Host)
+		if err != nil {
+			return nil, fmt.Errorf("upstream: dial HTTP proxy %s: %w", proxyURL.Host, err)
+		}
+		req := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Opaque: addr},
+			Host:   addr,
+			Header: make(http.Header),
+		}
+		if proxyURL.User != nil {
+			user := proxyURL.User.Username()
+			pass, _ := proxyURL.User.Password()
+			req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
+		}
+		if err := req.Write(conn); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("upstream: CONNECT %s: %w", addr, err)
+		}
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("upstream: CONNECT %s response: %w", addr, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = conn.Close()
+			return nil, fmt.Errorf("upstream: CONNECT %s: proxy %s", addr, resp.Status)
+		}
+		// Preserve any bytes the response reader buffered past the headers:
+		// the TLS handshake must see them, not lose them.
+		return &bufConn{conn: conn, r: br}, nil
+	}
+}
+
+// bufConn bridges a buffered reader back to the underlying connection so the
+// stealth TLS handshake reads exactly the bytes the CONNECT response reader
+// left buffered (it would otherwise swallow the first TLS records).
+type bufConn struct {
+	conn net.Conn
+	r    *bufio.Reader
+}
+
+func (b *bufConn) Read(p []byte) (int, error)         { return b.r.Read(p) }
+func (b *bufConn) Write(p []byte) (int, error)        { return b.conn.Write(p) }
+func (b *bufConn) Close() error                       { return b.conn.Close() }
+func (b *bufConn) LocalAddr() net.Addr                { return b.conn.LocalAddr() }
+func (b *bufConn) RemoteAddr() net.Addr               { return b.conn.RemoteAddr() }
+func (b *bufConn) SetDeadline(t time.Time) error      { return b.conn.SetDeadline(t) }
+func (b *bufConn) SetReadDeadline(t time.Time) error  { return b.conn.SetReadDeadline(t) }
+func (b *bufConn) SetWriteDeadline(t time.Time) error { return b.conn.SetWriteDeadline(t) }
 
 func drainBody(r io.Reader) string {
 	data, _ := io.ReadAll(io.LimitReader(r, 51200))

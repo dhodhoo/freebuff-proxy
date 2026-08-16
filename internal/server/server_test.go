@@ -1386,6 +1386,33 @@ func TestUpstreamRetryableMapsTo503(t *testing.T) {
 	}
 }
 
+// TestUpstreamRetryableNotBlindRetried verifies chatAttempt does NOT retry a
+// Retryable UpstreamError (deployment_outside_hours): the flag means "worth
+// retrying later", not "transient", so a blind retry must not burn a second
+// lease against the same wall. The mock must see exactly one chat call.
+func TestUpstreamRetryableNotBlindRetried(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var chatCalls atomic.Int32
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		chatCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"message":"deployment_outside_hours","type":"upstream_error","code":"deployment_outside_hours"}}`)
+	}
+	ts, _ := newTestServer(t, nil, mock)
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "upstream_retryable") {
+		t.Errorf("body = %s, want upstream_retryable code", data)
+	}
+	if got := chatCalls.Load(); got != 1 {
+		t.Errorf("upstream chat calls = %d, want 1 (Retryable errors must not be blind-retried)", got)
+	}
+}
+
 // TestBridgeModeHealthzReportsMode pins the healthz "mode" field in pure
 // bridge mode.
 func TestBridgeModeHealthzReportsMode(t *testing.T) {

@@ -77,6 +77,34 @@ func TestRingForwardsToNext(t *testing.T) {
 	}
 }
 
+// TestRingFlattenGroupKeys verifies grouped attrs keep the group key as a
+// dotted prefix: slog.Group("http", slog.Int("status", 200)) must render as
+// "http.status=200", not "status.status=200" (the child key must not replace
+// the group key it extends).
+func TestRingFlattenGroupKeys(t *testing.T) {
+	h := NewHandler(discarding{}, 10)
+	slog.New(h).Info("msg",
+		slog.Group("http", slog.Int("status", 200)),
+		slog.Group("nested", slog.Group("deep", slog.String("k", "v"))),
+	)
+	recent := h.Recent(1)
+	if len(recent) != 1 {
+		t.Fatalf("Recent(1) = %d entries, want 1", len(recent))
+	}
+	found := map[string]bool{}
+	for _, f := range recent[0].Fields {
+		found[f] = true
+	}
+	for _, want := range []string{"http.status=200", "nested.deep.k=v"} {
+		if !found[want] {
+			t.Errorf("fields %v missing %q", recent[0].Fields, want)
+		}
+	}
+	if found["status=200"] {
+		t.Errorf("fields %v contain %q: group key was dropped", recent[0].Fields, "status=200")
+	}
+}
+
 type writerFunc func(p []byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

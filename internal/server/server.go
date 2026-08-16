@@ -106,7 +106,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	mux.HandleFunc("POST /admin/reload", s.requireAdminToken(s.requireAuth(s.handleReload)))
+	mux.HandleFunc("POST /admin/reload", s.requireAdminToken(s.requireAuth(s.adminCSRF(http.HandlerFunc(s.handleReload)))))
 	// Admin dashboard: cookie-authenticated browser UI. Assets are static
 	// and public — the login page (served without a cookie) references them,
 	// so they must NOT sit behind dashboardAuth. Overview/tokens/metrics are
@@ -123,16 +123,16 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /admin/config", s.dashboardAuth(s.adminSensitive(s.dash.Page("config"))))
 	mux.Handle("GET /admin/logs", s.dashboardAuth(s.adminSensitive(s.dash.Page("logs"))))
 	mux.Handle("GET /admin/metrics", s.dashboardAuth(s.dash.Page("metrics")))
-	mux.Handle("POST /admin/config", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleConfigSave))))
-	mux.Handle("POST /admin/tokens/{id}/unlock", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenUnlock))))
-	mux.Handle("POST /admin/tokens/{id}/finish", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenFinish))))
-	mux.Handle("POST /admin/tokens/{id}/test", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenTest))))
-	mux.Handle("POST /admin/tokens/test-all", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenTestAll))))
-	mux.Handle("POST /admin/tokens/add", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenAdd))))
-	mux.Handle("POST /admin/tokens/remove", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleTokenRemove))))
-	mux.Handle("POST /admin/mode", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleModeSwitch))))
-	mux.Handle("POST /admin/diag", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleDiag))))
-	mux.Handle("POST /admin/smoke", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleSmoke))))
+	mux.Handle("POST /admin/config", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleConfigSave)))))
+	mux.Handle("POST /admin/tokens/{id}/unlock", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenUnlock)))))
+	mux.Handle("POST /admin/tokens/{id}/finish", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenFinish)))))
+	mux.Handle("POST /admin/tokens/{id}/test", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenTest)))))
+	mux.Handle("POST /admin/tokens/test-all", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenTestAll)))))
+	mux.Handle("POST /admin/tokens/add", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenAdd)))))
+	mux.Handle("POST /admin/tokens/remove", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleTokenRemove)))))
+	mux.Handle("POST /admin/mode", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleModeSwitch)))))
+	mux.Handle("POST /admin/diag", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleDiag)))))
+	mux.Handle("POST /admin/smoke", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleSmoke)))))
 	mux.Handle("GET /admin/assets/", http.StripPrefix("/admin/assets/", noDirListing(http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -482,6 +482,40 @@ func isLoopback(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// adminCSRF rejects cross-origin mutating admin requests. Browsers send
+// Origin (and/or Sec-Fetch-Site) on every POST; a malicious site's form
+// would carry an Origin that does not match the proxy's own host. Requests
+// with NEITHER header (curl, API clients, legacy tests) pass through, so the
+// admin API stays scriptable while a victim's browser cannot drive the
+// dashboard cross-site. Origin is compared case-insensitively per RFC 6454
+// host matching; Sec-Fetch-Site must be same-origin or none (direct
+// navigation). Wired inside dashboardAuth → adminSensitive so the cookie
+// and loopback gates still run first.
+func (s *Server) adminCSRF(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				u, err := url.Parse(origin)
+				if err != nil || !strings.EqualFold(u.Host, r.Host) {
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					w.WriteHeader(http.StatusForbidden)
+					s.dash.RenderConfigResult(w, r, false, "Cross-origin request rejected.")
+					return
+				}
+			}
+			if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" {
+				if sfs != "same-origin" && sfs != "none" {
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					w.WriteHeader(http.StatusForbidden)
+					s.dash.RenderConfigResult(w, r, false, "Cross-origin request rejected.")
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
 // handleAdminLogin renders the login page and processes the token form:
 // constant-time ADMIN_TOKEN comparison, per-IP rate limiting, and a signed
 // session cookie on success. With ADMIN_TOKEN unset it redirects straight to
@@ -633,16 +667,28 @@ const maxSmokeBytes = 32 << 10
 // preview. Bridge mode requires a client token in the payload.
 func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	var req smokeRequest
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
-	if err != nil {
-		s.dash.RenderConfigResult(w, r, false, "Failed to read request: "+err.Error())
-		return
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		s.dash.RenderConfigResult(w, r, false, "Invalid request JSON: "+err.Error())
-		return
+	// The dashboard form posts urlencoded model=&prompt=&token=; read those
+	// first and only fall back to JSON for programmatic clients (mirrors
+	// handleTokenAdd).
+	var err error
+	req.Model = strings.TrimSpace(r.FormValue("model"))
+	req.Prompt = strings.TrimSpace(r.FormValue("prompt"))
+	req.Token = strings.TrimSpace(r.FormValue("token"))
+	if req.Model == "" && req.Prompt == "" && req.Token == "" {
+		var body []byte
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request: "+err.Error())
+			return
+		}
+		if err = json.Unmarshal(body, &req); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Invalid request JSON: "+err.Error())
+			return
+		}
 	}
 	req.Model = strings.TrimSpace(req.Model)
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	req.Token = strings.TrimSpace(req.Token)
 	if req.Model == "" {
 		models := s.reg.Models()
 		if len(models) == 0 {
@@ -794,6 +840,7 @@ func (s *Server) syncTokensAfterMutation(tokens []string) error {
 		return fmt.Errorf("reload config: %w", err)
 	}
 	s.cfg.Store(&newCfg)
+	s.reg.SetConfig(&newCfg)
 	return nil
 }
 
@@ -853,6 +900,18 @@ func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
 	defer s.adminSaveMu.Unlock()
 
 	cfg := s.cfg.Load()
+	// A config-editor AUTH_TOKENS edit or /admin/reload can diverge
+	// cfg.AuthTokens from the live pool; removing "the last token" from a
+	// stale list would persist the wrong .env and leave pool/.env/cfg
+	// permanently inconsistent.
+	if len(cfg.AuthTokens) != s.pool.TokenCount() {
+		s.dash.RenderConfigResult(w, r, false, "AUTH_TOKENS in .env differs from the live pool — reconcile in the Config editor or restart.")
+		return
+	}
+	removed := ""
+	if len(cfg.AuthTokens) > 0 {
+		removed = cfg.AuthTokens[len(cfg.AuthTokens)-1]
+	}
 	if err := s.pool.RemoveLastToken(); err != nil {
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
@@ -862,6 +921,15 @@ func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
 		tokens = tokens[:len(tokens)-1]
 	}
 	if err := s.syncTokensAfterMutation(tokens); err != nil {
+		// Roll the pool back so a failed persist does not leave the token
+		// removed from the pool but still listed in .env/cfg (mirrors
+		// handleTokenAdd's rollback).
+		if removed != "" {
+			if _, addErr := s.pool.AddToken(removed); addErr != nil {
+				s.logger.Warn("dashboard token remove rollback re-add failed", "err", addErr)
+			}
+		}
+		s.logger.Warn("dashboard token remove rolled back", "err", err)
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
 	}
@@ -934,6 +1002,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cfg.Store(&newCfg)
+		s.reg.SetConfig(&newCfg)
 		s.pool.RemoveAllTokens(r.Context())
 		s.logger.Info("dashboard switched to bridge mode")
 		s.dash.RenderConfigResult(w, r, true, "Switched to bridge mode — AUTH_TOKENS cleared; clients now send their own token.")
@@ -966,6 +1035,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cfg.Store(&newCfg)
+		s.reg.SetConfig(&newCfg)
 		s.logger.Info("dashboard switched to pooled mode", "auth_tokens", len(newCfg.AuthTokens))
 		s.dash.RenderConfigResult(w, r, true, "Switched to pooled mode — HYBRID_MODE cleared; all requests now use the pool.")
 	case "hybrid":
@@ -993,6 +1063,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cfg.Store(&newCfg)
+		s.reg.SetConfig(&newCfg)
 		msg := "Switched to hybrid mode — clients with a token relay it; token-less requests use the pool."
 		if len(newCfg.AuthTokens) == 0 {
 			msg += " Warning: no AUTH_TOKENS — token-less requests will fail (502) until a token is added."
@@ -1014,6 +1085,16 @@ func restoreEnvFile(old []byte, oldErr error) {
 		return
 	}
 	_ = writeFileAtomic(".env", old)
+}
+
+// dialTarget returns the host:port to dial for an upstream base host,
+// defaulting to 443 only when the host carries no explicit port — an
+// UpstreamBaseURL like "https://host:8443" must not become "host:8443:443".
+func dialTarget(host string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	return net.JoinHostPort(host, "443")
 }
 
 // handleDiag runs the dashboard diagnostics: config state, upstream
@@ -1044,11 +1125,12 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 	} else {
 		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "DNS resolves " + targetHost})
 	}
-	if conn, err := net.DialTimeout("tcp", targetHost+":443", 5*time.Second); err != nil {
-		checks = append(checks, dashboard.DiagCheck{Message: "TCP connect to " + targetHost + ":443 failed: " + err.Error()})
+	hostForDial := dialTarget(targetHost)
+	if conn, err := net.DialTimeout("tcp", hostForDial, 5*time.Second); err != nil {
+		checks = append(checks, dashboard.DiagCheck{Message: "TCP connect to " + hostForDial + " failed: " + err.Error()})
 	} else {
 		_ = conn.Close()
-		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "TCP reachable " + targetHost + ":443"})
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "TCP reachable " + hostForDial})
 	}
 
 	checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Model registry: %d models", s.reg.ModelCount())})
@@ -1088,10 +1170,25 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	const envPath = ".env"
 	r.Body = http.MaxBytesReader(w, r.Body, maxEnvSize)
-	content, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.dash.RenderConfigResult(w, r, false, "Failed to read request body.")
-		return
+
+	// The dashboard textarea posts application/x-www-form-urlencoded
+	// (name="content"); a raw urlencoded body written verbatim as .env would
+	// become "content=KEY=VALUE..." and destroy the file. Programmatic
+	// clients (text/plain) post the raw .env text and keep the raw path.
+	var content []byte
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		if err := r.ParseForm(); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request form.")
+			return
+		}
+		content = []byte(r.FormValue("content"))
+	} else {
+		var err error
+		content, err = io.ReadAll(r.Body)
+		if err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to read request body.")
+			return
+		}
 	}
 
 	s.adminSaveMu.Lock()
@@ -1114,6 +1211,7 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Store(&newCfg)
+	s.reg.SetConfig(&newCfg)
 	s.logger.Info("dashboard config saved and reloaded",
 		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	s.dash.RenderConfigResult(w, r, true, "Saved and reloaded — effective configuration updated.")
@@ -1478,6 +1576,14 @@ func (s *Server) chatAttempt(
 			return nil, nil, err
 		default:
 			release()
+			// Retryable UpstreamErrors (e.g. deployment_outside_hours) are
+			// temporarily unavailable, not transient: a blind retry burns a
+			// fresh lease against the same wall. Surface them for writeError
+			// (503 upstream_retryable) instead.
+			var ue *upstream.UpstreamError
+			if errors.As(err, &ue) && ue.Retryable {
+				return nil, nil, err
+			}
 			if attempts > 1 {
 				return nil, nil, err
 			}
@@ -1840,6 +1946,7 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Store(&newCfg)
+	s.reg.SetConfig(&newCfg)
 	s.logger.Info("config reloaded successfully", "auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{

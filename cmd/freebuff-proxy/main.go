@@ -177,6 +177,13 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		// IdleTimeout closes keep-alive connections that have been idle for
+		// two minutes, bounding goroutines parked on dead clients.
+		IdleTimeout: 120 * time.Second,
+		// WriteTimeout is deliberately unset (0): /v1/chat/completions
+		// streams SSE responses that can legitimately outlive any fixed
+		// write budget.
 	}
 
 	// Startup summary -- token values are never logged, only counts.
@@ -254,14 +261,18 @@ func main() {
 	}
 
 	// Graceful drain: stop accepting new requests first, then finish
-	// runs/sessions, bounded by a 10s force deadline.
+	// runs/sessions. HTTP gets a 10s force deadline; the pool then gets its
+	// OWN fresh budget — a slow-draining SSE stream can consume the whole
+	// HTTP budget, and the pool drain must not be starved by it.
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("http server shutdown incomplete", "err", err)
 	}
-	p.Shutdown(shutdownCtx)
+	poolCtx, poolCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer poolCancel()
+	p.Shutdown(poolCtx)
 	logger.Info("shutdown complete")
 	if exitCode != 0 {
 		os.Exit(exitCode)

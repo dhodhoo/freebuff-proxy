@@ -360,6 +360,38 @@ func TestModelAliases(t *testing.T) {
 	}
 }
 
+// TestSetConfigUpdatesAliases verifies a runtime config swap (dashboard
+// save / /admin/reload) is reflected by alias resolution without a restart:
+// the registry must read MODEL_ALIASES through the atomic pointer, not the
+// startup pointer.
+func TestSetConfigUpdatesAliases(t *testing.T) {
+	cfg := &config.Config{
+		ModelAliases: map[string]string{"gpt-4o": "deepseek/deepseek-v4-flash"},
+	}
+	r := New(cfg, nil)
+	r.LoadFallback()
+
+	if got := r.ResolveModel("gpt-4o"); got != "deepseek/deepseek-v4-flash" {
+		t.Fatalf("ResolveModel(gpt-4o) before SetConfig = %q, want deepseek/deepseek-v4-flash", got)
+	}
+
+	r.SetConfig(&config.Config{
+		ModelAliases: map[string]string{"gpt-4o": "z-ai/glm-5.2", "glm": "z-ai/glm-5.2"},
+	})
+	if got := r.ResolveModel("gpt-4o"); got != "z-ai/glm-5.2" {
+		t.Errorf("ResolveModel(gpt-4o) after SetConfig = %q, want z-ai/glm-5.2 (reload must apply)", got)
+	}
+	if got := r.ResolveModel("glm"); got != "z-ai/glm-5.2" {
+		t.Errorf("ResolveModel(glm) after SetConfig = %q, want z-ai/glm-5.2 (new alias must apply)", got)
+	}
+
+	// Clearing the config must fall back to identity resolution.
+	r.SetConfig(nil)
+	if got := r.ResolveModel("gpt-4o"); got != "gpt-4o" {
+		t.Errorf("ResolveModel(gpt-4o) after SetConfig(nil) = %q, want unchanged", got)
+	}
+}
+
 func contains(values []string, needle string) bool {
 	for _, v := range values {
 		if v == needle {

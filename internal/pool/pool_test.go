@@ -1898,3 +1898,242 @@ func TestRuntimeTokenManagement(t *testing.T) {
 		t.Fatalf("TokenCount = %d, want 0 after RemoveAllTokens", p.TokenCount())
 	}
 }
+
+// TestAcquireChatConcurrentTokenMutation is the P1 regression guard for the
+// snapshot double-load race: Acquire used to load p.toks once, then
+// acquireOrder loaded it AGAIN and built indices against the newer
+// (longer) snapshot — an AddToken between the two loads made the failover
+// loop index the stale snapshot past its end and panic with
+// index-out-of-range. The fix passes the single snapshot into acquireOrder
+// (plus a defensive bounds check in the loop), so this hammers Acquire+Chat
+// while a driver goroutine churns AddToken/RemoveLastToken/RemoveAllTokens.
+// The panic window is narrow, so the loop repeats many times; with -race any
+// reintroduced double-load that survives the panics still trips the race
+// detector. Assertion: no panic, and every attempt either succeeds or fails
+// cleanly (never an index-out-of-range).
+func TestAcquireChatConcurrentTokenMutation(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\n")
+	// Session-admission churn: ~2/3 of admits fail (404) in adjacent pairs,
+	// so an Acquire pass walks PAST every failing token to the end of the
+	// order — exactly the path that indexed past the stale snapshot in the
+	// original double-load bug (a success early in the order would return
+	// before the out-of-range index was reached). The sequence is long
+	// enough to cover the whole hammer so the failure mix never exhausts.
+	seq := make([]string, 8000)
+	for i := range seq {
+		if i%3 == 2 {
+			seq[i] = "active"
+		} else {
+			seq[i] = "404"
+		}
+	}
+	mock.SessionSequence = seq
+	// Two fixed tokens to start; the driver churns the list from there.
+	p := newTestPoolCfg(t, func(c *config.Config) {
+		c.UpstreamBaseURL = mock.URL()
+	}, mock, mock)
+
+	ctx := context.Background()
+	body := []byte(`{"model":"z-ai/glm-5.2"}`)
+	const (
+		workers = 8
+		iters   = 250
+		cycles  = 8
+	)
+
+	var (
+		mu       sync.Mutex
+		panics   []string
+		attempts int
+		success  int
+		failure  int
+	)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							mu.Lock()
+							panics = append(panics, fmt.Sprintf("%v", r))
+							mu.Unlock()
+						}
+					}()
+					lease, err := p.Acquire(ctx, modelA)
+					if err != nil {
+						mu.Lock()
+						attempts++
+						failure++
+						mu.Unlock()
+						return
+					}
+					rc, err := p.Chat(ctx, lease, upstream.ChatOptions{Model: modelA}, body)
+					if err == nil {
+						_ = rc.Close()
+					}
+					p.LeaseRelease(lease)
+					mu.Lock()
+					attempts++
+					success++
+					mu.Unlock()
+				}()
+			}
+		}()
+	}
+
+	// Driver: churn the token list while the workers acquire/chat. AddToken
+	// is the dangerous direction (it grows the snapshot acquireOrder builds
+	// indices against); RemoveLastToken is refused while a lease is in
+	// flight (ignored here), RemoveAllTokens empties the list.
+	for i := 0; i < cycles; i++ {
+		if _, err := p.AddToken(fmt.Sprintf("hammer-%d", i)); err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+		_ = p.RemoveLastToken()
+		if _, err := p.AddToken(fmt.Sprintf("hammer-%d", i+100)); err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+		p.RemoveAllTokens(ctx)
+		if _, err := p.AddToken(fmt.Sprintf("hammer-%d", i+200)); err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+	}
+	wg.Wait()
+
+	if len(panics) > 0 {
+		t.Fatalf("panic(s) under concurrent token mutation: %v", panics)
+	}
+	if attempts != success+failure {
+		t.Fatalf("attempts=%d but success=%d failure=%d", attempts, success, failure)
+	}
+	if success == 0 {
+		t.Fatal("no chat succeeded under the hammer; mutation churn starved the workers")
+	}
+}
+
+// TestUsageAccountingConcurrentTokenMutation is the P2 regression guard for
+// the usage-slice indexing race: recordChat/usageCount/usageResetIn index
+// p.msgsPerToken, which RemoveAllTokens (nil) and RemoveLastToken (truncate)
+// mutate concurrently — usageResetIn previously had no bounds check at all
+// and panicked the moment a capped Acquire raced a removal. This hammers the
+// daily-cap path (usageCount + dailyLimitError -> usageResetIn) and feeds
+// usage via recordChat from a seeder goroutine while the driver churns the
+// token list. Assertion: no panic, every Acquire succeeds or fails cleanly,
+// and the cap path actually fired.
+func TestUsageAccountingConcurrentTokenMutation(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPoolCfg(t, func(c *config.Config) {
+		c.UpstreamBaseURL = mock.URL()
+		c.MaxMessagesPerDay = 3
+	}, mock)
+
+	ctx := context.Background()
+	const (
+		workers = 8
+		iters   = 250
+		cycles  = 6
+	)
+
+	// Deterministic mechanism check: with token 0 pre-seeded past the cap,
+	// a single-threaded Acquire MUST surface the daily-cap 429. This pins
+	// the usageCount + dailyLimitError -> usageResetIn path (the functions
+	// that index p.msgsPerToken) without depending on goroutine scheduling;
+	// the concurrent hammer below covers the mutation race.
+	for range 5 {
+		p.recordChat(0)
+	}
+	if _, err := p.Acquire(ctx, modelA); !errors.Is(err, upstream.ErrRateLimited) {
+		t.Fatalf("capped Acquire err = %v, want ErrRateLimited", err)
+	}
+
+	var (
+		mu        sync.Mutex
+		panics    []string
+		attempts  int
+		success   int
+		failure   int
+		capped429 int
+	)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							mu.Lock()
+							panics = append(panics, fmt.Sprintf("%v", r))
+							mu.Unlock()
+						}
+					}()
+					lease, err := p.Acquire(ctx, modelA)
+					if err != nil {
+						mu.Lock()
+						attempts++
+						failure++
+						if errors.Is(err, upstream.ErrRateLimited) {
+							capped429++
+						}
+						mu.Unlock()
+						return
+					}
+					p.LeaseRelease(lease)
+					mu.Lock()
+					attempts++
+					success++
+					mu.Unlock()
+				}()
+			}
+		}()
+	}
+
+	// Seeder: record usage on arbitrary indices (valid and stale) so
+	// recordChat itself runs under the driver's mutations (P2 class).
+	seedDone := make(chan struct{})
+	go func() {
+		defer close(seedDone)
+		for i := range cycles * workers * 20 {
+			p.recordChat(i % 8)
+		}
+	}()
+
+	for i := 0; i < cycles; i++ {
+		idx, err := p.AddToken(fmt.Sprintf("usage-%d", i))
+		if err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+		// Seed the fresh generation past the cap immediately so the pool is
+		// capped for nearly its whole lifetime: a worker Acquire that lands
+		// here hits the daily-cap path instead of a fresh-token success.
+		for range 3 {
+			p.recordChat(idx)
+		}
+		_ = p.RemoveLastToken() // refused while a lease is in flight — fine
+		p.RemoveAllTokens(ctx)
+		idx, err = p.AddToken(fmt.Sprintf("usage-%d", i+100))
+		if err != nil {
+			t.Fatalf("AddToken: %v", err)
+		}
+		for range 3 {
+			p.recordChat(idx)
+		}
+	}
+	wg.Wait()
+	<-seedDone
+
+	if len(panics) > 0 {
+		t.Fatalf("panic(s) under concurrent token mutation: %v", panics)
+	}
+	if attempts != success+failure {
+		t.Fatalf("attempts=%d but success=%d failure=%d", attempts, success, failure)
+	}
+	t.Logf("hammer: attempts=%d success=%d failure=%d capped429=%d", attempts, success, failure, capped429)
+}

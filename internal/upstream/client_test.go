@@ -1,19 +1,24 @@
 package upstream
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -580,12 +585,335 @@ func TestProxyWiring(t *testing.T) {
 	}
 }
 
+// TestSOCKS5RotationDisablesKeepAlives verifies round-robin/random rotation
+// is not defeated by pooled idle connections: with multiple SOCKS5 proxies
+// the transport must redial per request (DisableKeepAlives) so the
+// per-request proxy choice is actually dialed, while the single-proxy path
+// keeps pooled connections.
+func TestSOCKS5RotationDisablesKeepAlives(t *testing.T) {
+	multi, err := New("tok", testConfig("", func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
+		c.ProxyRotation = "round-robin"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !multi.http.Transport.(*http.Transport).DisableKeepAlives {
+		t.Error("multi-proxy rotation must disable keep-alives so every request dials through its assigned proxy")
+	}
+
+	single, err := New("tok", testConfig("", func(c *config.Config) { c.SOCKS5Proxy = "socks5://127.0.0.1:1080" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if single.http.Transport.(*http.Transport).DisableKeepAlives {
+		t.Error("single SOCKS5 proxy must keep pooled keep-alive connections")
+	}
+}
+
+// TestSOCKS5IgnoresEnvProxy verifies the SOCKS5 branches drop the
+// ProxyFromEnvironment inherited from http.DefaultTransport.Clone: an
+// operator HTTP_PROXY/HTTPS_PROXY env var must never double-route SOCKS5
+// traffic through a second proxy.
+func TestSOCKS5IgnoresEnvProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9998")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9998")
+
+	multi, err := New("tok", testConfig("", func(c *config.Config) {
+		c.SOCKS5Proxies = []string{"socks5://127.0.0.1:1001", "socks5://127.0.0.1:1002"}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := multi.http.Transport.(*http.Transport); tr.Proxy != nil {
+		t.Error("SOCKS5_PROXIES transport still routes via ProxyFromEnvironment")
+	}
+
+	single, err := New("tok", testConfig("", func(c *config.Config) { c.SOCKS5Proxy = "socks5://127.0.0.1:1080" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := single.http.Transport.(*http.Transport); tr.Proxy != nil {
+		t.Error("SOCKS5_PROXY transport still routes via ProxyFromEnvironment")
+	}
+}
+
+// TestHTTPProxyStealthUsesConnectTunnel verifies HTTP_PROXY + TLS_FINGERPRINT
+// routes the stealth dialer through an explicit CONNECT tunnel instead of
+// transport.Proxy: Go calls DialTLSContext with the proxy's address for
+// proxied HTTPS (not the origin), so transport.Proxy would hand the stealth
+// ClientHello to the plain CONNECT proxy and break the tunnel.
+func TestHTTPProxyStealthUsesConnectTunnel(t *testing.T) {
+	stealthClient, err := New("tok", testConfig("", func(c *config.Config) {
+		c.HTTPProxy = "http://127.0.0.1:9999"
+		c.TLSFingerprint = "chrome126"
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := stealthClient.http.Transport.(*http.Transport)
+	if tr.Proxy != nil {
+		t.Error("HTTP_PROXY + TLS_FINGERPRINT must not route via transport.Proxy (Go would TLS to the proxy, not the origin)")
+	}
+	if tr.DialTLSContext == nil {
+		t.Error("HTTP_PROXY + TLS_FINGERPRINT must wire the stealth DialTLSContext over the CONNECT tunnel")
+	}
+
+	plainClient, err := New("tok", testConfig("", func(c *config.Config) { c.HTTPProxy = "http://127.0.0.1:9999" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainTr := plainClient.http.Transport.(*http.Transport)
+	if plainTr.Proxy == nil {
+		t.Error("HTTP_PROXY without TLS_FINGERPRINT should keep transport.Proxy routing")
+	}
+	if plainTr.DialTLSContext != nil {
+		t.Error("HTTP_PROXY without TLS_FINGERPRINT must not wire DialTLSContext")
+	}
+}
+
+// TestHTTPConnectDial exercises the CONNECT tunnel against a real proxy
+// listener: the CONNECT request line carries the target, Proxy-Authorization
+// is sent when the proxy URL has credentials, bytes flow both ways through
+// the tunnel, and a non-200 CONNECT response is rejected.
+func TestHTTPConnectDial(t *testing.T) {
+	t.Run("tunnel", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+
+		type proxyObs struct {
+			reqLine string
+			echo    string
+		}
+		obs := make(chan proxyObs, 1)
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			br := bufio.NewReader(conn)
+			reqLine, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+			}
+			_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(br, buf); err != nil {
+				return
+			}
+			_, _ = io.WriteString(conn, "pong")
+			obs <- proxyObs{reqLine: reqLine, echo: string(buf)}
+		}()
+
+		dial := httpConnectDial(&url.URL{Scheme: "http", Host: ln.Addr().String()})
+		conn, err := dial(context.Background(), "tcp", "origin.example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		reply := make([]byte, 4)
+		if _, err := io.ReadFull(conn, reply); err != nil {
+			t.Fatal(err)
+		}
+		if string(reply) != "pong" {
+			t.Errorf("tunnel reply = %q, want pong", reply)
+		}
+		got := <-obs
+		if !strings.Contains(got.reqLine, "CONNECT origin.example:443 HTTP/1.1") {
+			t.Errorf("CONNECT request line = %q, want target origin.example:443", got.reqLine)
+		}
+		if got.echo != "ping" {
+			t.Errorf("tunnel carried %q, want ping", got.echo)
+		}
+	})
+
+	t.Run("proxy auth", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+
+		authCh := make(chan string, 1)
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			br := bufio.NewReader(conn)
+			var auth string
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if strings.HasPrefix(strings.ToLower(line), "proxy-authorization:") {
+					auth = strings.TrimSpace(line[strings.IndexByte(line, ':')+1:])
+				}
+				if line == "\r\n" {
+					break
+				}
+			}
+			_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+			authCh <- auth
+			_, _ = io.Copy(io.Discard, br)
+		}()
+
+		dial := httpConnectDial(&url.URL{Scheme: "http", User: url.UserPassword("alice", "s3cret"), Host: ln.Addr().String()})
+		conn, err := dial(context.Background(), "tcp", "origin.example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret"))
+		if got := <-authCh; !strings.EqualFold(got, want) {
+			t.Errorf("Proxy-Authorization = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("non-200 rejected", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			br := bufio.NewReader(conn)
+			for {
+				line, err := br.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+			}
+			_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+		}()
+
+		dial := httpConnectDial(&url.URL{Scheme: "http", Host: ln.Addr().String()})
+		conn, err := dial(context.Background(), "tcp", "origin.example:443")
+		if err == nil {
+			_ = conn.Close()
+			t.Fatal("CONNECT through a 403 proxy succeeded, want error")
+		}
+		if !strings.Contains(err.Error(), "403") {
+			t.Errorf("error = %q, want proxy 403 status", err)
+		}
+	})
+}
+
+// TestCrossHostRedirectStripsToken verifies a cross-host redirect does not
+// carry x-codebuff-api-key (or Authorization): Go strips the latter itself
+// but not the former, so the raw token used to leak to any redirect target.
+// Same-host redirects keep their credentials (CDN / bare-host -> www).
+func TestCrossHostRedirectStripsToken(t *testing.T) {
+	const token = "tok-secret-redirect"
+
+	keySeen := make(chan string, 1)
+	authSeen := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keySeen <- r.Header.Get("x-codebuff-api-key")
+		authSeen <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/final", http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	client, err := New(token, testConfig(origin.URL, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := client.newRequest(context.Background(), http.MethodGet, "/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.http.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got := <-keySeen; got != "" {
+		t.Errorf("cross-host redirect carried x-codebuff-api-key %q, want stripped", got)
+	}
+	if got := <-authSeen; got != "" {
+		t.Errorf("cross-host redirect carried Authorization %q, want stripped", got)
+	}
+
+	sameKey := make(chan string, 1)
+	same := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/final", http.StatusTemporaryRedirect)
+			return
+		}
+		sameKey <- r.Header.Get("x-codebuff-api-key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer same.Close()
+
+	sameClient, err := New(token, testConfig(same.URL, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameReq, err := sameClient.newRequest(context.Background(), http.MethodGet, "/start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameResp, err := sameClient.http.Do(sameReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = sameResp.Body.Close()
+	if got := <-sameKey; got != token {
+		t.Errorf("same-host redirect carried x-codebuff-api-key %q, want %q kept", got, token)
+	}
+}
+
 func TestClientIDFormat(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		id := generateClientID()
 		if !regexp.MustCompile(`^[0-9a-z]{13}$`).MatchString(id) {
 			t.Fatalf("client_id %q not 13-char base36", id)
 		}
+	}
+}
+
+// TestGenerateClientIDFallbackPads verifies the time-seeded fallback never
+// panics on a short base36 value: UnixNano in base36 is 12 digits today, and
+// the old [:13] slice on it panicked whenever crypto/rand failed. The shared
+// padBase36 helper must always yield the SDK's 13-char id.
+func TestGenerateClientIDFallbackPads(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		fallback := padBase36(strconv.FormatInt(time.Now().UnixNano(), 36))
+		if !regexp.MustCompile(`^[0-9a-z]{13}$`).MatchString(fallback) {
+			t.Fatalf("time fallback client_id %q not 13-char base36", fallback)
+		}
+	}
+	if got := padBase36("abc"); got != "0000000000abc" {
+		t.Errorf("padBase36(abc) = %q, want 0000000000abc (13 chars)", got)
+	}
+	if got := padBase36("0123456789abc"); got != "0123456789abc" {
+		t.Errorf("padBase36(13-char) = %q, want unchanged", got)
 	}
 }
 

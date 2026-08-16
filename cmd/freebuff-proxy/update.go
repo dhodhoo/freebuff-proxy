@@ -28,6 +28,15 @@ type githubRelease struct {
 }
 
 func runUpdate() {
+	// A deferred Windows swap (see update_swap.go) records its outcome in
+	// <exe>.update.result only AFTER this process exits — the swap helper
+	// waits for the parent, so the parent cannot wait on it. Surface any
+	// stale marker before doing anything else: a FAILED swap from the
+	// previous run must not be silently ignored.
+	if execPath, err := os.Executable(); err == nil {
+		reportUpdateResultMarker(execPath)
+	}
+
 	fmt.Println("freebuff-proxy self-updater")
 	fmt.Println("===========================")
 	fmt.Printf("Current version: %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
@@ -220,6 +229,25 @@ func runUpdate() {
 	fmt.Printf("\nSUCCESS: freebuff-proxy updated to %s!\n", rel.TagName)
 	fmt.Println("Please restart freebuff-proxy to run the new version.")
 	os.Exit(0)
+}
+
+// reportUpdateResultMarker consumes the result marker left by a deferred
+// Windows swap from a previous -update run: it prints the recorded outcome
+// ("OK" or "FAILED: ...", see update_swap.go) and deletes the marker so it is
+// reported exactly once. No-op when no marker exists. Returns the marker
+// contents ("" when none) for tests.
+func reportUpdateResultMarker(execPath string) string {
+	marker := updateResultMarker(execPath)
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return "" // no stale marker: no deferred swap, or already reported
+	}
+	result := strings.TrimSpace(string(data))
+	if result != "" {
+		fmt.Printf("Previous deferred update result: %s\n", result)
+	}
+	_ = os.Remove(marker)
+	return result
 }
 
 func downloadURL(ctx context.Context, client *http.Client, url string) ([]byte, error) {

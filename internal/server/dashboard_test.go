@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -667,5 +668,327 @@ func TestDashboardConcurrentTokenAdds(t *testing.T) {
 		if !strings.Contains(string(env), want) {
 			t.Errorf("token %q lost from .env after concurrent adds", want)
 		}
+	}
+}
+
+// postForm submits a urlencoded form to an admin POST endpoint (the browser
+// dashboard's native wire format).
+func postForm(t *testing.T, url, cookie, path string, form url.Values) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url+path, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", cookie)
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// A browser urlencoded save must decode the textarea's "content" field; a
+// raw urlencoded body written verbatim as .env would destroy the file
+// ("content=KEY=VALUE..."). The reload must also succeed on the decoded
+// values.
+func TestDashboardConfigSaveURLEncoded(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	content := "# my config\nMAX_MESSAGES_PER_DAY=7\nSAFE_MODE=true\n"
+	resp := postForm(t, ts.URL, cookie, "/admin/config", url.Values{"content": {content}})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("save status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(bodyOf(t, resp), "Saved and reloaded") {
+		t.Error("urlencoded save response missing success class")
+	}
+	got, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != content {
+		t.Errorf(".env after urlencoded save = %q, want decoded %q (not \"content=...\")", got, content)
+	}
+}
+
+// The smoke form posts urlencoded model=&prompt=; the handler must read the
+// form (like handleTokenAdd), not json.Unmarshal the raw body. JSON clients
+// must keep working.
+func TestDashboardSmokeFormAndJSON(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	resp := postForm(t, ts.URL, cookie, "/admin/smoke", url.Values{"model": {modelA}, "prompt": {"ping"}})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("smoke form status = %d, want 200", resp.StatusCode)
+	}
+	if body := bodyOf(t, resp); !strings.Contains(body, "Smoke test OK") {
+		t.Errorf("smoke form response = %q, want success fragment", body)
+	}
+
+	resp = postJSON(t, ts.URL, cookie, "/admin/smoke", `{"model":"`+modelA+`","prompt":"ping"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("smoke JSON status = %d, want 200", resp.StatusCode)
+	}
+	if body := bodyOf(t, resp); !strings.Contains(body, "Smoke test OK") {
+		t.Errorf("smoke JSON response = %q, want success fragment", body)
+	}
+}
+
+// Cross-origin admin POSTs must be rejected (CSRF): a browser on another
+// origin sends Origin (and/or Sec-Fetch-Site) on every request, while curl
+// and API clients send neither. Matching Origin and no-header requests pass.
+func TestDashboardCSRF(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	// Cross-origin Origin → 403 with the rejection fragment.
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/admin/tokens/add", strings.NewReader("token=cb_csrf_evil"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("Origin", "http://evil.example")
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := bodyOf(t, resp)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("cross-origin POST status = %d, want 403", resp.StatusCode)
+	}
+	if !strings.Contains(body, "Cross-origin request rejected.") {
+		t.Errorf("cross-origin body = %q, want rejection message", body)
+	}
+
+	// Cross-site Sec-Fetch-Site (no Origin) → 403.
+	req, err = http.NewRequest(http.MethodPost, ts.URL+"/admin/tokens/add", strings.NewReader("token=cb_csrf_evil2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	resp, err = noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("cross-site Sec-Fetch-Site POST status = %d, want 403", resp.StatusCode)
+	}
+
+	// Matching Origin (the proxy's own authority) → passes.
+	req, err = http.NewRequest(http.MethodPost, ts.URL+"/admin/tokens/add", strings.NewReader("token=cb_csrf_same"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("Origin", ts.URL)
+	resp, err = noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := bodyOf(t, resp); !strings.Contains(body, "Token added") {
+		t.Errorf("same-origin POST body = %q, want success (matching Origin must pass)", body)
+	}
+
+	// No Origin/Sec-Fetch-Site headers (curl, API clients) → passes.
+	resp = postJSON(t, ts.URL, cookie, "/admin/tokens/add", `{"token":"cb_csrf_curl"}`)
+	if body := bodyOf(t, resp); !strings.Contains(body, "Token added") {
+		t.Errorf("no-header POST body = %q, want success (header-less clients must pass)", body)
+	}
+}
+
+// After a config-editor AUTH_TOKENS edit, cfg.AuthTokens diverges from the
+// live pool; removing "the last token" from the stale list must be rejected
+// instead of persisting a wrong .env.
+func TestDashboardTokenRemoveRejectsDiverged(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ts := dashboardServer(t, "secret", nil) // 1 pooled token
+	cookie := authedCookie(t, ts)
+
+	// Config editor lists two tokens; the pool still holds one.
+	resp := postConfig(t, ts.URL, cookie, "AUTH_TOKENS=tok-0,extra-token\nSAFE_MODE=true\n")
+	if body := bodyOf(t, resp); !strings.Contains(body, "Saved and reloaded") {
+		t.Fatalf("config save failed: %s", body)
+	}
+
+	resp = doTokenAction(t, ts.URL, cookie, "/admin/tokens/remove")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("remove status = %d, want 200 with rejection message", resp.StatusCode)
+	}
+	body := bodyOf(t, resp)
+	if !strings.Contains(body, "differs from the live pool") {
+		t.Errorf("remove response = %q, want divergence rejection", body)
+	}
+	env, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(env), "extra-token") {
+		t.Error("diverged .env must be left untouched")
+	}
+}
+
+// A failed persist after removal must roll the pool back (mirroring
+// handleTokenAdd): the token is re-added so pool/.env/cfg stay consistent.
+func TestDashboardTokenRemoveRollsBackOnPersistFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+	// Seed an invalid .env: the post-removal reload fails Validate, so
+	// syncTokensAfterMutation errors and the pool must re-add the token.
+	if err := os.WriteFile(".env", []byte("LISTEN_ADDR=127.0.0.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		AdminToken:         "secret",
+	}
+	clientCfg := *cfg
+	clientCfg.UpstreamBaseURL = mock.URL()
+	client, err := upstream.New(cfg.AuthTokens[0], &clientCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := []*session.Manager{session.NewManager(client)}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, sessions, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(cfg, p, reg, nil, nil, "")
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	cookie := authedCookie(t, ts)
+
+	resp := doTokenAction(t, ts.URL, cookie, "/admin/tokens/remove")
+	body := bodyOf(t, resp)
+	if !strings.Contains(body, "reload config") {
+		t.Errorf("remove response = %q, want reload failure surfaced", body)
+	}
+	if got := p.TokenCount(); got != 1 {
+		t.Errorf("pool TokenCount after failed remove = %d, want 1 (rollback re-added the token)", got)
+	}
+}
+
+// handleDiag must not append ":443" to an UpstreamBaseURL that already
+// carries a port: the mock URL (http://127.0.0.1:PORT) is dialed as-is and
+// reported reachable (a host that already has a port must never become
+// "host:PORT:443").
+func TestDashboardDiagPortHandling(t *testing.T) {
+	t.Chdir(t.TempDir())
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		AdminToken:         "secret",
+	}
+	clientCfg := *cfg
+	clientCfg.UpstreamBaseURL = mock.URL()
+	client, err := upstream.New(cfg.AuthTokens[0], &clientCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := []*session.Manager{session.NewManager(client)}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, sessions, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(cfg, p, reg, nil, nil, "")
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	cookie := authedCookie(t, ts)
+
+	resp := postJSON(t, ts.URL, cookie, "/admin/diag", "{}")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("diag status = %d, want 200", resp.StatusCode)
+	}
+	body := bodyOf(t, resp)
+	if !strings.Contains(body, "TCP reachable 127.0.0.1:") {
+		t.Errorf("diag did not dial the ported mock host:\n%s", body)
+	}
+	if strings.Contains(body, ":443") {
+		t.Errorf("diag appended :443 to a host that already carries a port:\n%s", body)
+	}
+}
+
+// A config save that adds MODEL_ALIASES must apply to live alias resolution
+// (registry SetConfig wiring): a chat with the alias reaches upstream with
+// the resolved model, no restart needed.
+func TestDashboardConfigSaveAppliesModelAliases(t *testing.T) {
+	t.Chdir(t.TempDir())
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		AdminToken:         "secret",
+	}
+	clientCfg := *cfg
+	clientCfg.UpstreamBaseURL = mock.URL()
+	client, err := upstream.New(cfg.AuthTokens[0], &clientCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := []*session.Manager{session.NewManager(client)}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, sessions, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(cfg, p, reg, nil, nil, "")
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	cookie := authedCookie(t, ts)
+
+	resp := postConfig(t, ts.URL, cookie, "AUTH_TOKENS=tok-0\nMODEL_ALIASES=gpt-4o:"+modelA+"\n")
+	body := bodyOf(t, resp)
+	if !strings.Contains(body, "Saved and reloaded") {
+		t.Fatalf("config save failed: %s", body)
+	}
+
+	resp2, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody("gpt-4o"), nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("chat with alias status = %d, want 200: %s", resp2.StatusCode, data)
+	}
+	if len(mock.RecordedChatBodies) == 0 {
+		t.Fatal("no chat requests recorded upstream")
+	}
+	last := mock.RecordedChatBodies[len(mock.RecordedChatBodies)-1]
+	if !strings.Contains(last, modelA) {
+		t.Errorf("upstream body = %s, want resolved model %s after config-save alias", last, modelA)
 	}
 }

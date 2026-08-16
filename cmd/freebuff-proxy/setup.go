@@ -130,21 +130,93 @@ func setupContinueYamlConfig(p string) bool {
 
 	backupFile(p)
 
-	snippet := "\nmodels:\n  - title: \"FreeBuff DeepSeek Flash\"\n    provider: \"openai\"\n    model: \"deepseek/deepseek-v4-flash\"\n    apiBase: \"http://localhost:3457/v1\"\n    apiKey: \"not-needed\"\n"
+	// The FreeBuff entry as a YAML list item under a top-level models: key.
+	// One source of truth: used both to build the fresh-config snippet and to
+	// insert into an existing models: list (see mergeContinueYamlModels).
+	freebuffModel := []string{
+		`  - title: "FreeBuff DeepSeek Flash"`,
+		`    provider: "openai"`,
+		`    model: "deepseek/deepseek-v4-flash"`,
+		`    apiBase: "http://localhost:3457/v1"`,
+		`    apiKey: "not-needed"`,
+	}
+	snippet := "\nmodels:\n" + strings.Join(freebuffModel, "\n") + "\n"
 	if fileExists(p) {
 		existing, err := os.ReadFile(p)
-		if err == nil && strings.Contains(string(existing), "localhost:3457") {
-			return true
-		}
-		f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
 			return false
 		}
-		defer func() { _ = f.Close() }()
-		_, err = f.WriteString(snippet)
-		return err == nil
+		if strings.Contains(string(existing), "localhost:3457") {
+			return true
+		}
+		merged, ok := mergeContinueYamlModels(string(existing), freebuffModel, snippet)
+		if !ok {
+			return false
+		}
+		return os.WriteFile(p, []byte(merged), 0644) == nil
 	}
 	return os.WriteFile(p, []byte(snippet), 0644) == nil
+}
+
+// mergeContinueYamlModels merges the FreeBuff model into existing Continue
+// YAML text WITHOUT a YAML parser, preserving every byte outside the edit.
+// When the file already has a top-level "models:" key (a line starting at
+// column 0), the list item (itemLines) is inserted at the END of that list —
+// after its last non-blank sibling, before the next column-0 key, comment or
+// EOF — so the user's existing models stay intact and no duplicate key
+// appears. When no top-level models: key exists, snippet (key + item) is
+// appended verbatim. A "models:" line carrying an inline value (flow style,
+// e.g. "models: []") cannot be merged line-wise: ok=false leaves the file
+// untouched rather than corrupting it.
+func mergeContinueYamlModels(existing string, itemLines []string, snippet string) (string, bool) {
+	lines := strings.Split(existing, "\n")
+	crlf := strings.Contains(existing, "\r\n")
+
+	modelsIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "models:") {
+			if strings.TrimSpace(strings.TrimPrefix(line, "models:")) != "" {
+				// Inline value: flow-style list. Rewriting it line-wise would
+				// corrupt the file; leave it to the user.
+				return "", false
+			}
+			modelsIdx = i
+			break
+		}
+	}
+	if modelsIdx < 0 {
+		// No top-level models: key — append the whole snippet.
+		return existing + snippet, true
+	}
+
+	// The list body runs from modelsIdx+1 until the next column-0 line
+	// (non-blank and unindented: another key or a top-level comment) or EOF.
+	// Insert the new item after the last non-blank line of that body so
+	// trailing blank lines stay below the item.
+	end := len(lines)
+	for j := modelsIdx + 1; j < len(lines); j++ {
+		if strings.TrimSpace(lines[j]) != "" && lines[j][0] != ' ' && lines[j][0] != '\t' {
+			end = j
+			break
+		}
+	}
+	last := modelsIdx
+	for j := modelsIdx + 1; j < end; j++ {
+		if strings.TrimSpace(lines[j]) != "" {
+			last = j
+		}
+	}
+
+	merged := make([]string, 0, len(lines)+len(itemLines))
+	merged = append(merged, lines[:last+1]...)
+	for _, item := range itemLines {
+		if crlf {
+			item += "\r" // keep the file's line-ending style
+		}
+		merged = append(merged, item)
+	}
+	merged = append(merged, lines[last+1:]...)
+	return strings.Join(merged, "\n"), true
 }
 
 func setupContinueConfig(p string) bool {
@@ -200,8 +272,18 @@ func setupOpencodeConfig(p string) bool {
 	backupFile(p)
 
 	var cfg map[string]any
-	if data, err := os.ReadFile(p); err == nil {
-		_ = json.Unmarshal(data, &cfg)
+	data, err := os.ReadFile(p)
+	if err == nil {
+		if jsonErr := json.Unmarshal(data, &cfg); jsonErr != nil {
+			// opencode.json allows // comments (JSONC); json.Unmarshal
+			// rejects them, so a failed parse must NOT be treated as an
+			// empty config — rewriting the file from scratch would silently
+			// delete the user's providers/agents/MCPs (and their API keys).
+			// Abort and leave the file untouched; the .bak made above
+			// preserves the original either way.
+			fmt.Fprintf(os.Stderr, "ERROR: could not parse existing opencode.json (it may contain JSONC comments); add the freebuff provider manually - original saved as %s.bak\n", p)
+			return false
+		}
 	}
 	if cfg == nil {
 		cfg = make(map[string]any)

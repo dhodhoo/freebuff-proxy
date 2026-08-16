@@ -27,6 +27,15 @@ func clearEnv(t *testing.T) {
 	// a gitignored .env with real tokens) — Load() reads it by default.
 	t.Chdir(t.TempDir())
 	for _, k := range envKeys {
+		// AUTH_TOKENS is presence-sensitive (an empty value is an explicit
+		// bridge-mode choice), so the neutral test state is ABSENT, not
+		// empty: setting it to "" would record presence and suppress
+		// auto-discovery in every test. Unsetting also blocks a
+		// machine-level AUTH_TOKENS leak into assertions.
+		if k == "AUTH_TOKENS" {
+			_ = os.Unsetenv(k)
+			continue
+		}
 		t.Setenv(k, "")
 	}
 	t.Setenv("AUTO_DISCOVER_TOKEN", "false")
@@ -746,6 +755,66 @@ func TestDotenvEmptyAuthTokensClearsJSON(t *testing.T) {
 	}
 	if cfg.DiscoveredSource != "" {
 		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must stay suppressed)", cfg.DiscoveredSource)
+	}
+}
+
+// TestEnvEmptyAuthTokensBridgeMode verifies that an explicitly-empty
+// AUTH_TOKENS in the real environment (the shape systemd/Docker unit files
+// use to force bridge mode) records presence: cfg.AuthTokens stays empty,
+// BridgeMode() is true, and CLI auto-discovery must NOT refill the pool.
+// Regression: overrideCSV skipped empty values, so AUTH_TOKENS= left
+// AuthTokensSet false and a local CLI login silently flipped bridge mode to
+// pooled mode under systemd/Docker.
+func TestEnvEmptyAuthTokensBridgeMode(t *testing.T) {
+	clearEnv(t)
+	// Re-enable auto-discovery; the explicit-empty AUTH_TOKENS below is what
+	// must suppress it (not the AUTO_DISCOVER_TOKEN=off switch).
+	t.Setenv("AUTO_DISCOVER_TOKEN", "")
+	t.Setenv("AUTH_TOKENS", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	credDir := filepath.Join(home, ".config", "manicode")
+	if err := os.MkdirAll(credDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture := `{"default": {"authToken": "cb_discovered", "email": "dev@example.com"}}`
+	if err := os.WriteFile(filepath.Join(credDir, "credentials.json"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.AuthTokens) != 0 {
+		t.Errorf("AuthTokens = %v, want empty (explicit bridge mode, not refilled by discovery)", cfg.AuthTokens)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode() = false, want true with explicitly-empty AUTH_TOKENS")
+	}
+	if cfg.DiscoveredSource != "" {
+		t.Errorf("DiscoveredSource = %q, want empty (auto-discovery must be suppressed)", cfg.DiscoveredSource)
+	}
+}
+
+// TestEnvAuthTokensSetsTokens verifies the non-empty AUTH_TOKENS=a,b env
+// path lands in cfg.AuthTokens with explicit-presence semantics (a partial
+// pool must never trigger CLI auto-discovery either).
+func TestEnvAuthTokensSetsTokens(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "a,b")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"a", "b"}; !equalStrings(cfg.AuthTokens, want) {
+		t.Errorf("AuthTokens = %v, want %v", cfg.AuthTokens, want)
+	}
+	if cfg.BridgeMode() {
+		t.Error("BridgeMode() = true, want false with AUTH_TOKENS=a,b")
 	}
 }
 

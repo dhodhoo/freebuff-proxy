@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 )
 
 // ANSI 4-color scheme: DEBUG gray, INFO green, WARN yellow, ERROR red.
@@ -104,7 +105,7 @@ func (h *textHandler) Handle(_ context.Context, r slog.Record) error {
 	line := fmt.Sprintf("time=%s level=%s msg=%s",
 		r.Time.Format(timeFormat), h.levelToken(r.Level), quoteMessage(r.Message))
 	r.Attrs(func(a slog.Attr) bool {
-		line += " " + a.Key + "=" + a.Value.String()
+		line += " " + a.Key + "=" + quoteMessage(a.Value.String())
 		return true
 	})
 	_, err := io.WriteString(h.w, line+"\n")
@@ -137,11 +138,27 @@ func levelColor(level slog.Level) string {
 }
 
 // quoteMessage quotes multi-word messages so one line stays one record.
+// Values containing quotes, newlines, tabs, carriage returns or other
+// control characters are quoted too: an attr value (model name, URL path)
+// with an embedded newline — or an injected "level=ERROR" token — would
+// otherwise forge additional log lines, and a trailing \r corrupts the
+// appended log file. strconv.Quote escapes all of them safely.
 func quoteMessage(msg string) string {
-	if strings.ContainsAny(msg, " \t") {
+	if needsQuote(msg) {
 		return strconv.Quote(msg)
 	}
 	return msg
+}
+
+// needsQuote reports whether s contains characters that would break
+// one-record-per-line logging when written unquoted.
+func needsQuote(s string) bool {
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '"' || unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // sensitiveHeaders are redacted in dumps and request logs; keys are compared

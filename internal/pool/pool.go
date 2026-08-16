@@ -216,10 +216,16 @@ func (p *Pool) AddToken(token string) (int, error) {
 	next := make([]*tokenEntry, 0, len(*toks)+1)
 	next = append(next, *toks...)
 	next = append(next, entry)
-	p.toks.Store(&next)
+	// Publish the usage slice BEFORE the token snapshot: a concurrent
+	// reader that observes the new snapshot (via p.toks) must always find
+	// a matching entry in p.msgsPerToken, so recordChat/usageCount for the
+	// new index can never index past the usage slice. The two fields are
+	// otherwise independent (toks is an atomic pointer, msgsPerToken is
+	// usageMu-guarded); only this publish order matters.
 	p.usageMu.Lock()
 	p.msgsPerToken = append(p.msgsPerToken, nil)
 	p.usageMu.Unlock()
+	p.toks.Store(&next)
 	return idx, nil
 }
 
@@ -286,7 +292,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	// hot token fails does it fall back to the remaining eligible tokens
 	// from the round-robin start (cold path), exactly like the historical
 	// linear failover. When no token is hot the order is unchanged.
-	order := p.acquireOrder(start, model)
+	order := p.acquireOrder(toks, start, model)
 	var errs []string
 	var waiting []*session.WaitingRoomError
 	var rateLimited []*upstream.RateLimitError
@@ -297,6 +303,13 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	for _, idx := range order {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		// Defensive bounds check: acquireOrder builds its order against the
+		// SAME snapshot loaded above, but a removal racing this call must
+		// never index past the slice it computed the order from. Skip
+		// indices that are no longer present instead of panicking.
+		if idx < 0 || idx >= len(*toks) {
+			continue
 		}
 		tok := (*toks)[idx]
 		name := fmt.Sprintf("token-%d", idx+1)
@@ -414,12 +427,14 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 }
 
 // acquireOrder computes the token iteration order for one Acquire pass
-// (hot-session-first selection, see Acquire). start is the round-robin
-// start index; model is the requested upstream model, used as a tiebreak to
+// (hot-session-first selection, see Acquire). toks is the caller's snapshot
+// (loaded once in Acquire) — the order is built against the same snapshot
+// the failover loop indexes, so an AddToken racing the call can never make
+// the loop index past its own snapshot. start is the round-robin start
+// index; model is the requested upstream model, used as a tiebreak to
 // prefer a hot token whose session already serves it (sessions are shared
 // across models in practice, so the match is not a requirement).
-func (p *Pool) acquireOrder(start int, model string) []int {
-	toks := p.toks.Load()
+func (p *Pool) acquireOrder(toks *[]*tokenEntry, start int, model string) []int {
 	// eligible mirrors the per-token checks the failover loop applies:
 	// not cooling down and (when configured) under the daily message cap.
 	eligible := func(idx int) bool {
@@ -974,6 +989,14 @@ func (p *Pool) recordChat(token int) {
 	}
 	p.usageMu.Lock()
 	defer p.usageMu.Unlock()
+	// Authoritative bound under the lock: p.msgsPerToken is the index space
+	// AddToken/RemoveLastToken/RemoveAllTokens keep consistent, so a
+	// removal that raced the snapshot check above (or a lease issued from a
+	// snapshot that already went stale) is caught here instead of indexing
+	// past the usage slice.
+	if token < 0 || token >= len(p.msgsPerToken) {
+		return
+	}
 	cutoff := time.Now().Add(-usageWindow)
 	history := p.msgsPerToken[token]
 	first := 0
@@ -992,6 +1015,11 @@ func (p *Pool) usageCount(token int) int {
 	}
 	p.usageMu.Lock()
 	defer p.usageMu.Unlock()
+	// Authoritative bound under the lock (see recordChat): the usage slice
+	// may have been truncated/nil'd by a removal racing the snapshot check.
+	if token < 0 || token >= len(p.msgsPerToken) {
+		return 0
+	}
 	cutoff := time.Now().Add(-usageWindow)
 	history := p.msgsPerToken[token]
 	first := 0
@@ -1020,6 +1048,12 @@ func (p *Pool) dailyLimitError(token int) *upstream.RateLimitError {
 func (p *Pool) usageResetIn(token int) time.Duration {
 	p.usageMu.Lock()
 	defer p.usageMu.Unlock()
+	// Bounds check under the lock (see recordChat): the usage slice may
+	// have been truncated/nil'd by a removal racing this call — usageResetIn
+	// previously had no guard at all and indexed past the end.
+	if token < 0 || token >= len(p.msgsPerToken) {
+		return 0
+	}
 	history := p.msgsPerToken[token]
 	if len(history) == 0 {
 		return 0
@@ -1335,9 +1369,13 @@ func (p *Pool) maintainTick(ctx context.Context) {
 }
 
 // bridgeMaintain sweeps the bridge cache: entries idle past bridgeIdleEvict
-// are dropped (runs FINISHed best-effort); the rest get the per-token
-// maintain work — rotate aged runs and advance queued sessions, bounded by
-// the same RequestTimeout ctx as the fixed-token loop.
+// are dropped (runs FINISHed and the upstream session ended, best-effort);
+// entries with in-flight leases are NEVER evicted — FINISHing their runs
+// would kill the in-flight chat, so busy entries always get the per-token
+// maintain work below and are only swept once their leases drain and they
+// stay idle. The remaining entries get the per-token maintain work — rotate
+// aged runs and advance queued sessions, bounded by the same RequestTimeout
+// ctx as the fixed-token loop.
 func (p *Pool) bridgeMaintain(ctx context.Context) {
 	var toEvict []*bridgeEntry
 	var toMaintain []*bridgeEntry
@@ -1345,6 +1383,13 @@ func (p *Pool) bridgeMaintain(ctx context.Context) {
 	p.bridgeMu.Lock()
 	now := time.Now()
 	for token, entry := range p.bridge {
+		// Busy entry: leave it for the maintain pass (same rule as
+		// bridgeEvictLocked's busy skip — the idle sweep only handles
+		// entries once their leases drain).
+		if entry.runs.InflightCount() > 0 {
+			toMaintain = append(toMaintain, entry)
+			continue
+		}
 		if now.Sub(entry.lastUsed) > bridgeIdleEvict {
 			toEvict = append(toEvict, entry)
 			delete(p.bridge, token)
@@ -1357,7 +1402,14 @@ func (p *Pool) bridgeMaintain(ctx context.Context) {
 	p.bridgeMu.Unlock()
 
 	for _, entry := range toEvict {
-		entry.runs.FinishAllRuns(ctx)
+		// Mirror the shutdown drain: FINISH the runs AND end the entry's
+		// upstream session, so a dropped idle entry does not leak its
+		// session upstream. Bounded by the same RequestTimeout ctx as the
+		// per-token maintain work so a hung upstream cannot stall the loop.
+		eCtx, cancel := context.WithTimeout(ctx, p.cfg.RequestTimeout)
+		entry.runs.FinishAllRuns(eCtx)
+		_ = entry.session.EndSession(eCtx)
+		cancel()
 	}
 	for _, entry := range toMaintain {
 		// Same cooldown skip as the fixed-token loop: no heartbeat, no

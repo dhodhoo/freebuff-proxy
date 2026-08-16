@@ -275,3 +275,41 @@ func TestVerifyChecksumMatchAndMismatch(t *testing.T) {
 		t.Fatal("verifyChecksum(mismatch) = nil, want checksum mismatch error")
 	}
 }
+
+// TestReportUpdateResultMarkerReportsAndDeletes pins the deferred-swap marker
+// contract: a stale <exe>.update.result left by a previous Windows swap is
+// surfaced ("Previous deferred update result: ...") and deleted, so a FAILED
+// swap is reported exactly once on the next -update invocation.
+func TestReportUpdateResultMarkerReportsAndDeletes(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "freebuff-proxy.exe")
+	marker := updateResultMarker(exe)
+
+	// FAILED case: the previous deferred swap did not complete.
+	failed := "FAILED: could not replace the running binary after 5 attempts.\nInstall manually: move \"new\" over \"old\".\n"
+	if err := os.WriteFile(marker, []byte(failed), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := reportUpdateResultMarker(exe); got != strings.TrimSpace(failed) {
+		t.Errorf("reportUpdateResultMarker(FAILED) = %q, want %q", got, strings.TrimSpace(failed))
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("FAILED marker was not deleted after reporting")
+	}
+
+	// OK case: the previous deferred swap succeeded.
+	if err := os.WriteFile(marker, []byte("OK\r\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := reportUpdateResultMarker(exe); got != "OK" {
+		t.Errorf("reportUpdateResultMarker(OK) = %q, want %q", got, "OK")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("OK marker was not deleted after reporting")
+	}
+
+	// No marker: no-op, returns "".
+	if got := reportUpdateResultMarker(exe); got != "" {
+		t.Errorf("reportUpdateResultMarker(no marker) = %q, want \"\"", got)
+	}
+}

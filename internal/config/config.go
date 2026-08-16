@@ -145,7 +145,17 @@ func Load(configPath string) (Config, error) {
 
 	overrideString(&raw.ListenAddr, "LISTEN_ADDR")
 	overrideString(&raw.UpstreamBaseURL, "UPSTREAM_BASE_URL")
-	overrideCSV(&raw.AuthTokens, "AUTH_TOKENS")
+	// AUTH_TOKENS is presence-sensitive: an empty value in the real
+	// environment is an explicit bridge-mode choice (systemd/Docker unit
+	// files set AUTH_TOKENS= to force bridge mode). Unlike other keys, an
+	// empty value must not be skipped — it records presence so CLI
+	// auto-discovery cannot refill the pool, mirroring applyDotenv's
+	// AUTH_TOKENS handling for .env. When the variable is absent, the
+	// JSON/.env value (if any) stands unchanged.
+	if v, ok := os.LookupEnv("AUTH_TOKENS"); ok {
+		raw.AuthTokens = splitList(v)
+		raw.AuthTokensSet = true
+	}
 	overrideString(&raw.RotationInterval, "ROTATION_INTERVAL")
 	overrideString(&raw.RequestTimeout, "REQUEST_TIMEOUT")
 	overrideString(&raw.SessionCallTimeout, "SESSION_CALL_TIMEOUT")
