@@ -107,7 +107,51 @@ for await (const chunk of response) {
 
 ---
 
-## 5. API Routers & Aggregators (9router, OmniRouter, One API, LiteLLM)
+---
+
+## 5. Cursor IDE
+
+1. Open **Cursor Settings** -> **Models**.
+2. Turn off other models and click **Add custom model**: `deepseek/deepseek-v4-flash`.
+3. In **OpenAI API Key**, enter any placeholder (e.g. `not-needed`).
+4. Click **Override OpenAI Base URL** and set: `http://localhost:3457/v1`.
+
+---
+
+## 6. VS Code (Continue / Cline / Roo Code)
+
+### Continue Extension (`~/.continue/config.json`)
+```json
+{
+  "models": [
+    {
+      "title": "FreeBuff DeepSeek Flash",
+      "provider": "openai",
+      "model": "deepseek/deepseek-v4-flash",
+      "apiBase": "http://localhost:3457/v1",
+      "apiKey": "not-needed"
+    }
+  ]
+}
+```
+
+### Cline / Roo Code
+- **API Provider**: OpenAI Compatible
+- **Base URL**: `http://localhost:3457/v1`
+- **API Key**: `not-needed`
+- **Model ID**: `deepseek/deepseek-v4-flash`
+
+---
+
+## 7. Chatbox / NextChat / LibreChat / Jan
+
+- **API Host / Base URL**: `http://localhost:3457/v1`
+- **API Key**: `not-needed`
+- **Model Name**: `deepseek/deepseek-v4-flash`
+
+---
+
+## 8. API Routers & Aggregators (9router, OmniRouter, One API, LiteLLM)
 
 For multi-account management or multi-user API routing:
 

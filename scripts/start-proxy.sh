@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# start-proxy.sh - Launch freebuff-proxy from the extracted folder.
+# start-proxy.sh - Launch freebuff-proxy from the extracted folder or repo.
 # Right-click this folder -> "Open in Terminal" -> ./start-proxy.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -f "$ROOT/freebuff-proxy" ] && [ -f "$ROOT/../freebuff-proxy" ]; then
+  ROOT="$(cd "$ROOT/.." && pwd)"
+fi
 cd "$ROOT"
 
 if [ ! -f "$ROOT/freebuff-proxy" ]; then
@@ -21,15 +24,21 @@ fi
 
 # 2. If no token, offer to generate one (skipped when piped/CI)
 if [ -f "$ENV_FILE" ] && ! grep -qE '^AUTH_TOKENS=[^[:space:]]' "$ENV_FILE"; then
-  if [ -t 0 ]; then
-    echo "No token found in .env"
-    read -r -p "Generate one now? [Y/n] " ANS
-    case "$ANS" in
-      n|N|no|NO) echo "  Skipped; running in bridge mode (clients send their own token)." ;;
-      *) "$ROOT/gen-freebuff-token.sh" --append --env "$ENV_FILE" ;;
-    esac
-  else
-    echo "No token in AUTH_TOKENS - running in bridge mode (clients send their own token)."
+  GEN_SCRIPT="$ROOT/gen-freebuff-token.sh"
+  if [ ! -f "$GEN_SCRIPT" ] && [ -f "$ROOT/scripts/gen-freebuff-token.sh" ]; then
+    GEN_SCRIPT="$ROOT/scripts/gen-freebuff-token.sh"
+  fi
+  if [ -f "$GEN_SCRIPT" ]; then
+    if [ -t 0 ]; then
+      echo "No token found in .env"
+      read -r -p "Generate one now via browser login? [Y/n] " ANS
+      case "$ANS" in
+        n|N|no|NO) echo "  Skipped; running in bridge mode (clients send their own token)." ;;
+        *) "$GEN_SCRIPT" --append --env "$ENV_FILE" ;;
+      esac
+    else
+      echo "No token in AUTH_TOKENS - running in bridge mode (clients send their own token)."
+    fi
   fi
 fi
 

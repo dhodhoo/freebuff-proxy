@@ -10,9 +10,9 @@
 #
 # Order of operations (fail fast on the token BEFORE downloading anything):
 #   1. pick the install method
-#   2. TOKEN PREREQUISITE: make sure the official freebuff CLI is installed
-#      (npm install -g freebuff) and logged in (run: freebuff), then read
-#      authToken from its credentials file. Paste-a-login-URL is the fallback.
+#   2. TOKEN PREREQUISITE: reuse the CLI credentials file if you already have
+#      one; otherwise 1-click browser login (headless OAuth), manual paste, or
+#      bridge mode - zero extra dependencies.
 #   3. install the proxy (release binary, or clone + docker compose)
 #   4. write .env - always, for every option: copied from .env.example (fetched
 #      from GitHub if the archive did not ship one), then filled with your token,
@@ -26,7 +26,8 @@
 #   --env-file=<path>             write .env to <path>
 #   --method=binary|docker|bridge skip the menu
 #   --no-prompt                   safe defaults, never read the terminal
-#   --no-cli-install              never install or wait for the freebuff CLI
+#   --no-cli-install              legacy no-op kept for compatibility; the
+#                                 installer never installs or waits for a CLI
 #   -h|--help                     this header
 #
 # What it does NOT do: modify system paths, install services, or touch your
@@ -191,9 +192,9 @@ if [ -z "$DIR" ]; then DIR="$(pwd)"; fi
 mkdir -p "$DIR"
 
 # --- 3. TOKEN PREREQUISITE (before installing anything) -----------------------
-# The proxy is useless without a FreeBuff token, and the supported way to mint
-# one is the official CLI. So: detect it, offer to install it, make sure it is
-# logged in, and read the token - all before we download the proxy.
+# The proxy is useless without a FreeBuff token. Order: reuse an existing
+# credentials.json if present, else 1-click headless browser OAuth, else manual
+# paste, else bridge mode - all before we download the proxy.
 CREDS_PATHS="$HOME/.config/manicode/credentials.json $HOME/.config/codebuff/credentials.json"
 [ -n "${USERPROFILE:-}" ] && CREDS_PATHS="$CREDS_PATHS $USERPROFILE/.config/manicode/credentials.json"
 
@@ -204,17 +205,7 @@ creds_file() {
 
 read_token() {
   local creds="$1" t=""
-  if command -v node >/dev/null 2>&1; then
-    t="$(node -e '
-      const fs = require("fs");
-      try {
-        const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        const acct = data.default || Object.values(data)[0];
-        if (acct && acct.authToken) process.stdout.write(acct.authToken);
-      } catch (e) {}
-    ' "$creds" 2>/dev/null || true)"
-  fi
-  if [ -z "$t" ] && command -v python3 >/dev/null 2>&1; then
+  if command -v python3 >/dev/null 2>&1; then
     t="$(python3 -c '
 import json, sys
 try:
@@ -239,61 +230,76 @@ token_from_creds() {
   return 0
 }
 
-ensure_node() {
-  command -v npm >/dev/null 2>&1 && return 0
-  warn "npm/node not found - the freebuff CLI needs Node.js."
-  confirm "Install Node.js now via your package manager?" || return 1
-  pkg_install nodejs npm || { warn "Could not install Node.js automatically. Install Node 20+ from https://nodejs.org and re-run."; return 1; }
-  command -v npm >/dev/null 2>&1 || { warn "npm still not on PATH."; return 1; }
-  ok "Node.js installed: $(node --version 2>/dev/null)"
+# urlencode <str> - minimal percent-encoding for query-string values (no deps).
+urlencode() {
+  printf '%s' "$1" | sed \
+    -e 's/%/%25/g' \
+    -e 's/ /%20/g' \
+    -e 's/&/%26/g' \
+    -e 's/+/%2B/g' \
+    -e 's/=/%3D/g' \
+    -e 's/#/%23/g' \
+    -e 's/:/%3A/g' \
+    -e 's/,/%2C/g' \
+    -e 's|/|%2F|g' \
+    -e 's/?/%3F/g'
 }
 
-ensure_cli_installed() {
-  if command -v freebuff >/dev/null 2>&1; then
-    ok "freebuff CLI detected: $(command -v freebuff)"
-    return 0
-  fi
-  [ "$NO_CLI_INSTALL" = "1" ] && { warn "freebuff CLI not installed (--no-cli-install)."; return 1; }
-  echo ""
-  warn "The official freebuff CLI is NOT installed on this machine."
-  warn "It is the supported way to mint a FreeBuff token, and the proxy needs one."
-  warn "This will run:  npm install -g freebuff"
-  confirm "Install the freebuff CLI now?" || { warn "Skipping CLI install."; return 1; }
-  ensure_node || return 1
-  c "Installing the freebuff CLI (npm install -g freebuff)..."
-  if ! npm install -g freebuff >/dev/null 2>&1; then
-    warn "Global npm install failed (permissions?). Retrying with sudo..."
-    sudo npm install -g freebuff >/dev/null 2>&1 \
-      || { warn "'npm install -g freebuff' failed. Install it manually, then re-run."; return 1; }
-  fi
-  command -v freebuff >/dev/null 2>&1 || { warn "freebuff still not on PATH after install (check your npm global bin)."; return 1; }
-  ok "freebuff CLI installed."
-}
+obtain_headless_token() {
+  [ "$NO_PROMPT" = "1" ] && { warn "Non-interactive mode: skipping browser login; AUTH_TOKENS stays empty."; return 1; }
+  c "Requesting login URL for browser authentication..."
+  local fp="enhanced-$(openssl rand -base64 32 2>/dev/null | tr -d '+/=' | head -c 43 || head -c 43 /dev/urandom | tr -dc 'a-zA-Z0-9')"
+  local code_resp
+  code_resp=$(curl -sS -X POST "https://www.codebuff.com/api/auth/cli/code" \
+    -H "Content-Type: application/json" \
+    -d "{\"fingerprintId\":\"$fp\"}" 2>/dev/null || true)
+  local login_url fp_hash expires_at
+  login_url=$(echo "$code_resp" | sed -n 's/.*"loginUrl": *"\([^"]*\)".*/\1/p')
+  fp_hash=$(echo "$code_resp" | sed -n 's/.*"fingerprintHash": *"\([^"]*\)".*/\1/p')
+  expires_at=$(echo "$code_resp" | sed -n 's/.*"expiresAt": *"\([^"]*\)".*/\1/p')
 
-ensure_cli_login() {
-  # already logged in?
-  token_from_creds && { ok "freebuff CLI is already logged in ($TOKEN_SOURCE)"; return 0; }
-  [ "$NO_PROMPT" = "1" ] && { warn "CLI not logged in and --no-prompt: skipping login."; return 1; }
-  echo ""
-  warn "The freebuff CLI is installed but NOT logged in (no authToken found)."
-  warn "Log in now - two ways:"
-  warn "  A) let this script launch it for you (it opens a browser login), or"
-  warn "  B) open another terminal, run 'freebuff', finish the login, come back."
-  if confirm "Launch 'freebuff' here now? (answer n if you prefer another terminal)"; then
-    c "Starting the freebuff CLI. Complete the login, then quit the CLI (Ctrl+C or /exit)."
-    freebuff <&"$TTY_FD" || true
+  if [ -z "$login_url" ]; then
+    warn "Could not obtain login URL from upstream server."
+    return 1
   fi
-  local attempt=1
-  while [ "$attempt" -le 3 ]; do
-    if token_from_creds; then
-      ok "Login detected ($TOKEN_SOURCE)"
+
+  # percent-encode the poll params (expiresAt is ISO-8601, may carry ':'/'+')
+  local enc_fp enc_hash enc_exp
+  enc_fp="$(urlencode "$fp")"
+  enc_hash="$(urlencode "$fp_hash")"
+  enc_exp="$(urlencode "$expires_at")"
+
+  echo ""
+  ok "Opening browser for FreeBuff GitHub login..."
+  echo "URL: $login_url"
+  echo ""
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$login_url" 2>/dev/null &
+  elif command -v open >/dev/null 2>&1; then
+    open "$login_url" 2>/dev/null &
+  else
+    warn "Cannot open browser automatically. Please open the URL above manually."
+  fi
+
+  c "Waiting for authentication in browser (timeout: 300s)..."
+  local start_time elapsed status_resp tok
+  start_time=$(date +%s)
+  while true; do
+    elapsed=$(( $(date +%s) - start_time ))
+    if [ "$elapsed" -ge 300 ]; then
+      warn "Login timed out after 300s."
+      return 1
+    fi
+    sleep 4
+    status_resp=$(curl -sS "https://www.codebuff.com/api/auth/cli/status?fingerprintId=$enc_fp&fingerprintHash=$enc_hash&expiresAt=$enc_exp" 2>/dev/null || true)
+    tok=$(echo "$status_resp" | sed -n 's/.*"authToken": *"\([^"]*\)".*/\1/p')
+    if [ -n "$tok" ] && [ "${#tok}" -gt 12 ]; then
+      TOKEN_VALUE="$tok"
+      TOKEN_SOURCE="headless OAuth login"
+      ok "Authentication successful! Token acquired."
       return 0
     fi
-    warn "No authToken found yet (check $attempt/3). Run 'freebuff' and finish the browser login."
-    confirm "Check again?" || return 1
-    attempt=$((attempt + 1))
   done
-  return 1
 }
 
 paste_token() {
@@ -323,10 +329,20 @@ else
   c "Step 1/3: FreeBuff token (required before installing the proxy)"
   if token_from_creds; then
     ok "Existing freebuff CLI login found ($TOKEN_SOURCE) - reusing its token."
-  elif ensure_cli_installed && ensure_cli_login; then
-    ok "Token obtained from the freebuff CLI login."
+  elif [ "$NO_PROMPT" = "0" ]; then
+    echo "  1) Generate token now via browser login (recommended, zero extra dependencies)"
+    echo "  2) Paste an existing FreeBuff authToken"
+    echo "  3) Bridge mode (skip token; clients supply their own per request)"
+    tok_choice=""
+    ask tok_choice "Choose" "1"
+    case "$tok_choice" in
+      1|"") obtain_headless_token || paste_token || warn "Continuing without a token." ;;
+      2) paste_token || warn "Continuing without a token." ;;
+      3) BRIDGE=1; SKIP_TOKEN=1; ok "Switched to Bridge mode." ;;
+      *) obtain_headless_token || paste_token || warn "Continuing without a token." ;;
+    esac
   else
-    paste_token || warn "Continuing without a token - the proxy will start but chat will fail until AUTH_TOKENS is set."
+    obtain_headless_token || paste_token || warn "Continuing without a token - the proxy will start but chat will fail until AUTH_TOKENS is set."
   fi
 fi
 

@@ -48,7 +48,16 @@ Using this proxy conflicts with Codebuff's terms of service. Upstream abuse dete
 
 ## Step 1: Install & Start the Proxy
 
-### Option A: One-Command Installer (Recommended)
+### Option A: Portable Release ZIP (Recommended for Windows / Beginners)
+1. Download the latest ZIP from [**GitHub Releases**](https://github.com/trefeon/freebuff-proxy/releases) (e.g. `freebuff-proxy_..._windows_amd64.zip`).
+2. Extract the folder and:
+   - **Windows**: Double-click `start-proxy.cmd`.
+   - **Linux / macOS**: Open terminal in the folder and run `./start-proxy.sh`.
+3. Press Enter to sign in via your browser. Your token is saved automatically!
+
+---
+
+### Option B: One-Command Online Installer
 
 **Linux / macOS Terminal:**
 ```bash
@@ -60,22 +69,9 @@ curl -sSL https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/
 irm https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/install-freebuff-proxy.ps1 | iex
 ```
 
-Follow the prompts to pick your token or enable bridge mode.
-
-#### How to obtain your FreeBuff token (`authToken`):
-
-Fastest path: run the bundled gen script. It opens a browser OAuth login; run with no flags for an interactive menu whose recommended default (Enter) appends the token to `.env`, auto-creating it from `.env.example` if missing:
-
-- Linux / macOS: `./scripts/gen-token.sh`
-- Windows (PowerShell): `.\scripts\gen-token.ps1`
-
-`gen-token.*` is an alias for `gen-freebuff-token.*`, which also supports explicit modes that skip the menu: `--clipboard`, `--save` (store in the CLI credentials file), `--append` (add to `.env` `AUTH_TOKENS`), and `--env <path>`.
-
-Alternatively, log in with the official CLI: `npm i -g freebuff` and run `freebuff`. The CLI saves your `authToken` in `~/.config/manicode/credentials.json` (Windows: `C:\Users\<you>\.config\manicode\credentials.json`).
-
 ---
 
-### Option B: Docker Compose
+### Option C: Docker Compose
 
 ```bash
 cp .env.example .env
