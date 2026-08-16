@@ -5,7 +5,7 @@
     <p class="muted">live relay status — refreshes every 5s</p>
   </div>
   <div class="pills">
-    <span class="pill pill-{{if .InBridge}}bridge{{else}}pool{{end}}">{{.Mode}}</span>
+    <span class="pill pill-{{if .InBridge}}bridge{{else if eq .Mode "hybrid"}}hybrid{{else}}pool{{end}}">{{.Mode}}</span>
     <span class="pill">{{.ModelCount}} models</span>
     <span class="pill">up {{.Uptime}}</span>
     {{if .SafeMode}}<span class="pill pill-safe">safe mode</span>{{end}}

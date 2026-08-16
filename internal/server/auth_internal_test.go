@@ -1,12 +1,21 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"freebuff-proxy/internal/upstream"
 )
 
 // Internal (package server) auth tests: these exercise adminAuth with the
@@ -79,6 +88,148 @@ func assertNoTmpFiles(t *testing.T, dir, base string) {
 	}
 	if len(matches) != 0 {
 		t.Errorf("temp files left behind: %v", matches)
+	}
+}
+
+// errorResponse decodes the OpenAI error shape writeError produces.
+func errorResponse(t *testing.T, err error) (status int, body struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+		Hint    string `json:"hint"`
+	} `json:"error"`
+}) {
+	t.Helper()
+	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	s.writeError(w, r, err)
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("writeError response is not JSON: %v: %s", err, w.Body.Bytes())
+	}
+	return w.Code, body
+}
+
+// TestWriteErrorNewMappings pins the self-healing error matrix additions:
+// country block → 403, free-mode CLI gate → 403, credits → 402 (upstream body
+// passed through verbatim), upstream deadline → 504.
+func TestWriteErrorNewMappings(t *testing.T) {
+	t.Run("country blocked 403", func(t *testing.T) {
+		err := &upstream.CountryBlockedError{CountryCode: "CN", CountryBlockReason: "region_restricted", IpPrivacySignals: []string{"vpn"}}
+		status, body := errorResponse(t, err)
+		if status != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", status)
+		}
+		if body.Error.Code != "country_blocked" {
+			t.Errorf("code = %q, want country_blocked", body.Error.Code)
+		}
+		if body.Error.Hint == "" || !strings.Contains(body.Error.Hint, "SOCKS5") {
+			t.Errorf("hint = %q, want actionable egress hint", body.Error.Hint)
+		}
+	})
+
+	t.Run("free mode cli required 403", func(t *testing.T) {
+		err := fmt.Errorf("free tier gate: %w", upstream.ErrFreeModeCLIRequired)
+		status, body := errorResponse(t, err)
+		if status != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", status)
+		}
+		if body.Error.Code != "free_mode_cli_required" {
+			t.Errorf("code = %q, want free_mode_cli_required", body.Error.Code)
+		}
+		if !strings.Contains(errors.Unwrap(err).Error(), "CLI") && !strings.Contains(body.Error.Hint, "CLI") {
+			t.Errorf("hint = %q, want CLI envelope hint", body.Error.Hint)
+		}
+	})
+
+	t.Run("credits 402 with body passthrough", func(t *testing.T) {
+		const upstreamBody = `{"error":"out of credits","model":"deepseek/deepseek-v4-flash"}`
+		err := &upstream.CreditsError{Status: http.StatusPaymentRequired, Body: upstreamBody}
+		status, body := errorResponse(t, err)
+		if status != http.StatusPaymentRequired {
+			t.Errorf("status = %d, want 402", status)
+		}
+		if body.Error.Code != "out_of_credits" {
+			t.Errorf("code = %q, want out_of_credits", body.Error.Code)
+		}
+		if body.Error.Message != upstreamBody {
+			t.Errorf("message = %q, want upstream body verbatim (no passthrough loss)", body.Error.Message)
+		}
+		if body.Error.Hint == "" || !strings.Contains(body.Error.Hint, "COST_MODE") {
+			t.Errorf("hint = %q, want COST_MODE hint", body.Error.Hint)
+		}
+	})
+
+	t.Run("upstream deadline 504", func(t *testing.T) {
+		err := fmt.Errorf("chat: %w", context.DeadlineExceeded)
+		status, body := errorResponse(t, err)
+		if status != http.StatusGatewayTimeout {
+			t.Errorf("status = %d, want 504", status)
+		}
+		if body.Error.Code != "upstream_timeout" {
+			t.Errorf("code = %q, want upstream_timeout", body.Error.Code)
+		}
+		if body.Error.Hint == "" {
+			t.Error("hint empty, want retry/REQUEST_TIMEOUT hint")
+		}
+	})
+}
+
+// TestWriteErrorExistingMappingsUnchanged guards the PRD §6 matrix: ban stays
+// 403 account_banned, rate limit 429, waiting room 503 — the new mappings
+// must not shadow them.
+func TestWriteErrorExistingMappingsUnchanged(t *testing.T) {
+	status, body := errorResponse(t, &upstream.BanError{ResumesAt: time.Now().Add(time.Hour), Body: `{"status":"banned"}`})
+	if status != http.StatusForbidden || body.Error.Code != "account_banned" {
+		t.Errorf("ban: status=%d code=%q, want 403 account_banned", status, body.Error.Code)
+	}
+
+	status, body = errorResponse(t, &upstream.RateLimitError{RetryAfter: time.Minute})
+	if status != http.StatusTooManyRequests || body.Error.Code != "rate_limited" {
+		t.Errorf("rate limit: status=%d code=%q, want 429 rate_limited", status, body.Error.Code)
+	}
+
+	status, body = errorResponse(t, &upstream.WaitingRoomError{RetryAfter: time.Minute})
+	if status != http.StatusServiceUnavailable || body.Error.Code != "waiting_room_queued" {
+		t.Errorf("waiting room: status=%d code=%q, want 503 waiting_room_queued", status, body.Error.Code)
+	}
+}
+
+// TestUpdateEnvKeys pins the multi-key .env writer behind the mode switches:
+// replaces existing keys, appends missing ones, and preserves CRLF line
+// endings (a Windows-edited .env must never be rewritten mixed-EOL).
+func TestUpdateEnvKeys(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=true\r\nAUTH_TOKENS=tok-a\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := updateEnvKeys([]envUpdate{
+		{Key: "AUTH_TOKENS", Value: ""},
+		{Key: "HYBRID_MODE", Value: "false"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "SAFE_MODE=true\r\nAUTH_TOKENS=\r\nHYBRID_MODE=false\r\n"
+	if string(got) != want {
+		t.Errorf(".env after update = %q, want %q", got, want)
+	}
+	assertNoTmpFiles(t, ".", ".env")
+
+	// Flip HYBRID_MODE back to true: in-place replace, no duplicate line.
+	if _, err := updateEnvKeys([]envUpdate{{Key: "HYBRID_MODE", Value: "true"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(got), "HYBRID_MODE=") != 1 || !strings.Contains(string(got), "HYBRID_MODE=true") {
+		t.Errorf(".env after flip = %q, want single HYBRID_MODE=true line", got)
 	}
 }
 

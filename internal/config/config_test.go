@@ -17,7 +17,7 @@ var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "HTTP_PROXY",
 	"SOCKS5_PROXY", "SOCKS5_PROXIES", "COST_MODE", "TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
-	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES", "AUTO_DISCOVER_TOKEN",
+	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES", "AUTO_DISCOVER_TOKEN",
 	"TRANSIENT_RETRIES", "ADMIN_TOKEN",
 }
 
@@ -67,6 +67,12 @@ func TestDefaults(t *testing.T) {
 	}
 	if !cfg.SafeMode {
 		t.Error("SafeMode = false, want true (default)")
+	}
+	if cfg.HybridMode {
+		t.Error("HybridMode = true, want false (default)")
+	}
+	if got := cfg.EffectiveMode(); got != "pooled" {
+		t.Errorf("EffectiveMode = %q, want pooled", got)
 	}
 	if cfg.LogFile != "" {
 		t.Errorf("LogFile = %q, want empty", cfg.LogFile)
@@ -511,6 +517,9 @@ func TestValidate(t *testing.T) {
 		{"zero request timeout", func(c *Config) { c.RequestTimeout = 0 }},
 		{"zero session timeout", func(c *Config) { c.SessionCallTimeout = 0 }},
 		{"zero registry refresh", func(c *Config) { c.RegistryRefresh = 0 }},
+		{"bad cost mode", func(c *Config) { c.CostMode = "Free" }},
+		{"bad proxy rotation", func(c *Config) { c.ProxyRotation = "round robin" }},
+		{"negative max messages", func(c *Config) { c.MaxMessagesPerDay = -1 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -520,6 +529,100 @@ func TestValidate(t *testing.T) {
 				t.Error("Validate succeeded, want error")
 			}
 		})
+	}
+}
+
+// TestValidateModeKnobs pins the accepted values for the routing knobs that
+// otherwise silently change behavior (a COST_MODE typo routes requests as
+// PAID → 402; an unknown PROXY_ROTATION silently falls back).
+func TestValidateModeKnobs(t *testing.T) {
+	good := Config{
+		ListenAddr:         ":3457",
+		UpstreamBaseURL:    "https://www.codebuff.com",
+		AuthTokens:         []string{"tok"},
+		RotationInterval:   6 * time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 30 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+	}
+	for _, cost := range []string{"", "free"} {
+		for _, rot := range []string{"", "per-token", "round-robin", "random"} {
+			for _, mmd := range []int{0, 1} {
+				c := good
+				c.CostMode, c.ProxyRotation, c.MaxMessagesPerDay = cost, rot, mmd
+				if err := c.Validate(); err != nil {
+					t.Errorf("Validate(COST_MODE=%q PROXY_ROTATION=%q MAX=%d) = %v, want nil", cost, rot, mmd, err)
+				}
+			}
+		}
+	}
+}
+
+// TestHybridMode verifies HYBRID_MODE loads from env and .env, EffectiveMode
+// reports hybrid before bridge/pooled, and Validate accepts hybrid with and
+// without AUTH_TOKENS (token-less requests 502 until a token is added, but
+// client-token requests relay like bridge).
+func TestHybridMode(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HybridMode {
+		t.Error("HybridMode = true by default, want false")
+	}
+	if got := cfg.EffectiveMode(); got != "pooled" {
+		t.Errorf("EffectiveMode = %q, want pooled", got)
+	}
+
+	// HYBRID_MODE=true via env.
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("HYBRID_MODE", "true")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load(HYBRID_MODE=true): %v", err)
+	}
+	if !cfg.HybridMode {
+		t.Error("HybridMode = false, want true (from env)")
+	}
+	if got := cfg.EffectiveMode(); got != "hybrid" {
+		t.Errorf("EffectiveMode = %q, want hybrid", got)
+	}
+
+	// Hybrid without tokens is legal; EffectiveMode still wins over bridge.
+	clearEnv(t)
+	t.Setenv("HYBRID_MODE", "true")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load(HYBRID_MODE=true, no tokens): %v", err)
+	}
+	if !cfg.BridgeMode() {
+		t.Error("BridgeMode = false, want true (no AUTH_TOKENS)")
+	}
+	if got := cfg.EffectiveMode(); got != "hybrid" {
+		t.Errorf("EffectiveMode = %q, want hybrid (hybrid beats bridge)", got)
+	}
+
+	// Validate accepts hybrid in both token configurations.
+	c := Config{
+		ListenAddr:         ":3457",
+		UpstreamBaseURL:    "https://www.codebuff.com",
+		AuthTokens:         []string{"tok"},
+		RotationInterval:   6 * time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 30 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		HybridMode:         true,
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("hybrid with tokens Validate: %v", err)
+	}
+	c.AuthTokens = nil
+	if err := c.Validate(); err != nil {
+		t.Fatalf("hybrid without tokens Validate: %v", err)
 	}
 }
 
@@ -994,6 +1097,7 @@ func TestDotenvFullKeySet(t *testing.T) {
 
 	content := strings.Join([]string{
 		"SAFE_MODE=false",
+		"HYBRID_MODE=true",
 		"REQUEST_JITTER=5s",
 		"CLI_VERSION=9.9.9",
 		"MODEL_ALIASES=gpt-4o:deepseek/deepseek-v4-flash,glm:z-ai/glm-5.2",
@@ -1010,6 +1114,9 @@ func TestDotenvFullKeySet(t *testing.T) {
 	}
 	if cfg.SafeMode {
 		t.Error("SafeMode = true, want false (from .env)")
+	}
+	if !cfg.HybridMode {
+		t.Error("HybridMode = false, want true (from .env)")
 	}
 	if cfg.RequestJitter != 5*time.Second {
 		t.Errorf("RequestJitter = %v, want 5s (from .env)", cfg.RequestJitter)
@@ -1033,10 +1140,11 @@ func TestDotenvFullKeySet(t *testing.T) {
 func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	clearEnv(t)
 
-	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\nPROXY_ROTATION=round-robin\n"), 0o644); err != nil {
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nHYBRID_MODE=true\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\nPROXY_ROTATION=round-robin\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SAFE_MODE", "true")
+	t.Setenv("HYBRID_MODE", "false")
 	t.Setenv("CLI_VERSION", "1.2.3")
 	t.Setenv("TRANSIENT_RETRIES", "5")
 	t.Setenv("PROXY_ROTATION", "random")
@@ -1047,6 +1155,9 @@ func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	}
 	if !cfg.SafeMode {
 		t.Error("SafeMode = false, want true (env wins over .env)")
+	}
+	if cfg.HybridMode {
+		t.Error("HybridMode = true, want false (env wins over .env)")
 	}
 	if cfg.CLIVersion != "1.2.3" {
 		t.Errorf("CLIVersion = %q, want 1.2.3 (env wins)", cfg.CLIVersion)

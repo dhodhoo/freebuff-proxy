@@ -5,7 +5,7 @@
     <p class="muted">live per-token session state and per-model quota</p>
   </div>
   <div class="pills">
-    <span class="pill pill-{{if .InBridge}}bridge{{else}}pool{{end}}">{{if .InBridge}}bridge{{else}}pooled{{end}}</span>
+    <span class="pill pill-{{if .InBridge}}bridge{{else if eq .Mode "hybrid"}}hybrid{{else}}pool{{end}}">{{.Mode}}</span>
     {{if .InBridge}}<span class="pill">{{.BridgeTokens}} bridge client{{if ne .BridgeTokens 1}}s{{end}}</span>{{end}}
   </div>
 </section>
@@ -23,10 +23,12 @@
 </article>
 {{else}}
 <article class="card mode-card">
-  <h2>Pooled mode — {{.TokenCount}} token(s)</h2>
+  <h2>{{if eq .Mode "hybrid"}}Hybrid mode{{else}}Pooled mode{{end}} — {{.TokenCount}} token(s)</h2>
+  {{if eq .Mode "hybrid"}}<p class="muted">Hybrid: a client-supplied token is relayed like bridge; token-less requests use the pooled tokens below.</p>{{end}}
   <p class="muted">Tokens below are live: Test/Unlock/Finish act on them immediately, and the pool persists changes to <code>.env</code> (no restart needed).</p>
   <div class="token-actions-bar">
     <button class="action-btn" hx-post="/admin/tokens/remove" hx-confirm="Remove the last token from the pool and .env?" hx-target="#token-result" hx-swap="innerHTML">Remove last token</button>
+    <button class="action-btn" hx-post="/admin/mode" hx-vals='{"mode":"hybrid"}' hx-confirm="Switch to hybrid mode? Pooled tokens stay; clients with a token relay it, token-less requests use the pool." hx-target="#token-result" hx-swap="innerHTML">Switch to hybrid mode</button>
     <button class="action-btn" hx-post="/admin/mode" hx-vals='{"mode":"bridge"}' hx-confirm="Switch to bridge mode? All pooled tokens are removed (clients then send their own token)." hx-target="#token-result" hx-swap="innerHTML">Switch to bridge mode</button>
   </div>
 </article>

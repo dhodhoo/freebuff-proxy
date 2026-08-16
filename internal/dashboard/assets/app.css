@@ -9,6 +9,7 @@
   --fp-muted: #8b93a8;
   --fp-amber: #d9a05b;     /* primary accent: warm relay amber */
   --fp-teal: #5fb8a7;      /* healthy / low risk */
+  --fp-lilac: #ac94fa;     /* hybrid mode accent */
   --fp-high: #e0a458;      /* elevated risk tier */
   --fp-red: #d97b7b;       /* critical */
   --fp-mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
@@ -124,6 +125,7 @@ footer.muted p {
 
 .pill-bridge { color: var(--fp-teal); border-color: rgba(95, 184, 167, 0.4); }
 .pill-pool   { color: var(--fp-amber); border-color: rgba(217, 160, 91, 0.4); }
+.pill-hybrid { color: var(--fp-lilac); border-color: rgba(172, 148, 250, 0.4); }
 .pill-safe   { color: var(--fp-teal); border-color: rgba(95, 184, 167, 0.4); }
 
 /* --- cards --- */

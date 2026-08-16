@@ -557,10 +557,13 @@ func TestModelsEndpoint(t *testing.T) {
 	var out struct {
 		Object string `json:"object"`
 		Data   []struct {
-			ID      string `json:"id"`
-			Object  string `json:"object"`
-			Created int64  `json:"created"`
-			OwnedBy string `json:"owned_by"`
+			ID                string `json:"id"`
+			Object            string `json:"object"`
+			Created           int64  `json:"created"`
+			OwnedBy           string `json:"owned_by"`
+			Available         bool   `json:"available"`
+			Status            string `json:"status"`
+			CurrentAccessTier string `json:"current_access_tier"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil {
@@ -578,6 +581,14 @@ func TestModelsEndpoint(t *testing.T) {
 		}
 		if m.Created != out.Data[0].Created {
 			t.Errorf("model %d created = %d, want %d (pinned to server start)", i, m.Created, out.Data[0].Created)
+		}
+		// Advisory annotation: never hide a working model, so available is
+		// true and status "unknown" when no session has reported anything.
+		if !m.Available {
+			t.Errorf("model %s available = false, want true (advisory default)", m.ID)
+		}
+		if m.Status == "" {
+			t.Errorf("model %s status empty, want a status string", m.ID)
 		}
 	}
 	if out.Data[0].Created <= 0 || out.Data[0].Created > time.Now().Unix() {
@@ -697,6 +708,103 @@ func TestHealthzQuota(t *testing.T) {
 	}
 	if len(out.Tokens[0].Entitlement) != 0 {
 		t.Errorf("top-level entitlement = %+v, want omitted (empty)", out.Tokens[0].Entitlement)
+	}
+}
+
+// TestModelsAnnotationWithQuota verifies /v1/models reflects a session that
+// admitted a model: status becomes "available" once quotaByModel mentions it,
+// and current_access_tier carries the admission's tier.
+func TestModelsAnnotationWithQuota(t *testing.T) {
+	mock := quotaMock(t)
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/v1/models", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Data []struct {
+			ID                string `json:"id"`
+			Available         bool   `json:"available"`
+			Status            string `json:"status"`
+			CurrentAccessTier string `json:"current_access_tier"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("models is not JSON: %v: %s", err, data)
+	}
+	var found *struct {
+		ID                string `json:"id"`
+		Available         bool   `json:"available"`
+		Status            string `json:"status"`
+		CurrentAccessTier string `json:"current_access_tier"`
+	}
+	for i := range out.Data {
+		if out.Data[i].ID == modelA {
+			found = &out.Data[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("model %q not in /v1/models", modelA)
+	}
+	if !found.Available {
+		t.Errorf("available = false, want true")
+	}
+	if found.Status != "available" {
+		t.Errorf("status = %q, want available (session admitted the model)", found.Status)
+	}
+	if found.CurrentAccessTier != "limited" {
+		t.Errorf("current_access_tier = %q, want limited (from session admission)", found.CurrentAccessTier)
+	}
+}
+
+// TestHealthzModeTierCountry verifies healthz surfaces the effective routing
+// mode plus the per-token tier/country from the session admission.
+func TestHealthzModeTierCountry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.AccessTier = "limited"
+	mock.CountryCode = "US"
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Mode   string `json:"mode"`
+		Tokens []struct {
+			Tier    string `json:"tier"`
+			Country string `json:"country"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if out.Mode != "pooled" {
+		t.Errorf("mode = %q, want pooled", out.Mode)
+	}
+	if len(out.Tokens) != 1 {
+		t.Fatalf("tokens = %d, want 1", len(out.Tokens))
+	}
+	if out.Tokens[0].Tier != "limited" {
+		t.Errorf("tier = %q, want limited", out.Tokens[0].Tier)
+	}
+	if out.Tokens[0].Country != "US" {
+		t.Errorf("country = %q, want US", out.Tokens[0].Country)
 	}
 }
 
@@ -1114,6 +1222,125 @@ func TestBridgeModeChat401Cooldown(t *testing.T) {
 	}
 	if got := len(mock.RecordedChatHeaders); got != 1 {
 		t.Errorf("upstream chat calls = %d, want 1 (cooldown skipped upstream)", got)
+	}
+}
+
+// TestHybridModeChatRouting verifies hybrid mode routes per request: a
+// client-supplied token is relayed upstream like bridge, and a token-less
+// request falls back to the pooled AUTH_TOKENS.
+func TestHybridModeChatRouting(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-h1", 1, `"choices":[{"index":0,"delta":{"content":"hybrid"},"finish_reason":null}]`))
+	ts, p := newTestServerCfg(t, nil, func(c *config.Config) {
+		c.HybridMode = true
+		c.UpstreamBaseURL = mock.URL() // bridge leases build clients from the pool cfg
+	}, mock)
+	_ = p
+	chatURL := ts.URL + "/v1/chat/completions"
+
+	// Client token present → bridge relay: the upstream sees the client token.
+	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer client-hybrid-1"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("token request status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "hybrid") {
+		t.Errorf("stream missing content: %s", data)
+	}
+
+	// Token-less → pooled: the upstream sees the configured pool token.
+	resp, data = doJSON(t, http.MethodPost, chatURL, chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("token-less request status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	if len(mock.RecordedChatHeaders) != 2 {
+		t.Fatalf("upstream chat calls = %d, want 2", len(mock.RecordedChatHeaders))
+	}
+	if got := mock.RecordedChatHeaders[0].Get("Authorization"); got != "Bearer client-hybrid-1" {
+		t.Errorf("token request upstream Authorization = %q, want %q", got, "Bearer client-hybrid-1")
+	}
+	if got := mock.RecordedChatHeaders[1].Get("Authorization"); got != "Bearer tok-0" {
+		t.Errorf("token-less request upstream Authorization = %q, want %q (pooled)", got, "Bearer tok-0")
+	}
+
+	// healthz reports the hybrid mode.
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if out.Mode != "hybrid" {
+		t.Errorf("mode = %q, want hybrid", out.Mode)
+	}
+}
+
+// TestHybridModeNoTokensRequiresPooledFallback verifies hybrid without any
+// AUTH_TOKENS: a client token still relays (bridge path), while a token-less
+// request fails with the pooled no-tokens error instead of the bridge 401 —
+// the mode-switch warning ("token-less requests will 502 until a token is
+// added") is what the operator sees.
+func TestHybridModeNoTokensRequiresPooledFallback(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-h2", 2, `"choices":[{"index":0,"delta":{"content":"relayed"},"finish_reason":null}]`))
+	// Mirrors newBridgeTestServer (no AUTH_TOKENS) plus HYBRID_MODE.
+	cfg := &config.Config{
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+		HybridMode:         true,
+	}
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, nil, nil, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(cfg, p, reg, nil, nil, "")
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// Client token relays fine.
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), map[string]string{"Authorization": "Bearer client-hybrid-2"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("token request status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	// Token-less request fails as pooled-no-tokens (not the bridge 401).
+	resp, data = doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("token-less hybrid status = 401, want a pooled no-tokens failure (not bridge 401): %s", data)
+	}
+	if strings.Contains(string(data), "missing_bearer_token") {
+		t.Errorf("token-less hybrid body = %s, must not claim bridge mode", data)
+	}
+}
+
+// TestBridgeModeHealthzReportsMode pins the healthz "mode" field in pure
+// bridge mode.
+func TestBridgeModeHealthzReportsMode(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newBridgeTestServer(t, mock)
+	resp, data := doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if out.Mode != "bridge" {
+		t.Errorf("mode = %q, want bridge", out.Mode)
 	}
 }
 

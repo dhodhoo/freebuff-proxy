@@ -43,6 +43,7 @@ type Config struct {
 	MaxMessagesPerDay   int               // 0 = unlimited: per-token cap on successful chats per 24h
 	IdleRotationTimeout time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
 	SafeMode            bool              // true = apply recommended anti-ban safe defaults
+	HybridMode          bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
 	RequestJitter       time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
 	CLIVersion          string            // upstream CLI version string (default: 0.10.7)
 	ModelAliases        map[string]string // map model alias -> real model ID (#25)
@@ -55,6 +56,21 @@ type Config struct {
 // client supplies their own FreeBuff token per request (Authorization: Bearer
 // or x-api-key), and the proxy relays with that token upstream.
 func (c Config) BridgeMode() bool { return len(c.AuthTokens) == 0 }
+
+// EffectiveMode reports the routing mode label for dashboards and healthz:
+// "hybrid" when HYBRID_MODE is set, "bridge" when no AUTH_TOKENS are
+// configured, else "pooled". Hybrid wins over bridge so a hybrid config with
+// zero tokens still reports hybrid (token-less requests 502 until a token is
+// added, while client-token requests relay like bridge).
+func (c Config) EffectiveMode() string {
+	if c.HybridMode {
+		return "hybrid"
+	}
+	if c.BridgeMode() {
+		return "bridge"
+	}
+	return "pooled"
+}
 
 // rawConfig mirrors the JSON file / env keys as strings so that parsing and
 // validation happen once, after all overrides are applied.
@@ -86,6 +102,7 @@ type rawConfig struct {
 	MaxMessagesPerDay   *int     `json:"MAX_MESSAGES_PER_DAY"`
 	IdleRotationTimeout string   `json:"IDLE_ROTATION_TIMEOUT"`
 	SafeMode            bool     `json:"SAFE_MODE"`
+	HybridMode          bool     `json:"HYBRID_MODE"`
 	RequestJitter       string   `json:"REQUEST_JITTER"`
 	CLIVersion          string   `json:"CLI_VERSION"`
 	ModelAliases        string   `json:"MODEL_ALIASES"`
@@ -102,9 +119,10 @@ func defaultRawConfig() rawConfig {
 		RegistryRefresh:     "6h",
 		CostMode:            "free", // free-tier mode; omission routes requests as PAID and fresh free accounts get 402 "Out of credits" (upstream check: cost_mode !== 'free' → billing)
 		MaxMessagesPerDay:   nil,
-		IdleRotationTimeout: "",   // "" = disabled (unset → SAFE_MODE preset may fill)
-		SafeMode:            true, // anti-ban presets on by default; set SAFE_MODE=false to disable
-		RequestJitter:       "",   // "" = disabled (unset → SAFE_MODE preset may fill)
+		IdleRotationTimeout: "",    // "" = disabled (unset → SAFE_MODE preset may fill)
+		SafeMode:            true,  // anti-ban presets on by default; set SAFE_MODE=false to disable
+		HybridMode:          false, // relay client tokens AND serve the pool (off by default)
+		RequestJitter:       "",    // "" = disabled (unset → SAFE_MODE preset may fill)
 		CLIVersion:          "0.10.7",
 		TransientRetries:    nil, // nil = 1 (one retry after a transient transport failure; 0 disables)
 	}
@@ -146,6 +164,7 @@ func Load(configPath string) (Config, error) {
 	overrideInt(&raw.MaxMessagesPerDay, "MAX_MESSAGES_PER_DAY")
 	overrideString(&raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
 	overrideBool(&raw.SafeMode, "SAFE_MODE")
+	overrideBool(&raw.HybridMode, "HYBRID_MODE")
 	overrideString(&raw.RequestJitter, "REQUEST_JITTER")
 	overrideString(&raw.CLIVersion, "CLI_VERSION")
 	overrideString(&raw.ModelAliases, "MODEL_ALIASES")
@@ -237,6 +256,7 @@ func Load(configPath string) (Config, error) {
 		MaxMessagesPerDay:   maxMessagesPerDay,
 		IdleRotationTimeout: idleRotationTimeout,
 		SafeMode:            raw.SafeMode,
+		HybridMode:          raw.HybridMode,
 		RequestJitter:       requestJitter,
 		CLIVersion:          strings.TrimSpace(raw.CLIVersion),
 		ModelAliases:        parseMap(raw.ModelAliases),
@@ -353,7 +373,18 @@ func (c Config) Validate() error {
 		return errors.New("REQUEST_JITTER cannot be negative")
 	case c.TransientRetries < 0:
 		return errors.New("TRANSIENT_RETRIES cannot be negative")
+	case c.CostMode != "" && c.CostMode != "free":
+		return errors.New(`COST_MODE must be "free" or unset -- any other value (e.g. a typo) routes requests as PAID and fresh free accounts get 402 "Out of credits"`)
+	case c.ProxyRotation != "" && c.ProxyRotation != "per-token" && c.ProxyRotation != "round-robin" && c.ProxyRotation != "random":
+		return fmt.Errorf("PROXY_ROTATION %q must be one of: per-token, round-robin, random", c.ProxyRotation)
+	case c.MaxMessagesPerDay < 0:
+		return errors.New("MAX_MESSAGES_PER_DAY cannot be negative")
 	}
+
+	// HYBRID_MODE deliberately has no constraint: hybrid with zero
+	// AUTH_TOKENS is legal — the dashboard warns that token-less requests
+	// will 502 until a token is added, while client-token requests relay
+	// like bridge mode.
 
 	for i, tok := range c.AuthTokens {
 		if strings.HasPrefix(strings.ToLower(tok), "bearer ") {
@@ -484,6 +515,7 @@ func applyDotenv(raw *rawConfig) error {
 	// AUTO_DISCOVER_TOKEN is intentionally env-only (it controls the .env
 	// read itself, so honoring it from .env would be circular).
 	overrideBoolFrom(&raw.SafeMode, get, "SAFE_MODE")
+	overrideBoolFrom(&raw.HybridMode, get, "HYBRID_MODE")
 	overrideStringFrom(&raw.RequestJitter, get, "REQUEST_JITTER")
 	overrideStringFrom(&raw.CLIVersion, get, "CLI_VERSION")
 	overrideStringFrom(&raw.ModelAliases, get, "MODEL_ALIASES")

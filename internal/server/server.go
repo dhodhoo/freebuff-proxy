@@ -223,11 +223,13 @@ func remoteHost(r *http.Request) string {
 // are configured the handler passes through untouched; /healthz is always
 // exempt (the caller wires it without requireAuth). Bridge mode (no
 // AUTH_TOKENS) also passes through: the Authorization header IS the upstream
-// token there, and API_KEYS is meaningless.
+// token there, and API_KEYS is meaningless. Hybrid mode passes through for
+// the same reason: a client-supplied token is relayed like bridge, while
+// token-less requests fall back to the pool.
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfg.Load()
-		if len(cfg.APIKeys) == 0 || cfg.BridgeMode() {
+		if len(cfg.APIKeys) == 0 || cfg.BridgeMode() || cfg.HybridMode {
 			next(w, r)
 			return
 		}
@@ -705,42 +707,75 @@ func readBounded(r io.Reader, n int) ([]byte, error) {
 	return buf[:got], nil
 }
 
-// updateAuthTokensEnv rewrites the AUTH_TOKENS= line in .env (appending it
-// when absent), preserving every other line. Returns the new content. The
-// existing EOL style is preserved — CRLF files stay CRLF — so a
-// Windows-edited .env is never rewritten with mixed line endings.
-func updateAuthTokensEnv(tokens []string) ([]byte, error) {
+// envUpdate is one KEY=VALUE replacement for updateEnvKeys.
+type envUpdate struct {
+	Key   string
+	Value string
+}
+
+// updateEnvKeys rewrites the given KEY=VALUE lines in .env (appending each
+// missing key), preserving every other line. The existing EOL style is
+// preserved — CRLF files stay CRLF — so a Windows-edited .env is never
+// rewritten with mixed line endings. Updates apply in order; later updates
+// to an already-replaced key win (callers keep keys distinct).
+func updateEnvKeys(updates []envUpdate) ([]byte, error) {
 	content, err := os.ReadFile(".env")
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	crlf := bytes.Contains(content, []byte("\r"))
-	line := "AUTH_TOKENS=" + strings.Join(tokens, ",")
-	raw := strings.Split(string(content), "\n")
-	lines := make([]string, 0, len(raw))
-	for _, l := range raw {
+	lines := make([]string, 0, len(content)/8)
+	for _, l := range strings.Split(string(content), "\n") {
 		lines = append(lines, strings.TrimSuffix(l, "\r"))
 	}
-	replaced := false
-	for i, l := range lines {
-		if strings.HasPrefix(strings.TrimSpace(l), "AUTH_TOKENS=") {
-			lines[i] = line
-			replaced = true
-			break
+	// A file ending with a newline has a trailing "" split element that is
+	// an artifact of that newline, not a real blank line; drop it so
+	// appended keys do not land after a spurious blank line.
+	trailingNL := len(content) > 0 && content[len(content)-1] == '\n'
+	if trailingNL {
+		if n := len(lines); n > 0 && lines[n-1] == "" {
+			lines = lines[:n-1]
 		}
 	}
-	if !replaced {
-		lines = append(lines, line)
+	for _, u := range updates {
+		line := u.Key + "=" + u.Value
+		replaced := false
+		for i, l := range lines {
+			if strings.HasPrefix(strings.TrimSpace(l), u.Key+"=") {
+				lines[i] = line
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			if n := len(lines); n == 1 && lines[0] == "" {
+				// Empty (or missing) file: the new line is the whole file.
+				lines[0] = line
+			} else {
+				lines = append(lines, line)
+			}
+		}
 	}
 	eol := "\n"
 	if crlf {
 		eol = "\r\n"
 	}
 	out := []byte(strings.Join(lines, eol))
+	if trailingNL {
+		out = append(out, eol...)
+	}
 	if err := writeFileAtomic(".env", out); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// updateAuthTokensEnv rewrites the AUTH_TOKENS= line in .env (appending it
+// when absent), preserving every other line. Returns the new content. The
+// existing EOL style is preserved — CRLF files stay CRLF — so a
+// Windows-edited .env is never rewritten with mixed line endings.
+func updateAuthTokensEnv(tokens []string) ([]byte, error) {
+	return updateEnvKeys([]envUpdate{{Key: "AUTH_TOKENS", Value: strings.Join(tokens, ",")}})
 }
 
 // syncTokensAfterMutation updates .env + reloads config after a pool token
@@ -829,16 +864,18 @@ func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
 	s.dash.RenderConfigResult(w, r, true, "Last token removed and persisted to .env.")
 }
 
-// handleModeSwitch flips between bridge and pooled mode at runtime
+// handleModeSwitch flips between bridge, pooled, and hybrid mode at runtime
 // (dashboard mode control). Pooled→bridge removes all tokens; bridge→pooled
-// requires at least one token to add (use the Add-token form first).
+// requires at least one token to add (use the Add-token form first). Hybrid
+// keeps the pooled tokens and additionally relays client-supplied tokens;
+// switching to it persists HYBRID_MODE=true in .env.
 //
 // Order matters: the .env is persisted and the config reloaded BEFORE the
 // live pool is drained, and the reload result is verified to actually be in
-// bridge mode. Otherwise a failed persist (or a higher-precedence AUTH_TOKENS
-// source such as a -config JSON file or real environment variable) would
-// empty the pool while cfg still claims pooled — leaving the proxy broken and
-// the dashboard pill showing the old mode.
+// the requested mode. Otherwise a failed persist (or a higher-precedence
+// AUTH_TOKENS/HYBRID_MODE source such as a -config JSON file or real
+// environment variable) would empty the pool while cfg still claims pooled —
+// leaving the proxy broken and the dashboard pill showing the old mode.
 func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Mode string `json:"mode"`
@@ -858,7 +895,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Load()
 	switch strings.ToLower(strings.TrimSpace(req.Mode)) {
 	case "bridge":
-		if cfg.BridgeMode() {
+		if cfg.BridgeMode() && !cfg.HybridMode {
 			s.dash.RenderConfigResult(w, r, false, "Already in bridge mode.")
 			return
 		}
@@ -869,11 +906,11 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		// verified (persist → verify → drain).
 		s.adminSaveMu.Lock()
 		defer s.adminSaveMu.Unlock()
-		// Persist AUTH_TOKENS= (explicit empty) and reload, verifying the
-		// effective config actually lands in bridge mode before touching the
-		// live pool. Roll the .env back on any failure.
+		// Persist AUTH_TOKENS= (explicit empty) + HYBRID_MODE=false and
+		// reload, verifying the effective config actually lands in bridge
+		// mode before touching the live pool. Roll the .env back on failure.
 		old, oldErr := os.ReadFile(".env")
-		if _, err := updateAuthTokensEnv(nil); err != nil {
+		if _, err := updateEnvKeys([]envUpdate{{Key: "AUTH_TOKENS", Value: ""}, {Key: "HYBRID_MODE", Value: "false"}}); err != nil {
 			s.dash.RenderConfigResult(w, r, false, "Failed to persist .env: "+err.Error())
 			return
 		}
@@ -896,13 +933,71 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("dashboard switched to bridge mode")
 		s.dash.RenderConfigResult(w, r, true, "Switched to bridge mode — AUTH_TOKENS cleared; clients now send their own token.")
 	case "pooled":
-		if !cfg.BridgeMode() {
+		if !cfg.BridgeMode() && !cfg.HybridMode {
 			s.dash.RenderConfigResult(w, r, false, "Already in pooled mode.")
 			return
 		}
-		s.dash.RenderConfigResult(w, r, false, "Pooled mode needs tokens — add one via the Add-token form first.")
+		if cfg.BridgeMode() {
+			s.dash.RenderConfigResult(w, r, false, "Pooled mode needs tokens — add one via the Add-token form first.")
+			return
+		}
+		// Hybrid → pooled: keep the tokens, just clear HYBRID_MODE.
+		s.adminSaveMu.Lock()
+		defer s.adminSaveMu.Unlock()
+		old, oldErr := os.ReadFile(".env")
+		if _, err := updateEnvKeys([]envUpdate{{Key: "HYBRID_MODE", Value: "false"}}); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to persist .env: "+err.Error())
+			return
+		}
+		newCfg, err := config.Load(s.configPath)
+		if err != nil {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Reload rejected: "+err.Error())
+			return
+		}
+		if newCfg.HybridMode {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Could not switch to pooled mode: HYBRID_MODE is still true via a -config JSON file or the environment, which overrides .env. Clear it there, then retry.")
+			return
+		}
+		s.cfg.Store(&newCfg)
+		s.logger.Info("dashboard switched to pooled mode", "auth_tokens", len(newCfg.AuthTokens))
+		s.dash.RenderConfigResult(w, r, true, "Switched to pooled mode — HYBRID_MODE cleared; all requests now use the pool.")
+	case "hybrid":
+		if cfg.HybridMode {
+			s.dash.RenderConfigResult(w, r, false, "Already in hybrid mode.")
+			return
+		}
+		// Hybrid → pooled: keep the tokens, just clear HYBRID_MODE.
+		s.adminSaveMu.Lock()
+		defer s.adminSaveMu.Unlock()
+		old, oldErr := os.ReadFile(".env")
+		if _, err := updateEnvKeys([]envUpdate{{Key: "HYBRID_MODE", Value: "true"}}); err != nil {
+			s.dash.RenderConfigResult(w, r, false, "Failed to persist .env: "+err.Error())
+			return
+		}
+		newCfg, err := config.Load(s.configPath)
+		if err != nil {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Reload rejected: "+err.Error())
+			return
+		}
+		if !newCfg.HybridMode {
+			restoreEnvFile(old, oldErr)
+			s.dash.RenderConfigResult(w, r, false, "Could not switch to hybrid mode: HYBRID_MODE is still false via a -config JSON file or the environment, which overrides .env. Set it there, then retry.")
+			return
+		}
+		s.cfg.Store(&newCfg)
+		msg := "Switched to hybrid mode — clients with a token relay it; token-less requests use the pool."
+		if len(newCfg.AuthTokens) == 0 {
+			msg += " Warning: no AUTH_TOKENS — token-less requests will fail (502) until a token is added."
+			s.logger.Warn("hybrid mode enabled without AUTH_TOKENS: token-less requests will 502 until a token is added")
+		} else {
+			s.logger.Info("dashboard switched to hybrid mode", "auth_tokens", len(newCfg.AuthTokens))
+		}
+		s.dash.RenderConfigResult(w, r, true, msg)
 	default:
-		s.dash.RenderConfigResult(w, r, false, "Mode must be 'bridge' or 'pooled'.")
+		s.dash.RenderConfigResult(w, r, false, "Mode must be 'bridge', 'pooled', or 'hybrid'.")
 	}
 }
 
@@ -923,9 +1018,12 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 	checks := []dashboard.DiagCheck{}
 
 	cfg := s.cfg.Load()
-	if cfg.BridgeMode() {
+	switch cfg.EffectiveMode() {
+	case "bridge":
 		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "Configuration: bridge mode (clients relay their own token)"})
-	} else {
+	case "hybrid":
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Configuration: hybrid mode, %d pooled token(s) (client tokens relayed; token-less requests use the pool)", len(cfg.AuthTokens))})
+	default:
 		checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Configuration: pooled mode, %d token(s)", len(cfg.AuthTokens))})
 	}
 
@@ -950,7 +1048,7 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 
 	checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Model registry: %d models", s.reg.ModelCount())})
 
-	// Per-token validity probes (pooled mode only).
+	// Per-token validity probes (pooled and hybrid-with-tokens modes).
 	if !cfg.BridgeMode() {
 		models := s.reg.Models()
 		if len(models) == 0 {
@@ -969,7 +1067,7 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Bridge mode: no tokens to probe (the smoke test uses a client token)"})
+		checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "No pooled tokens to probe (the smoke test uses a client token)."})
 	}
 
 	s.dash.RenderDiag(w, r, checks)
@@ -1132,13 +1230,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		reqAttrs = append(reqAttrs, "reasoning_effort", reasoningEffort)
 	}
 	s.logger.Info("chat request", reqAttrs...)
-	// Bridge mode (no AUTH_TOKENS): the client's Authorization header IS the
-	// upstream token. No token → 401 before touching the pool.
+	// Bridge routing: pure bridge (no AUTH_TOKENS, not hybrid) always relays
+	// the client's Authorization header as the upstream token; hybrid mode
+	// relays when a token is present and falls back to the pool otherwise.
+	// No token in pure bridge → 401 before touching the pool.
 	var up io.ReadCloser
 	var lease *pool.Lease
 	cfg := s.cfg.Load()
-	if cfg.BridgeMode() {
-		tok := clientToken(r)
+	tok := clientToken(r)
+	bridge := false
+	switch {
+	case cfg.BridgeMode() && !cfg.HybridMode:
+		// Pure bridge: the client token is the only upstream credential.
+		bridge = true
+	case cfg.HybridMode:
+		// Hybrid: a present client token is relayed like bridge.
+		bridge = tok != ""
+	}
+	if bridge {
 		if tok == "" {
 			s.writeJSONError(w, http.StatusUnauthorized,
 				"bridge mode: send your FreeBuff token as Authorization: Bearer <token> (no AUTH_TOKENS configured on the proxy)",
@@ -1447,26 +1556,75 @@ func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Read
 
 // handleModels serves the OpenAI model-list shape with the registry's
 // current models; created is pinned to server start so every entry matches.
+// Each row carries an advisory availability annotation derived from the pool
+// token snapshots (available/status/current_access_tier) so clients can
+// surface quota or lock signals without probing.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := s.started.Unix()
+	snaps := s.pool.Snapshot()
 	models := s.reg.Models()
 	data := make([]map[string]any, 0, len(models))
 	for _, id := range models {
+		available, status, tier := modelAvailability(id, snaps)
 		data = append(data, map[string]any{
-			"id":       id,
-			"object":   "model",
-			"created":  created,
-			"owned_by": "freebuff",
+			"id":                  id,
+			"object":              "model",
+			"created":             created,
+			"owned_by":            "freebuff",
+			"available":           available,
+			"status":              status,
+			"current_access_tier": tier,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 }
 
-// handleHealthz reports uptime, model count, the per-token snapshot, and
-// the cached bridge entries (bridge mode).
+// modelAvailability derives the advisory per-model annotation from the pool
+// token snapshots. The snapshot does not carry the model of a live session,
+// so the signal set is: quotaByModel presence (the session admitted this
+// model), quota exhaustion (recent >= limit), and session-level locks. The
+// result is deliberately conservative: a model is never marked unavailable
+// from snapshot data alone — available defaults to true when no signal
+// exists, so a working model is never hidden. current_access_tier is the
+// first non-empty TierAccess across the pool ("" when unknown).
+func modelAvailability(id string, snaps []pool.TokenSnapshot) (available bool, status, tier string) {
+	available = true
+	status = "unknown"
+	quotaHit := false
+	quotaExhausted := false
+	locked := false
+	for _, snap := range snaps {
+		if tier == "" {
+			tier = snap.TierAccess
+		}
+		switch snap.SessionStatus {
+		case "model_locked", "disabled":
+			locked = true
+		}
+		if q, ok := snap.QuotaByModel[id]; ok {
+			quotaHit = true
+			if q.Limit > 0 && q.RecentCount >= q.Limit {
+				quotaExhausted = true
+			}
+		}
+	}
+	switch {
+	case quotaExhausted:
+		status = "quota_exhausted"
+	case locked:
+		status = "locked"
+	case quotaHit:
+		status = "available"
+	}
+	return available, status, tier
+}
+
+// handleHealthz reports uptime, model count, the per-token snapshot, the
+// cached bridge entries (bridge mode), and the effective routing mode.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	snaps := s.pool.Snapshot()
+	cfg := s.cfg.Load()
 	w.Header().Set("Content-Type", "application/json")
 	tokens := make([]map[string]any, 0, len(snaps))
 	for _, snap := range snaps {
@@ -1483,6 +1641,8 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			"DailyLimit":           snap.DailyLimit,
 			"UsagePct":             snap.UsagePct,
 			"RiskLevel":            snap.RiskLevel,
+			"tier":                 snap.TierAccess,
+			"country":              snap.CountryCode,
 		}
 		if len(snap.QuotaByModel) > 0 {
 			quota := make(map[string]any, len(snap.QuotaByModel))
@@ -1509,6 +1669,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":         "ok",
+		"mode":           cfg.EffectiveMode(),
 		"uptime_seconds": time.Since(s.started).Seconds(),
 		"models":         s.reg.ModelCount(),
 		"tokens":         tokens,
@@ -1692,6 +1853,10 @@ func defaultHintForCode(code, message string) string {
 		return "Account suspended upstream. Token is dead; create a fresh account with an established GitHub login."
 	case code == "country_blocked" || strings.Contains(lowerMsg, "country blocked") || strings.Contains(lowerMsg, "country_blocked"):
 		return "Your egress IP is in an unsupported region. Route traffic through an allowed country (e.g. US/EU/ID/SG) or configure SOCKS5_PROXY in .env."
+	case code == "out_of_credits" || strings.Contains(lowerMsg, "out of credits"):
+		return "Upstream free-tier credits exhausted. Check COST_MODE=free in .env — a typo routes requests as PAID and fresh free accounts get 402."
+	case code == "upstream_timeout":
+		return "The upstream request exceeded its deadline. Retry, or raise REQUEST_TIMEOUT/SESSION_CALL_TIMEOUT in .env."
 	case code == "upstream_auth_rejected" || code == "invalid_api_key" || strings.Contains(lowerMsg, "invalid api key"):
 		return "Token invalid or expired. Get a fresh token by running freebuff or scripts/get-freebuff-token.sh"
 	case code == "rate_limited":
@@ -1728,6 +1893,8 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var ue *upstream.UpstreamError
 	var rle *upstream.RateLimitError
 	var be *upstream.BanError
+	var cbe *upstream.CountryBlockedError
+	var ce *upstream.CreditsError
 	switch {
 	case errors.As(err, &be):
 		status, code = http.StatusForbidden, "account_banned"
@@ -1769,6 +1936,23 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, upstream.ErrWaitingRoom):
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message = err.Error()
+	case errors.As(err, &cbe):
+		status, code = http.StatusForbidden, "country_blocked"
+		message = cbe.Error()
+	case errors.Is(err, upstream.ErrFreeModeCLIRequired):
+		status, code = http.StatusForbidden, "free_mode_cli_required"
+		message = err.Error()
+	case errors.As(err, &ce):
+		// 402 "Out of credits": surfacing the upstream body verbatim keeps
+		// the quota detail (limit/recent/reset) for the client.
+		status, code = http.StatusPaymentRequired, "out_of_credits"
+		message = ce.Body
+		if message == "" {
+			message = "out of credits"
+		}
+	case errors.Is(err, context.DeadlineExceeded):
+		status, code = http.StatusGatewayTimeout, "upstream_timeout"
+		message = "upstream request timed out: " + err.Error()
 	}
 
 	s.logger.Warn("request failed", "status", status, "code", code, "err", err)

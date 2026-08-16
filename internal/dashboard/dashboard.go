@@ -282,7 +282,8 @@ func sparklineSVG(values []float64, color, label string) template.HTML {
 // --- tokens ---
 
 type tokensData struct {
-	InBridge     bool
+	Mode         string // "bridge" | "pooled" | "hybrid"
+	InBridge     bool   // tokens page shows the bridge card only in pure bridge
 	BridgeTokens int
 	TokenCount   int
 	Tokens       []tokenDetail
@@ -313,10 +314,8 @@ type quotaRow struct {
 
 func (d *Dashboard) tokensData() tokensData {
 	cfg := d.cfg()
-	td := tokensData{BridgeTokens: d.pool.BridgeCount(), TokenCount: d.pool.TokenCount()}
-	if cfg.BridgeMode() {
-		td.InBridge = true
-	}
+	td := tokensData{BridgeTokens: d.pool.BridgeCount(), TokenCount: d.pool.TokenCount(), Mode: cfg.EffectiveMode()}
+	td.InBridge = td.Mode == "bridge"
 	for _, t := range d.pool.Snapshot() {
 		detail := tokenDetail{
 			tokenCard:       cardFromSnapshot(t),
@@ -457,6 +456,7 @@ type setupData struct {
 	KeyHint      string
 	Model        string
 	Models       []string
+	Mode         string // "bridge" | "pooled" | "hybrid"
 	Bridge       bool
 	BridgeTokens int
 	TokenCount   int
@@ -469,9 +469,11 @@ func (d *Dashboard) setupData() setupData {
 	if h, _, err := net.SplitHostPort(cfg.ListenAddr); err == nil && h != "" && h != "0.0.0.0" && h != "::" {
 		host = h
 	}
+	mode := cfg.EffectiveMode()
 	sd := setupData{
 		BaseURL:      "http://" + host + "/v1",
-		Bridge:       cfg.BridgeMode(),
+		Mode:         mode,
+		Bridge:       mode == "bridge",
 		BridgeTokens: d.pool.BridgeCount(),
 		TokenCount:   d.pool.TokenCount(),
 		Models:       d.reg.Models(),
@@ -480,9 +482,12 @@ func (d *Dashboard) setupData() setupData {
 	if len(sd.Models) > 0 {
 		sd.Model = sd.Models[0]
 	}
-	if cfg.BridgeMode() {
+	switch mode {
+	case "bridge":
 		sd.KeyHint = "your FreeBuff token (bridge mode: the client's Authorization header IS the upstream token)"
-	} else {
+	case "hybrid":
+		sd.KeyHint = "your FreeBuff token — sent when present; otherwise the proxy picks from AUTH_TOKENS (hybrid mode)"
+	default:
 		sd.KeyHint = "sk-any (pooled mode; the proxy picks from AUTH_TOKENS)"
 	}
 	return sd
@@ -596,7 +601,7 @@ func (d *Dashboard) RenderDiag(w http.ResponseWriter, r *http.Request, checks []
 // --- overview ---
 
 type overviewData struct {
-	Mode                 string // "bridge" | "pooled"
+	Mode                 string // "bridge" | "pooled" | "hybrid"
 	InBridge             bool
 	BridgeTokens         int
 	Models               []string
@@ -703,6 +708,7 @@ func (d *Dashboard) configData() configData {
 		{Key: "MAX_MESSAGES_PER_DAY", Value: strconv.Itoa(cfg.MaxMessagesPerDay)},
 		{Key: "IDLE_ROTATION_TIMEOUT", Value: cfg.IdleRotationTimeout.String()},
 		{Key: "SAFE_MODE", Value: strconv.FormatBool(cfg.SafeMode)},
+		{Key: "HYBRID_MODE", Value: strconv.FormatBool(cfg.HybridMode)},
 		{Key: "REQUEST_JITTER", Value: cfg.RequestJitter.String()},
 		{Key: "CLI_VERSION", Value: cfg.CLIVersion},
 		{Key: "MODEL_ALIASES", Value: fmt.Sprintf("%d alias(es)", len(cfg.ModelAliases)), Secret: true},
@@ -745,6 +751,7 @@ const defaultEnvTemplate = `# freebuff-proxy configuration (.env)
 #MAX_MESSAGES_PER_DAY=0
 #IDLE_ROTATION_TIMEOUT=0
 #SAFE_MODE=true
+#HYBRID_MODE=false
 #REQUEST_JITTER=0s
 #CLI_VERSION=0.10.7
 #MODEL_ALIASES=
@@ -757,8 +764,10 @@ const defaultEnvTemplate = `# freebuff-proxy configuration (.env)
 func (d *Dashboard) overviewData() overviewData {
 	cfg := d.cfg()
 	ps := d.pool.PoolSnapshot()
+	mode := cfg.EffectiveMode()
 	od := overviewData{
-		Mode:                 "pooled",
+		Mode:                 mode,
+		InBridge:             mode == "bridge",
 		Models:               d.reg.Models(),
 		ModelCount:           d.reg.ModelCount(),
 		Uptime:               time.Since(d.started).Round(time.Second).String(),
@@ -768,10 +777,6 @@ func (d *Dashboard) overviewData() overviewData {
 		TransientRetries:     ps.TransientRetries,
 		FingerprintRotations: ps.FingerprintRotations,
 		BridgeTokens:         d.pool.BridgeCount(),
-	}
-	if cfg.BridgeMode() {
-		od.Mode = "bridge"
-		od.InBridge = true
 	}
 	for _, t := range ps.Tokens {
 		od.Tokens = append(od.Tokens, cardFromSnapshot(t))
