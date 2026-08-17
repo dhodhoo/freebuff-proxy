@@ -158,6 +158,7 @@ The bash installer prompts for an install method (easy, manual binary, Docker Co
 
 ```bash
 cp .env.example .env   # then set AUTH_TOKENS
+git fetch --tags 2>/dev/null || true
 VERSION=$(git describe --tags 2>/dev/null || echo dev) docker compose up -d --build
 ```
 

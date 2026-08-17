@@ -76,6 +76,7 @@ irm https://raw.githubusercontent.com/trefeon/freebuff-proxy/main/scripts/instal
 ```bash
 cp .env.example .env
 # Edit .env and set AUTH_TOKENS=your_token
+git fetch --tags 2>/dev/null || true
 VERSION=$(git describe --tags 2>/dev/null || echo dev) docker compose up -d --build
 ```
 
