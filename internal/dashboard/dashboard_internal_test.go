@@ -12,6 +12,7 @@ import (
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/upstream"
 )
 
 // testDashboard builds a dashboard over an empty (bridge-mode) pool: enough
@@ -164,5 +165,46 @@ func TestMetricsDataRepeatedSampling(t *testing.T) {
 	}
 	if !strings.Contains(string(md.RequestsSpark), "260.0,") {
 		t.Errorf("two-point sparkline missing final point: %.60s", md.RequestsSpark)
+	}
+}
+
+// TestCardFromSnapshotStanding pins the #96 standing mapping: the upstream
+// standing block (level/label/score/nextLevelAt/nextLevel) lands on the
+// token card fields, and a nil standing block leaves HasStanding false.
+func TestCardFromSnapshotStanding(t *testing.T) {
+	at := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	card := cardFromSnapshot(pool.TokenSnapshot{
+		Token:     0,
+		RiskLevel: "low",
+		Standing: &upstream.SessionStanding{
+			Level:       "established",
+			Label:       "Established",
+			Score:       62,
+			NextLevelAt: at,
+			NextLevel:   "core",
+		},
+	})
+	if !card.HasStanding {
+		t.Fatal("HasStanding = false, want true")
+	}
+	if card.StandingLevel != "established" || card.StandingLabel != "Established" {
+		t.Errorf("level/label = %q/%q, want established/Established", card.StandingLevel, card.StandingLabel)
+	}
+	if card.StandingScore != 62 {
+		t.Errorf("score = %v, want 62", card.StandingScore)
+	}
+	if card.StandingNextLevel != "core" {
+		t.Errorf("nextLevel = %q, want core", card.StandingNextLevel)
+	}
+	if card.StandingNextLevelAt != at.Format(time.RFC3339) {
+		t.Errorf("nextLevelAt = %q, want %q", card.StandingNextLevelAt, at.Format(time.RFC3339))
+	}
+
+	card = cardFromSnapshot(pool.TokenSnapshot{Token: 1, RiskLevel: "low"})
+	if card.HasStanding {
+		t.Error("HasStanding = true without a standing block, want false")
+	}
+	if card.StandingLevel != "" || card.StandingScore != 0 {
+		t.Errorf("standing fields populated without a block: %q/%v", card.StandingLevel, card.StandingScore)
 	}
 }

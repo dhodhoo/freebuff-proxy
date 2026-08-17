@@ -55,6 +55,7 @@
     <span class="state-dot dot-{{.RiskLevel}}"></span>
     <strong class="token-name">Token {{.Index}}</strong>
     <span class="pill risk-{{.RiskLevel}}">{{.RiskLevel}}</span>
+    {{if .HasStanding}}<span class="pill standing-pill" title="Account access level (standing)">trust {{.StandingLabel}} · {{printf "%.0f" .StandingScore}}/100{{if .StandingNextLevel}} → {{.StandingNextLevel}}{{end}}</span>{{end}}
     <span class="pill">{{.SessionStatus}}</span>
     <span class="token-actions">
       {{if .CooldownActive}}<button class="action-btn" hx-post="/admin/tokens/{{.Index}}/unlock" hx-confirm="Unlock Token {{.Index}}? Only do this if you know the cooldown/ban is stale — upstream locks are usually correct." hx-target="#token-result" hx-swap="innerHTML">Unlock</button>{{end}}
@@ -70,6 +71,7 @@
     {{if gt .QueueDepth 0}}<div><dt>queue</dt><dd class="mono">{{.QueuePosition}}/{{.QueueDepth}}</dd></div>{{end}}
     {{if .CooldownActive}}<div><dt>cooldown until</dt><dd class="mono">{{.CooldownUntil}}</dd></div>{{end}}
     {{if gt .TransientRetries 0}}<div><dt>transient retries</dt><dd class="mono">{{.TransientRetries}}</dd></div>{{end}}
+    {{if and .HasStanding .StandingNextLevelAt}}<div><dt>next level at</dt><dd class="mono">{{.StandingNextLevelAt}}</dd></div>{{end}}
   </dl>
   {{if gt .DailyLimit 0}}
   <div class="usage"><div class="usage-bar" style="width: {{.UsagePct}}%"></div></div>

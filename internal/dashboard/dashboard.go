@@ -27,6 +27,7 @@ import (
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/logring"
+	"freebuff-proxy/internal/phasetiming"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 )
@@ -519,6 +520,19 @@ func cardFromSnapshot(t pool.TokenSnapshot) tokenCard {
 		card.CooldownActive = true
 		card.CooldownUntil = t.CooldownUntil.Format(time.RFC3339)
 	}
+	// Account standing (issue #96): the upstream pre-join "standing" block,
+	// surfaced next to the risk card. HasStanding keeps the template clean
+	// when the session response omitted it (feature off / compact polls).
+	if t.Standing != nil {
+		card.HasStanding = true
+		card.StandingLevel = t.Standing.Level
+		card.StandingLabel = t.Standing.Label
+		card.StandingScore = t.Standing.Score
+		card.StandingNextLevel = t.Standing.NextLevel
+		if !t.Standing.NextLevelAt.IsZero() {
+			card.StandingNextLevelAt = t.Standing.NextLevelAt.Format(time.RFC3339)
+		}
+	}
 	return card
 }
 
@@ -592,10 +606,37 @@ func (d *Dashboard) RenderTestResult(w http.ResponseWriter, r *http.Request, tok
 	})
 }
 
-// RenderSmokeResult renders the smoke-test outcome fragment.
-func (d *Dashboard) RenderSmokeResult(w http.ResponseWriter, r *http.Request, model, token string, ms int64, preview []byte) {
+// PhaseKV is one rendered latency phase (name + ms) on the smoke result.
+type PhaseKV struct {
+	Name string
+	Ms   int64
+}
+
+// PhaseList orders a phase map for rendering (acquire → session/run →
+// ttfb → total, skipping absent phases) so the smoke result and traces read
+// the phases in the order the request actually experienced them.
+func PhaseList(phases map[string]int64) []PhaseKV {
+	order := []string{
+		phasetiming.AcquireMS,
+		phasetiming.SessionRefreshMS,
+		phasetiming.RunAcquireMS,
+		phasetiming.UpstreamTTFBMS,
+		phasetiming.TotalMS,
+	}
+	out := make([]PhaseKV, 0, len(order))
+	for _, name := range order {
+		if v, ok := phases[name]; ok {
+			out = append(out, PhaseKV{Name: name, Ms: v})
+		}
+	}
+	return out
+}
+
+// RenderSmokeResult renders the smoke-test outcome fragment. phases are the
+// per-request latency phases (#89), rendered in stable order.
+func (d *Dashboard) RenderSmokeResult(w http.ResponseWriter, r *http.Request, model, token string, ms int64, preview []byte, phases []PhaseKV) {
 	d.render(w, r, "smoke_result", smokeResultData{
-		Model: model, Token: token, Ms: ms, Preview: string(preview),
+		Model: model, Token: token, Ms: ms, Preview: string(preview), Phases: phases,
 	})
 }
 
@@ -636,6 +677,15 @@ type tokenCard struct {
 	CooldownActive   bool
 	CooldownUntil    string
 	TransientRetries int64
+	// Standing (issue #96): the upstream account access level, shown next
+	// to the risk card. HasStanding is false when the session response
+	// omitted the block.
+	HasStanding         bool
+	StandingLevel       string
+	StandingLabel       string
+	StandingScore       float64
+	StandingNextLevel   string
+	StandingNextLevelAt string
 }
 
 type loginData struct {
@@ -673,6 +723,7 @@ type smokeResultData struct {
 	Token   string
 	Ms      int64
 	Preview string
+	Phases  []PhaseKV
 }
 
 // DiagCheck is one diagnostics row (mirrors -doctor's pass/warn/fail model).

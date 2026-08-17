@@ -652,12 +652,12 @@ func TestRenderSmokeResultFragment(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/admin/smoke", nil)
 	req.Header.Set("HX-Request", "true")
 	rec := httptest.NewRecorder()
-	d.RenderSmokeResult(rec, req, dashModel, "bridge", 123, []byte("preview bytes"))
+	d.RenderSmokeResult(rec, req, dashModel, "bridge", 123, []byte("preview bytes"), []dashboard.PhaseKV{{Name: "acquire_ms", Ms: 5}, {Name: "total_ms", Ms: 123}})
 	frag := rec.Body.String()
 	if strings.Contains(frag, "<html") {
 		t.Error("HX-Request smoke result rendered a full page")
 	}
-	for _, want := range []string{"Smoke test OK", dashModel, "bridge", "123ms", "preview bytes"} {
+	for _, want := range []string{"Smoke test OK", dashModel, "bridge", "123ms", "preview bytes", "acquire_ms=5ms", "total_ms=123ms"} {
 		if !strings.Contains(frag, want) {
 			t.Errorf("smoke fragment missing %q: %s", want, frag)
 		}
@@ -681,5 +681,73 @@ func TestConfigPageHTTPProxyMasked(t *testing.T) {
 	}
 	if !strings.Contains(page, "http://alice:***@proxy.internal:8080") {
 		t.Errorf("config page missing masked HTTP_PROXY in: %s", page)
+	}
+}
+
+// TestTokensPageStanding renders the #96 account-standing block end-to-end:
+// a session admission carrying the upstream "standing" field surfaces the
+// access level/label/score/next-level pill on the tokens page.
+func TestTokensPageStanding(t *testing.T) {
+	mock := testutil.NewMock()
+	t.Cleanup(mock.Close)
+	mock.Standing = map[string]any{
+		"level":       "established",
+		"label":       "Established",
+		"score":       62,
+		"nextLevelAt": "2026-08-20T12:00:00Z",
+		"nextLevel":   "core",
+	}
+	mock.ChatBody = testutil.SSEEvent(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"`+dashModel+`","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`) +
+		testutil.SSEEvent(`{"id":"c1","object":"chat.completion.chunk","created":1,"model":"`+dashModel+`","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		ListenAddr:         "127.0.0.1:3457",
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    mock.URL(),
+	}
+	client, err := upstream.New("tok-0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := session.NewManager(client)
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, []*session.Manager{sess}, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := dashboard.New(func() *config.Config { return cfg }, p, reg, nil, nil)
+
+	// Admit a real session so the standing block is cached, then render.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lease, err := p.Acquire(ctx, dashModel)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	up, err := p.Chat(ctx, lease, upstream.ChatOptions{Model: dashModel, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID},
+		[]byte(`{"model":"`+dashModel+`","messages":[{"role":"user","content":"ping"}]}`))
+	if err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, up)
+	_ = up.Close()
+	p.LeaseRelease(lease)
+
+	ts := httptest.NewServer(d.Page("tokens"))
+	t.Cleanup(ts.Close)
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	page := string(mustReadAll(t, resp))
+	for _, want := range []string{"trust Established", "62/100", "2026-08-20T12:00:00Z", "core"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("tokens page missing standing %q", want)
+		}
 	}
 }

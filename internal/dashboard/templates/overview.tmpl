@@ -45,6 +45,7 @@
       <span class="state-dot dot-{{.RiskLevel}}"></span>
       <strong class="token-name">Token {{.Index}}</strong>
       <span class="pill risk-{{.RiskLevel}}">{{.RiskLevel}}</span>
+      {{if .HasStanding}}<span class="pill standing-pill" title="Account access level (standing)">trust {{.StandingLabel}} · {{printf "%.0f" .StandingScore}}/100{{if .StandingNextLevel}} → {{.StandingNextLevel}}{{end}}</span>{{end}}
     </header>
     <dl class="kv">
       <div><dt>session</dt><dd class="mono">{{.SessionStatus}}</dd></div>

@@ -265,13 +265,23 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `CLI_VERSION` | `0.10.7` | Upstream CLI version string used in the request envelope |
 | `MODEL_ALIASES` | `""` | Map aliases to real model IDs, e.g. `gpt-4o:deepseek/deepseek-v4-flash` |
 | `TRANSIENT_RETRIES` | `1` | Max additional attempts after a transient transport failure; `0` disables |
-| `SESSION_PERSIST` | `false` | Persist session state to disk so a restart resumes an unexpired session instead of burning a new daily slot |
+| `SESSION_PERSIST` | `false` | Persist session state AND active agent runs to disk so a restart resumes them instead of re-creating (new daily slot / re-START) |
 | `SESSION_STATE_FILE` | `.freebuff-session-state.json` | Path of the session state file (used when `SESSION_PERSIST=true`; token-keyed, `0600`) |
+| `SESSION_RE_ADMIT_LEAD` | `60s` | Re-admit a session pre-emptively when less than this remains: the request rides the old session while the refresh runs in the background |
+| `SESSION_PROBE_CACHE_TTL` | `15s` | Reuse the last successful session state (skip redundant heartbeat GETs) within this window |
+| `SESSION_CREATE_MAX_PARALLEL_GLOBAL` | `128` | Cap on concurrent in-flight session admissions (wait-or-503) |
+| `SESSION_CREATE_MAX_PARALLEL_PER_MODEL` | `32` | Per-model cap on concurrent in-flight session admissions |
+| `RUN_FINISH_QUEUE_SIZE` | `64` | Bounded deferred-FINISH worker queue for rotated/drained runs |
+| `RUN_FINISH_INLINE_TIMEOUT` | `250ms` | Synchronous inline FINISH fallback bound when the finish queue is full |
+| `RUNS_DRAIN_QUEUE_CAP` | `64` | Draining-runs list cap; older entries are force-dropped (FINISH is best-effort) |
+| `RUNS_DRAIN_TTL` | `10m` | Draining-runs TTL eviction window |
 
 When `SESSION_PERSIST=true`, the state file stores a SHA-256 hash of each
-active token plus its session metadata (instance id, expiry, tier/country),
-including bridge-mode client tokens, since every session manager shares the
-one store. The raw token is never written, and the file is created with mode
+active token plus its session metadata (instance id, expiry, tier/country)
+**and its active agent runs** (run id, agent, trace session id), including
+bridge-mode client tokens, since every session manager shares the one store.
+A restart adopts the persisted session and runs without re-creating them.
+The raw token is never written, and the file is created with mode
 `0600`. Leave `SESSION_PERSIST` unset (or `false`) to opt out entirely.
 
 ### Safe Mode & Zero-Spam Quota Handling

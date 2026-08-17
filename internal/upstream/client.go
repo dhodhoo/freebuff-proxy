@@ -337,6 +337,21 @@ type SessionState struct {
 	// admission/poll response (key = model id). Absent on compact polls and
 	// pre-join (none) responses; never required.
 	RateLimitsByModel map[string]ModelQuota
+	// Standing is the upstream account standing block (issue #96), parsed
+	// from the session response's "standing" field ({level,label,score,
+	// nextLevelAt,nextLevel}); nil when the response omits it.
+	Standing *SessionStanding
+}
+
+// SessionStanding is the upstream account standing block (issue #96): the
+// pre-join/session response's "standing" field. NextLevelAt is parsed with
+// parseFlexTime; zero when the server omits it.
+type SessionStanding struct {
+	Level       string
+	Label       string
+	Score       float64
+	NextLevelAt time.Time
+	NextLevel   string
 }
 
 // ModelQuota is one model's live session quota from the upstream
@@ -363,6 +378,16 @@ type rawModelQuota struct {
 	Period               string             `json:"period"`
 	ResetAt              any                `json:"resetAt"`
 	EntitlementBreakdown map[string]float64 `json:"entitlementBreakdown"`
+}
+
+// rawStanding mirrors the session response's "standing" block (issue #96).
+// nextLevelAt is parsed with parseFlexTime.
+type rawStanding struct {
+	Level       string  `json:"level"`
+	Label       string  `json:"label"`
+	Score       float64 `json:"score"`
+	NextLevelAt any     `json:"nextLevelAt"`
+	NextLevel   string  `json:"nextLevel"`
 }
 
 // LimitedModelOffer is one model's limited-tier allowance from the upstream
@@ -982,6 +1007,83 @@ func (c *Client) FinishRun(ctx context.Context, runID string, totalSteps int) er
 	return nil
 }
 
+// StartChildRun POSTs /api/v1/agent-runs with action START for the
+// context-pruner child of parentRunID (issue #91, CLI parity:
+// reference/freebuff-reverse .../http.go createChildRun — agentId
+// "context-pruner", ancestorRunIds [parent]). The child is created after a
+// parent run is STARTed and FINISHed once the parent's session work closes,
+// so the upstream run tree stays balanced. Returns the child run id.
+func (c *Client) StartChildRun(ctx context.Context, parentRunID string) (string, error) {
+	payload, _ := json.Marshal(map[string]any{
+		"action":         "START",
+		"agentId":        "context-pruner",
+		"ancestorRunIds": []string{parentRunID},
+	})
+	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/agent-runs", payload)
+	if err != nil {
+		return "", err
+	}
+	resp, cancel, err := c.do(req, c.sessionCallTimeout)
+	if err != nil {
+		return "", err
+	}
+	defer releaseCancel(cancel)
+	defer func() { _ = resp.Body.Close() }()
+	body := drainBody(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", classifyError(resp.StatusCode, body, resp.Header)
+	}
+	var parsed struct {
+		RunID string `json:"runId"`
+	}
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		return "", fmt.Errorf("upstream: parse child START response %q: %w", truncate(body, 200), err)
+	}
+	if parsed.RunID == "" {
+		return "", fmt.Errorf("upstream: child START response missing runId: %q", truncate(body, 200))
+	}
+	return parsed.RunID, nil
+}
+
+// RecordRunStep POSTs /api/v1/agent-runs/{runID}/steps with stepNumber 2
+// accounting (issue #91, CLI parity:
+// reference/freebuff-reverse .../http.go recordRunStep). Best-effort: the
+// server fires it through the bounded finish queue and failures are logged,
+// never surfaced. messageID is the completed chat response id ("" when the
+// stream never carried one); startTime anchors the step.
+func (c *Client) RecordRunStep(ctx context.Context, runID, messageID string, startTime time.Time) error {
+	body := map[string]any{
+		"stepNumber":  2,
+		"credits":     0,
+		"childRunIds": []any{},
+		"messageId":   nil,
+		"status":      "completed",
+		"startTime":   startTime.UTC().Format(time.RFC3339Nano),
+	}
+	if messageID != "" {
+		body["messageId"] = messageID
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/agent-runs/"+runID+"/steps", payload)
+	if err != nil {
+		return err
+	}
+	resp, cancel, err := c.do(req, c.sessionCallTimeout)
+	if err != nil {
+		return err
+	}
+	defer releaseCancel(cancel)
+	defer func() { _ = resp.Body.Close() }()
+	bodyStr := drainBody(resp.Body)
+	if resp.StatusCode >= 400 {
+		return classifyError(resp.StatusCode, bodyStr, resp.Header)
+	}
+	return nil
+}
+
 // --- internals ---
 
 // sessionCall performs a session control call: parse the JSON body into a
@@ -1036,6 +1138,7 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 		GlmPromo               json.RawMessage          `json:"glmPromo"`
 		LimitedModelOffers     []rawLimitedModelOffer   `json:"limitedModelOffers"`
 		RateLimitsByModel      map[string]rawModelQuota `json:"rateLimitsByModel"`
+		Standing               *rawStanding             `json:"standing"`
 	}
 	if err := json.Unmarshal([]byte(body), &raw); err == nil && raw.Status != "" {
 		state := &SessionState{
@@ -1059,6 +1162,18 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 			AvailableHours:     raw.AvailableHours,
 			Message:            raw.Message,
 			GlmPromo:           string(raw.GlmPromo),
+		}
+		if raw.Standing != nil {
+			standing := &SessionStanding{
+				Level:     raw.Standing.Level,
+				Label:     raw.Standing.Label,
+				Score:     raw.Standing.Score,
+				NextLevel: raw.Standing.NextLevel,
+			}
+			if standing.NextLevelAt, err = parseFlexTime(raw.Standing.NextLevelAt); err != nil {
+				standing.NextLevelAt = time.Time{}
+			}
+			state.Standing = standing
 		}
 		if state.ExpiresAt, err = parseFlexTime(raw.ExpiresAt); err != nil {
 			state.ExpiresAt = time.Time{}

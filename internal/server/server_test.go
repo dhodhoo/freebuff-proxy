@@ -389,9 +389,23 @@ func TestRunInvalidRecovers(t *testing.T) {
 	if got := len(mock.StartedRuns); got != 2 {
 		t.Errorf("started runs = %d, want 2 (re-START after run-invalid)", got)
 	}
-	if got := len(mock.FinishedRuns); got != 0 {
-		t.Errorf("finished runs = %d, want 0 (invalidated run is not FINISHed)", got)
-	}
+	// Issue #91: every new parent run creates a context-pruner child run that
+	// is started and immediately FINISHed as a best-effort side effect
+	// through the bounded queue. The invalidated run-0001 contributes its
+	// child's FINISH, and the re-STARTed run-0002 contributes its child's
+	// FINISH — so exactly 2 upstream FINISH calls (child-run ids only, never
+	// a FINISH of the invalidated parent). The queue is async: poll.
+	eventually(t, "both context-pruner children FINISHed", func() bool {
+		if len(mock.FinishedRuns) != 2 {
+			return false
+		}
+		for _, f := range mock.FinishedRuns {
+			if !strings.HasPrefix(f.RunID, "child-run-") {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 func TestChatSessionInvalidBoundedRetry(t *testing.T) {

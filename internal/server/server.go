@@ -45,6 +45,7 @@ import (
 	"freebuff-proxy/internal/convert"
 	"freebuff-proxy/internal/dashboard"
 	"freebuff-proxy/internal/logring"
+	"freebuff-proxy/internal/phasetiming"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
@@ -104,6 +105,10 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.requireAuth(s.handleChat))
+	mux.HandleFunc("POST /v1/responses", s.requireAuth(s.handleResponses))
+	mux.HandleFunc("POST /v1/messages", s.requireAuth(s.handleMessages))
+	mux.HandleFunc("POST /v1/messages/count_tokens", s.requireAuth(s.handleMessagesCountTokens))
+	mux.HandleFunc("POST /v1/embeddings", s.requireAuth(s.handleEmbeddings))
 	mux.HandleFunc("GET /v1/models", s.requireAuth(s.handleModels))
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -143,10 +148,16 @@ func (s *Server) Handler() http.Handler {
 	// the strip the path is "" and a trailing-slash directory request would
 	// slip past the guard into FileServerFS, which renders a listing.
 	mux.Handle("GET /admin/assets/", noDirListing(http.StripPrefix("/admin/assets/", http.FileServerFS(mustSubFS(dashboard.AssetsFS(), "assets")))))
+	// CORS middleware wraps the whole route table: it answers OPTIONS
+	// preflights on the /v1/* API surface with 204 and stamps the allow
+	// headers on every /v1/* response. Admin routes are intentionally left
+	// untouched (cookie-authenticated dashboard; SameSite=Strict already
+	// blocks cross-site reads, and an allow-origin would add nothing there).
+	cors := s.corsMiddleware(mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		mux.ServeHTTP(sw, r)
+		cors.ServeHTTP(sw, r)
 		s.logger.Info("access",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -154,6 +165,43 @@ func (s *Server) Handler() http.Handler {
 			"ms", time.Since(start).Milliseconds(),
 			"remote", remoteHost(r),
 		)
+	})
+}
+
+// corsOrigin returns the configured Access-Control-Allow-Origin, treating an
+// empty value as the "*" default (an empty .env line must not disable CORS).
+func (s *Server) corsOrigin() string {
+	origin := strings.TrimSpace(s.cfg.Load().CORSAllowedOrigin)
+	if origin == "" {
+		return "*"
+	}
+	return origin
+}
+
+// corsMiddleware answers CORS preflights on the /v1/* API surface and stamps
+// the allow headers on /v1/* responses. An OPTIONS request for any /v1/*
+// path is answered with 204 before the route table sees it (so unknown
+// /v1/* subpaths still get a clean preflight, matching the reference
+// proxy-freebuff OPTIONS → 204). Admin routes pass through untouched.
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			h := w.Header()
+			origin := s.corsOrigin()
+			h.Set("Access-Control-Allow-Origin", origin)
+			// When the origin is pinned (not "*"), vary on Origin so caches
+			// never serve the pinned header to a different requester.
+			if origin != "*" {
+				h.Add("Vary", "Origin")
+			}
+			h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version")
+			h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -726,6 +774,18 @@ func (s *Server) handleTokenTestAll(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleEmbeddings answers POST /v1/embeddings with a structured
+// unsupported-endpoint error: the proxy serves chat completions only, and
+// the error body points clients at /v1/chat/completions and the live model
+// list so a picker/fallback client can self-correct. 400 with the
+// documented "unsupported_endpoint" code (distinct from the mux's bare 404,
+// which gives an embeddings client no actionable signal).
+func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	s.writeJSONError(w, http.StatusBadRequest,
+		"this proxy serves chat completions only; embeddings are not supported. Use POST /v1/chat/completions with one of: "+strings.Join(s.reg.Models(), ", "),
+		"unsupported_endpoint", "unsupported_endpoint", 0)
+}
+
 // smokeRequest is the dashboard smoke-test payload (a real chat through the
 // exact client path clients use).
 type smokeRequest struct {
@@ -782,6 +842,7 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
+	ctx, phases := phasetiming.WithContext(ctx)
 
 	cfg := s.cfg.Load()
 	chatBody := []byte(`{"model":` + strconv.Quote(req.Model) + `,"messages":[{"role":"user","content":` + strconv.Quote(req.Prompt) + `}],"stream":false}`)
@@ -789,6 +850,7 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 
 	var lease *pool.Lease
 	var up io.ReadCloser
+	acquireStart := time.Now()
 	if cfg.BridgeMode() {
 		if req.Token == "" {
 			s.dash.RenderConfigResult(w, r, false, "Bridge mode: include a client token in the smoke request.")
@@ -798,6 +860,7 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	} else {
 		lease, err = s.pool.Acquire(ctx, req.Model)
 	}
+	phases.Since(phasetiming.AcquireMS, acquireStart)
 	if err == nil {
 		up, err = s.pool.Chat(ctx, lease, chatOpts, chatBody)
 	}
@@ -805,6 +868,7 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 		if lease != nil {
 			s.pool.LeaseRelease(lease)
 		}
+		phases.Since(phasetiming.TotalMS, start)
 		s.logger.Warn("dashboard smoke test failed", "model", req.Model, "err", err)
 		s.dash.RenderConfigResult(w, r, false, "Smoke test failed: "+err.Error())
 		return
@@ -813,13 +877,16 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = up.Close() }()
 
 	// Read a bounded prefix of the SSE stream for the preview.
+	chatStart := time.Now()
 	preview, readErr := readBounded(up, maxSmokeBytes)
+	phases.Since(phasetiming.UpstreamTTFBMS, chatStart)
+	phases.Since(phasetiming.TotalMS, start)
 	ms := time.Since(start).Milliseconds()
 	if readErr != nil {
 		s.dash.RenderConfigResult(w, r, false, "Smoke test: upstream accepted but stream read failed: "+readErr.Error())
 		return
 	}
-	s.dash.RenderSmokeResult(w, r, req.Model, tokenLabel(lease), ms, preview)
+	s.dash.RenderSmokeResult(w, r, req.Model, tokenLabel(lease), ms, preview, dashboard.PhaseList(phases.All()))
 }
 
 // readBounded reads up to n bytes from r, tolerating an EOF mid-prefix.
@@ -1410,12 +1477,18 @@ func bearerToken(r *http.Request) string {
 
 // --- chat ---
 
-// handleChat is the OpenAI chat-completions entry point: sanitize the
-// request, acquire a token lease, call upstream with retry-once recovery,
-// then relay the forced stream to the client (SSE or accumulated JSON).
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+// --- chat ---
 
+// relayFunc relays the upstream SSE reader to the client in the endpoint's
+// wire format (chat.completion chunks, Responses events, or Anthropic
+// events). Implementations set their own headers, flush, and write terminal
+// frames. chatStart is when the upstream chat call returned; the first
+// relayed chunk records the upstream TTFB phase.
+type relayFunc func(ctx context.Context, w http.ResponseWriter, up io.Reader, stats *relayStats, chatStart time.Time)
+
+// handleChat is the OpenAI chat-completions entry point: sanitize the
+// request, then route through chatCore with the chat wire format.
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -1445,8 +1518,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := s.reg.ResolveModel(rawModel)
-	agentID, _ := s.reg.AgentForModel(model)
-	reasoningEffort := convert.ExtractReasoningEffort(raw)
 	stream := false
 	if v, ok := raw["stream"].(bool); ok {
 		stream = v
@@ -1457,21 +1528,35 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"request body must be a valid JSON object: "+err.Error(), "invalid_request_error", "invalid_json", 0)
 		return
 	}
+	var relay relayFunc
+	if stream {
+		relay = s.relayStream
+	} else {
+		relay = s.relayJSON
+	}
+	s.chatCore(w, r, model, stream, normalized, convert.ExtractReasoningEffort(raw), "chat", relay)
+}
+
+// chatCore is the shared acquire→relay core for every completion-style
+// endpoint (chat completions, Responses, Anthropic messages): acquire a
+// token lease (bridge/hybrid routing included), call upstream with
+// retry-once recovery, then relay the forced stream to the client through
+// relay. kind names the endpoint in request/done log lines.
+func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, stream bool, normalized []byte, reasoningEffort, kind string, relay relayFunc) {
+	ctx, phases := phasetiming.WithContext(r.Context())
 	start := time.Now()
 
+	agentID, _ := s.reg.AgentForModel(model)
 	reqAttrs := []any{
 		"model", model,
 		"agent", agentID,
 		"stream", stream,
 		"remote", remoteHost(r),
 	}
-	if rawModel != model {
-		reqAttrs = append(reqAttrs, "raw_model", rawModel)
-	}
 	if reasoningEffort != "" {
 		reqAttrs = append(reqAttrs, "reasoning_effort", reasoningEffort)
 	}
-	s.logger.Info("chat request", reqAttrs...)
+	s.logger.Info(kind+" request", reqAttrs...)
 	// Bridge routing: pure bridge (no AUTH_TOKENS, not hybrid) always relays
 	// the client's Authorization header as the upstream token; hybrid mode
 	// relays when a token is present and falls back to the pool otherwise.
@@ -1494,6 +1579,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// requests fall back to the pool.
 		bridge = tok != ""
 	}
+	// Acquire is timed per call; on the retry-once path the last acquire
+	// wins (that is the lease-producing one, matching the pool's
+	// per-attempt session/run phases).
+	acquireTimed := func(acquire func(context.Context, string) (*pool.Lease, error)) func(context.Context, string) (*pool.Lease, error) {
+		return func(ctx context.Context, model string) (*pool.Lease, error) {
+			acquireStart := time.Now()
+			l, err := acquire(ctx, model)
+			phases.Since(phasetiming.AcquireMS, acquireStart)
+			return l, err
+		}
+	}
+	var err error
 	if bridge {
 		if tok == "" {
 			s.writeJSONError(w, http.StatusUnauthorized,
@@ -1502,9 +1599,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		up, lease, err = s.chatAttempt(ctx, model, normalized,
-			func(ctx context.Context, model string) (*pool.Lease, error) {
+			acquireTimed(func(ctx context.Context, model string) (*pool.Lease, error) {
 				return s.pool.AcquireBridge(ctx, tok, model)
-			},
+			}),
 			s.pool.Chat,
 			s.pool.InvalidateBridgeSession,
 			s.pool.InvalidateBridgeRun,
@@ -1516,7 +1613,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		)
 	} else {
 		up, lease, err = s.chatAttempt(ctx, model, normalized,
-			func(ctx context.Context, model string) (*pool.Lease, error) { return s.pool.Acquire(ctx, model) },
+			acquireTimed(func(ctx context.Context, model string) (*pool.Lease, error) { return s.pool.Acquire(ctx, model) }),
 			s.pool.Chat,
 			func(l *pool.Lease) { s.pool.InvalidateSession(l.Token) },
 			func(l *pool.Lease, agentID string) { s.pool.InvalidateRun(l.Token, agentID) },
@@ -1530,7 +1627,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 	if err != nil {
-		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err))
+		phases.Since(phasetiming.TotalMS, start)
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err), phases.All())
 		s.writeError(w, r, err)
 		return
 	}
@@ -1548,30 +1646,39 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if reasoningEffort != "" {
 		routingAttrs = append(routingAttrs, "reasoning_effort", reasoningEffort)
 	}
-	s.logger.Info("chat routing", routingAttrs...)
+	s.logger.Info(kind+" routing", routingAttrs...)
 
-	if stream {
-		stats := &relayStats{}
-		s.relayStream(ctx, w, up, stats)
-		s.logger.Info("chat done", chatDoneAttrs(model, lease.AgentID, true, time.Since(start).Milliseconds(), stats.chunks, stats.bytes, reasoningEffort)...)
-		s.traceChat(lease, model, time.Since(start).Milliseconds(), "ok", "")
-	} else {
-		stats := &relayStats{}
-		s.relayJSON(ctx, w, up, stats)
-		s.logger.Info("chat done", chatDoneAttrs(model, lease.AgentID, false, time.Since(start).Milliseconds(), 0, stats.bytes, reasoningEffort)...)
-		s.traceChat(lease, model, time.Since(start).Milliseconds(), "ok", "")
-	}
+	chatStart := time.Now()
+	stats := &relayStats{}
+	relay(ctx, w, up, stats, chatStart)
+	phases.Since(phasetiming.TotalMS, start)
+	ms := time.Since(start).Milliseconds()
+	s.logger.Info(kind+" done", chatDoneAttrs(model, lease.AgentID, stream, ms, stats.chunks, stats.bytes, reasoningEffort)...)
+	s.traceChat(lease, model, ms, "ok", "", phases.All())
 }
 
 // traceChat records a structured "chat trace" entry for the dashboard
 // traces page (the page filters the shared log ring by msg == "chat trace").
-func (s *Server) traceChat(lease *pool.Lease, model string, ms int64, status, errClass string) {
+// phases carries the per-request latency phases (#89); the map is ordered
+// deterministically for stable log output.
+func (s *Server) traceChat(lease *pool.Lease, model string, ms int64, status, errClass string, phases map[string]int64) {
 	attrs := []any{"model", model, "status", status, "ms", ms}
 	if lease != nil {
 		attrs = append(attrs, "token", tokenLabel(lease), "agent", lease.AgentID)
 	}
 	if errClass != "" {
 		attrs = append(attrs, "error", errClass)
+	}
+	for _, name := range []string{
+		phasetiming.AcquireMS,
+		phasetiming.SessionRefreshMS,
+		phasetiming.RunAcquireMS,
+		phasetiming.UpstreamTTFBMS,
+		phasetiming.TotalMS,
+	} {
+		if v, ok := phases[name]; ok {
+			attrs = append(attrs, name, v)
+		}
 	}
 	s.logger.Info("chat trace", attrs...)
 }
@@ -1757,10 +1864,56 @@ type relayStats struct {
 	bytes  int
 }
 
+// keepaliveInterval is how long the relay may sit without relaying a data
+// chunk before it emits an SSE comment frame to hold the connection open.
+// Long upstream reasoning pauses produce no chunks, and proxies/clients may
+// treat silence as a dead connection. A var (not const) so tests can shrink
+// it.
+var keepaliveInterval = 15 * time.Second
+
+// lineChunk is one upstream SSE line or the terminal send. done is set only
+// on the clean-EOF send (a real empty line also arrives as line==nil, so the
+// terminal state must be explicit, not inferred from a nil slice).
+type lineChunk struct {
+	line []byte
+	err  error
+	done bool
+}
+
+// relayReadLoop drains r line by line onto ch, stopping when the stream
+// ends or ctx is canceled. The final send carries done (clean EOF) or the
+// terminal read error; on cancellation the goroutine exits without sending
+// (the request context cancellation closes the upstream body read, so Scan
+// returns promptly).
+func relayReadLoop(ctx context.Context, r io.Reader, ch chan<- lineChunk) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), maxStreamLine)
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		select {
+		case ch <- lineChunk{line: line}:
+		case <-ctx.Done():
+			return
+		}
+	}
+	var terminal lineChunk
+	if err := scanner.Err(); err != nil {
+		terminal = lineChunk{err: err}
+	} else {
+		terminal = lineChunk{done: true}
+	}
+	select {
+	case ch <- terminal:
+	case <-ctx.Done():
+	}
+}
+
 // relayStream forwards sanitized upstream SSE lines to the client with
-// per-chunk flushing, a [DONE] terminator, and an error chunk (then DONE)
-// when the upstream stream dies while the client context is still live.
-func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Reader, stats *relayStats) {
+// per-chunk flushing, a ": connecting" grace-flush comment, a keepalive
+// comment every keepaliveInterval of relay silence, a [DONE] terminator,
+// and an error chunk (then DONE) when the upstream stream dies while the
+// client context is still live.
+func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Reader, stats *relayStats, chatStart time.Time) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -1773,49 +1926,87 @@ func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Re
 	}
 	w.WriteHeader(http.StatusOK)
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), maxStreamLine)
-	for scanner.Scan() {
-		if ctx.Err() != nil {
+	// The official CLI client treats a ": connecting" comment as the signal
+	// that headers have flushed and the stream is live (grace flush): write
+	// it before relaying anything so a client-side timeout can never fire
+	// during a long upstream admission pause. Comment frames are ignored by
+	// SSE parsers.
+	_, _ = io.WriteString(w, ": connecting\n\n")
+	flusher.Flush()
+
+	keepalive := time.NewTicker(keepaliveInterval)
+	defer keepalive.Stop()
+
+	lines := make(chan lineChunk)
+	go relayReadLoop(ctx, r, lines)
+
+	relayed := time.Now()
+	first := true
+	for {
+		select {
+		case <-ctx.Done():
 			return
-		}
-		clean, drop := convert.SanitizeChunk(scanner.Bytes())
-		if drop {
-			continue
-		}
-		frame := convert.EncodeSSE(clean)
-		if _, err := w.Write(frame); err != nil {
-			s.logger.Debug("stream write failed", "err", err)
-			return
-		}
-		stats.chunks++
-		stats.bytes += len(frame)
-		flusher.Flush()
-	}
-	if err := scanner.Err(); err != nil {
-		if ctx.Err() == nil {
-			s.logger.Warn("upstream stream error", "err", err)
-			_, _ = w.Write(convert.ErrorChunk("upstream_stream_error", ""))
-			_, _ = w.Write(convert.DONE)
+		case <-keepalive.C:
+			if time.Since(relayed) >= keepaliveInterval {
+				_, _ = io.WriteString(w, ": keepalive\n\n")
+				relayed = time.Now()
+				flusher.Flush()
+			}
+		case lc := <-lines:
+			if lc.err != nil {
+				if ctx.Err() == nil {
+					s.logger.Warn("upstream stream error", "err", lc.err)
+					_, _ = w.Write(convert.ErrorChunk("upstream stream interrupted: "+lc.err.Error(), "upstream_stream_error"))
+					_, _ = w.Write(convert.DONE)
+					flusher.Flush()
+				}
+				return
+			}
+			if lc.done {
+				// Clean end of stream (EOF is not a scanner error).
+				_, _ = w.Write(convert.DONE)
+				flusher.Flush()
+				return
+			}
+			clean, drop := convert.SanitizeChunk(lc.line)
+			if drop {
+				// Non-chunk lines (upstream comments) still prove liveness.
+				relayed = time.Now()
+				continue
+			}
+			if first {
+				first = false
+				phasetiming.FromContext(ctx).Since(phasetiming.UpstreamTTFBMS, chatStart)
+			}
+			frame := convert.EncodeSSE(clean)
+			if _, err := w.Write(frame); err != nil {
+				s.logger.Debug("stream write failed", "err", err)
+				return
+			}
+			stats.chunks++
+			stats.bytes += len(frame)
+			relayed = time.Now()
 			flusher.Flush()
 		}
-		return
 	}
-	_, _ = w.Write(convert.DONE)
-	flusher.Flush()
 }
 
 // relayJSON drains the upstream SSE stream through the accumulator and
 // writes one chat.completion JSON response. On any decode or stream error
 // nothing is written and a 502 is returned (the client asked for a single
 // response; a partial one would be worse than none).
-func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Reader, stats *relayStats) {
+func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Reader, stats *relayStats, chatStart time.Time) {
 	acc := convert.NewAccumulator()
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), maxStreamLine)
+	first := true
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return
+		}
+		if first {
+			first = false
+			phasetiming.FromContext(ctx).Since(phasetiming.UpstreamTTFBMS, chatStart)
 		}
 		if err := acc.Add(scanner.Bytes()); err != nil {
 			s.writeJSONError(w, http.StatusBadGateway,

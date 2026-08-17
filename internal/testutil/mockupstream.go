@@ -23,6 +23,21 @@ type FinishedRun struct {
 	TotalSteps int    `json:"totalSteps"`
 }
 
+// StartRequest records one agent-runs START payload (issue #91).
+type StartRequest struct {
+	AgentID        string   `json:"agentId"`
+	AncestorRunIDs []string `json:"ancestorRunIds"`
+}
+
+// RecordedStep records one /api/v1/agent-runs/{runID}/steps payload
+// (issue #91).
+type RecordedStep struct {
+	RunID      string `json:"-"`
+	StepNumber int    `json:"stepNumber"`
+	MessageID  string `json:"messageId"`
+	Status     string `json:"status"`
+}
+
 // MockUpstream is a scriptable codebuff.com stand-in.
 type MockUpstream struct {
 	srv *httptest.Server
@@ -54,9 +69,28 @@ type MockUpstream struct {
 	CountryCode        string
 	CountryBlockReason string
 
+	// Standing, when non-empty, is embedded in the session create/poll
+	// response body's "standing" key (issue #96) so dashboard e2e tests can
+	// exercise the account-standing data chain end-to-end.
+	Standing map[string]any
+
 	// RunIDs is the queue of run ids returned by agent-runs START.
 	RunIDs []string
 	runIdx int
+
+	// ChildRunIDs is the queue of run ids returned by context-pruner START
+	// (issue #91); defaults to child-run-NNNN when empty.
+	ChildRunIDs []string
+	childRunIdx int
+	// ChildRunsStarted records the parent run ids of context-pruner STARTs
+	// (issue #91, locked accessor ChildRunsStartedSnapshot).
+	ChildRunsStarted []string
+	// StartRequests records every agent-runs START payload (agentId +
+	// ancestorRunIds) so tests can assert the run-tree wiring.
+	StartRequests []StartRequest
+
+	// RecordedSteps records /steps POST payloads (issue #91).
+	RecordedSteps []RecordedStep
 
 	ChatStatus    int    // 200 by default
 	ChatBody      string // SSE body served on 200
@@ -196,6 +230,8 @@ func (m *MockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.URL.Path == "/api/v1/agent-runs" && r.Method == http.MethodPost:
 		m.handleAgentRuns(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/v1/agent-runs/") && strings.HasSuffix(r.URL.Path, "/steps") && r.Method == http.MethodPost:
+		m.handleSteps(w, r)
 	case r.URL.Path == "/api/v1/chat/completions" && r.Method == http.MethodPost:
 		m.handleChat(w, r)
 	default:
@@ -238,6 +274,7 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 	instanceID, expiresIn := m.InstanceID, m.ExpiresIn
 	limits := m.RateLimitsByModel
 	tier, countryCode, countryBlockReason := m.AccessTier, m.CountryCode, m.CountryBlockReason
+	standing := m.Standing
 	m.mu.Unlock()
 
 	switch mode {
@@ -261,6 +298,9 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 		}
 		if countryBlockReason != "" {
 			body["countryBlockReason"] = countryBlockReason
+		}
+		if len(standing) > 0 {
+			body["standing"] = standing
 		}
 		writeJSON(w, 200, body)
 	case "queued":
@@ -338,26 +378,46 @@ func (m *MockUpstream) handleProbe(w http.ResponseWriter) {
 func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var payload struct {
-		Action  string `json:"action"`
-		AgentID string `json:"agentId"`
-		RunID   string `json:"runId"`
-		Status  string `json:"status"`
-		Steps   int    `json:"totalSteps"`
+		Action         string   `json:"action"`
+		AgentID        string   `json:"agentId"`
+		RunID          string   `json:"runId"`
+		Status         string   `json:"status"`
+		Steps          int      `json:"totalSteps"`
+		AncestorRunIDs []string `json:"ancestorRunIds"`
 	}
 	_ = json.Unmarshal(body, &payload)
 
 	switch payload.Action {
 	case "START":
 		m.mu.Lock()
-		idx := m.runIdx
-		if idx >= len(m.RunIDs) {
-			m.mu.Unlock()
-			writeJSON(w, 500, map[string]any{"error": "no mock run ids left"})
-			return
+		m.StartRequests = append(m.StartRequests, StartRequest{
+			AgentID:        payload.AgentID,
+			AncestorRunIDs: append([]string(nil), payload.AncestorRunIDs...),
+		})
+		var runID string
+		if payload.AgentID == "context-pruner" {
+			// Issue #91: the context-pruner child of a parent run gets its
+			// own id queue (parent + child ids must not alias).
+			idx := m.childRunIdx
+			m.childRunIdx++
+			m.ChildRunsStarted = append(m.ChildRunsStarted, firstOf(payload.AncestorRunIDs))
+			if idx >= len(m.ChildRunIDs) {
+				m.mu.Unlock()
+				writeJSON(w, 200, map[string]any{"runId": fmt.Sprintf("child-run-%04d", idx+1)})
+				return
+			}
+			runID = m.ChildRunIDs[idx]
+		} else {
+			idx := m.runIdx
+			if idx >= len(m.RunIDs) {
+				m.mu.Unlock()
+				writeJSON(w, 500, map[string]any{"error": "no mock run ids left"})
+				return
+			}
+			m.runIdx++
+			runID = m.RunIDs[idx]
+			m.StartedRuns = append(m.StartedRuns, payload.AgentID)
 		}
-		m.runIdx++
-		runID := m.RunIDs[idx]
-		m.StartedRuns = append(m.StartedRuns, payload.AgentID)
 		m.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"runId": runID})
 	case "FINISH":
@@ -391,6 +451,64 @@ func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, 400, map[string]any{"error": "unknown action " + payload.Action})
 	}
+}
+
+// handleSteps records a /api/v1/agent-runs/{runID}/steps POST (issue #91).
+func (m *MockUpstream) handleSteps(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	var payload struct {
+		StepNumber int    `json:"stepNumber"`
+		MessageID  string `json:"messageId"`
+		Status     string `json:"status"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	runID := stepsRunID(r.URL.Path)
+	m.mu.Lock()
+	m.RecordedSteps = append(m.RecordedSteps, RecordedStep{
+		RunID:      runID,
+		StepNumber: payload.StepNumber,
+		MessageID:  payload.MessageID,
+		Status:     payload.Status,
+	})
+	m.mu.Unlock()
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// stepsRunID extracts the run id from /api/v1/agent-runs/{id}/steps.
+func stepsRunID(path string) string {
+	trimmed := strings.TrimPrefix(path, "/api/v1/agent-runs/")
+	trimmed = strings.TrimSuffix(trimmed, "/steps")
+	return trimmed
+}
+
+// firstOf returns the first element, or "" for an empty slice.
+func firstOf(s []string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	return s[0]
+}
+
+// StepsSnapshot returns a locked copy of the recorded /steps payloads.
+func (m *MockUpstream) StepsSnapshot() []RecordedStep {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]RecordedStep(nil), m.RecordedSteps...)
+}
+
+// StartRequestsSnapshot returns a locked copy of the START payloads.
+func (m *MockUpstream) StartRequestsSnapshot() []StartRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]StartRequest(nil), m.StartRequests...)
+}
+
+// ChildRunsStartedSnapshot returns a locked copy of the context-pruner
+// parent ids.
+func (m *MockUpstream) ChildRunsStartedSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.ChildRunsStarted...)
 }
 
 func (m *MockUpstream) handleChat(w http.ResponseWriter, r *http.Request) {
