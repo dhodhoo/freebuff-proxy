@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"freebuff-proxy/internal/config"
 )
@@ -562,4 +563,135 @@ func contains(values []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Issue #93 — jsDelivr mirrors + fallback ordering.
+// ---------------------------------------------------------------------------
+
+// TestMirrorForURLConstruction pins the jsDelivr mirror URL construction:
+// every default raw source has a matching mirror, and non-raw URLs (SetSources
+// overrides) are never mirrored.
+func TestMirrorForURLConstruction(t *testing.T) {
+	for _, f := range sourceFiles {
+		raw := RawBase + f
+		want := JsDelivrBase + f
+		if got := mirrorFor(raw); got != want {
+			t.Errorf("mirrorFor(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	if got := mirrorFor(JsDelivrBase + "free-agents.ts"); got != "" {
+		t.Errorf("mirrorFor(jsDelivr URL) = %q, want \"\" (no double mirror)", got)
+	}
+	if got := mirrorFor("file:///x.ts"); got != "" {
+		t.Errorf("mirrorFor(override) = %q, want \"\"", got)
+	}
+}
+
+// TestSourceCandidatesMirrorOrdering pins the per-file URL lists Refresh
+// tries: default sources are [raw, jsDelivr] pairs (mirror after primary),
+// while SetSources overrides are single-URL entries used as-is.
+func TestSourceCandidatesMirrorOrdering(t *testing.T) {
+	r := New(nil, nil)
+	cands := r.sourceCandidates()
+	if len(cands) != len(sourceFiles) {
+		t.Fatalf("candidates = %d, want %d source files", len(cands), len(sourceFiles))
+	}
+	for i, f := range sourceFiles {
+		want := []string{RawBase + f, JsDelivrBase + f}
+		if !reflect.DeepEqual(cands[i], want) {
+			t.Errorf("candidates[%d] = %v, want %v", i, cands[i], want)
+		}
+	}
+
+	r.SetSources([]string{"file:///custom", "http://example/x.ts"})
+	cands = r.sourceCandidates()
+	want := [][]string{{"file:///custom"}, {"http://example/x.ts"}}
+	if !reflect.DeepEqual(cands, want) {
+		t.Errorf("override candidates = %v, want %v", cands, want)
+	}
+}
+
+// TestFetchSourceFallbackOrdering verifies fetchSource tries candidate URLs
+// in order and stops at the first success: a failing primary falls through to
+// the mirror (the attempted list records both), while a successful primary
+// never triggers the fallback.
+func TestFetchSourceFallbackOrdering(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/raw":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case "/mirror":
+			_, _ = io.WriteString(w, "export const MIRROR_CONTENT = 'm/mirror'")
+		case "/ok":
+			_, _ = io.WriteString(w, "export const OK_CONTENT = 'm/ok'")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Primary fails, mirror succeeds: mirror content wins, both URLs recorded.
+	text, attempted, err := fetchSource(ctx, client, []string{srv.URL + "/raw", srv.URL + "/mirror"})
+	if err != nil {
+		t.Fatalf("fetchSource(raw→mirror): %v", err)
+	}
+	if !strings.Contains(text, "MIRROR_CONTENT") {
+		t.Errorf("text = %q, want mirror content", text)
+	}
+	wantAttempted := []string{srv.URL + "/raw", srv.URL + "/mirror"}
+	if !reflect.DeepEqual(attempted, wantAttempted) {
+		t.Errorf("attempted = %v, want %v", attempted, wantAttempted)
+	}
+
+	// All candidates fail: error returned, every URL recorded.
+	_, attempted, err = fetchSource(ctx, client, []string{srv.URL + "/raw", srv.URL + "/missing"})
+	if err == nil {
+		t.Fatal("fetchSource with all-failing candidates succeeded, want error")
+	}
+	if len(attempted) != 2 {
+		t.Errorf("attempted on total failure = %v, want both URLs", attempted)
+	}
+
+	// Primary succeeds: the mirror is never attempted.
+	text, attempted, err = fetchSource(ctx, client, []string{srv.URL + "/ok", srv.URL + "/mirror"})
+	if err != nil {
+		t.Fatalf("fetchSource(ok→mirror): %v", err)
+	}
+	if !strings.Contains(text, "OK_CONTENT") {
+		t.Errorf("text = %q, want primary content", text)
+	}
+	if !reflect.DeepEqual(attempted, []string{srv.URL + "/ok"}) {
+		t.Errorf("attempted = %v, want only the primary URL (no fallback)", attempted)
+	}
+}
+
+// TestLastAttemptedSources verifies the -doctor helper: every URL tried in
+// the most recent Refresh is recorded, including after failures.
+func TestLastAttemptedSources(t *testing.T) {
+	r := New(nil, nil)
+	if got := r.LastAttemptedSources(); got != nil {
+		t.Fatalf("fresh registry LastAttemptedSources = %v, want nil", got)
+	}
+
+	missing := fileSource(t, filepath.Join("testdata", "does-not-exist.ts"))
+	r.SetSources([]string{missing})
+	if err := r.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh against missing source succeeded, want error")
+	}
+	if got := r.LastAttemptedSources(); !reflect.DeepEqual(got, []string{missing}) {
+		t.Errorf("LastAttemptedSources after failed refresh = %v, want [%s]", got, missing)
+	}
+
+	// A successful refresh records the sources it actually tried.
+	fixture := fileSource(t, filepath.Join("testdata", "registry-fixture.ts"))
+	r.SetSources([]string{fixture})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got := r.LastAttemptedSources(); !reflect.DeepEqual(got, []string{fixture}) {
+		t.Errorf("LastAttemptedSources after successful refresh = %v, want [%s]", got, fixture)
+	}
 }

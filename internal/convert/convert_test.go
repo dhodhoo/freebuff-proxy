@@ -166,13 +166,17 @@ func TestNormalizeRequestToolSchemas(t *testing.T) {
 			},
 		},
 		{
-			name: "ref with siblings not resolved, definitions dropped",
+			// Issue #95 (inlineLocalSchemaRefs): a $ref WITH siblings is
+			// resolved against the schema root and the siblings are merged
+			// over the target (JS {...resolved, ...siblings}); definitions is
+			// dropped.
+			name: "ref with siblings resolved against root, siblings merged",
 			params: map[string]any{
 				"$ref":        "#/definitions/Args",
 				"description": "d",
 				"definitions": map[string]any{"Args": map[string]any{"type": "object"}},
 			},
-			want: map[string]any{"$ref": "#/definitions/Args", "description": "d"},
+			want: map[string]any{"description": "d", "type": "object"},
 		},
 		{
 			name: "dollar defs ref resolved",
@@ -944,7 +948,8 @@ func TestExtractReasoningEffort(t *testing.T) {
 }
 
 func TestNormalizeRequestReasoningEffort(t *testing.T) {
-	// Nested reasoning: { "effort": "max" } normalizes to reasoning_effort: "max"
+	// DeepSeek models (#101): nested reasoning.effort "max" is clamped (#65)
+	// and translated into the thinking block, replacing reasoning_effort.
 	body := map[string]any{
 		"model":     "deepseek/deepseek-v4-flash",
 		"messages":  []any{map[string]any{"role": "user", "content": "hello"}},
@@ -955,8 +960,37 @@ func TestNormalizeRequestReasoningEffort(t *testing.T) {
 		t.Fatalf("NormalizeRequest: %v", err)
 	}
 	got := decode(t, out)
+	if _, ok := got["reasoning_effort"]; ok {
+		t.Errorf("reasoning_effort kept for deepseek model: %v", got["reasoning_effort"])
+	}
+	thinking, ok := got["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinking block missing for deepseek model: %v", got)
+	}
+	if thinking["type"] != "enabled" {
+		t.Errorf("thinking.type = %v, want enabled", thinking["type"])
+	}
+	if thinking["reasoning_effort"] != "max" {
+		t.Errorf("thinking.reasoning_effort = %v, want max", thinking["reasoning_effort"])
+	}
+
+	// Non-DeepSeek models keep reasoning_effort (clamped to the model's
+	// allowance when the model has one).
+	body = map[string]any{
+		"model":            "openai/gpt-5.6-luna",
+		"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
+		"reasoning_effort": "max",
+	}
+	out, err = NormalizeRequest(mustJSON(t, body), "")
+	if err != nil {
+		t.Fatalf("NormalizeRequest: %v", err)
+	}
+	got = decode(t, out)
 	if gotEff, ok := got["reasoning_effort"].(string); !ok || gotEff != "max" {
 		t.Errorf("reasoning_effort = %v, want \"max\"", got["reasoning_effort"])
+	}
+	if _, ok := got["thinking"]; ok {
+		t.Error("thinking block added for non-deepseek model")
 	}
 }
 
@@ -1203,4 +1237,876 @@ func TestNormalizeRequestNonMapToolsEndTurn(t *testing.T) {
 			t.Errorf("end_turn appears %d times, want exactly 1: %v", count, tools)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Issue #63 — SSE fast path, sync.Pool reuse, benchmarks.
+// ---------------------------------------------------------------------------
+
+// TestSanitizeChunkFastPath pins the zero-allocation fast path: a chunk that
+// already satisfies every sanitize invariant is relayed verbatim (the
+// returned bytes alias the input payload — no re-encode), while a chunk
+// needing defaults still takes the full sanitize path.
+func TestSanitizeChunkFastPath(t *testing.T) {
+	payload := `{"id":"c1","object":"chat.completion.chunk","created":5,"model":"m","system_fingerprint":"fp","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null,"logprobs":{"a":1}}]}`
+	line := []byte("data: " + payload)
+
+	out, drop := SanitizeChunk(line)
+	if drop || out == nil {
+		t.Fatal("canonical chunk dropped")
+	}
+	// The fast path emits the raw payload byte-for-byte (skipping the
+	// sanitize-map + marshal round trip).
+	if string(out) != payload {
+		t.Fatalf("fast path did not return the raw payload:\n got: %s\nwant: %s", out, payload)
+	}
+	got := decode(t, out)
+	if got["id"] != "c1" || got["object"] != "chat.completion.chunk" || got["created"] != float64(5) || got["model"] != "m" {
+		t.Fatalf("passthrough fields mangled: %v", got)
+	}
+	choice := got["choices"].([]any)[0].(map[string]any)
+	if choice["index"] != float64(0) || choice["finish_reason"] != nil || choice["logprobs"] == nil {
+		t.Fatalf("choice fields mangled: %v", choice)
+	}
+
+	// A chunk needing defaults still takes the sanitize path.
+	out, drop = SanitizeChunk([]byte(`data: {"choices":[{"delta":{"content":"hi"}}]}`))
+	if drop || out == nil {
+		t.Fatal("chunk dropped")
+	}
+	got = decode(t, out)
+	if id, _ := got["id"].(string); !strings.HasPrefix(id, "chatcmpl-") {
+		t.Fatalf("id = %v, want chatcmpl- prefix (sanitize path ran)", got["id"])
+	}
+
+	// A number that saturates int64 (1e20) is integral but does not
+	// round-trip through numInt64: it must take the sanitize path (the exact
+	// saturated output is platform-dependent) rather than the fast path
+	// relaying the raw 1e20.
+	out, drop = SanitizeChunk([]byte(`{"id":"c1","object":"chat.completion.chunk","created":1e20,"model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`))
+	if drop || out == nil {
+		t.Fatal("chunk dropped")
+	}
+	got = decode(t, out)
+	if c, ok := got["created"].(float64); !ok || c == 1e20 {
+		t.Errorf("created = %v, want sanitize-path output (fast path must not relay 1e20)", got["created"])
+	}
+}
+
+func BenchmarkSanitizeChunkFastPath(b *testing.B) {
+	line := []byte(`data: {"id":"c1","object":"chat.completion.chunk","created":5,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out, drop := SanitizeChunk(line)
+		if drop || out == nil {
+			b.Fatal("canonical chunk dropped")
+		}
+		_ = out
+	}
+}
+
+func BenchmarkSanitizeChunkSanitizePath(b *testing.B) {
+	line := []byte(`data: {"choices":[{"delta":{"content":"hi"}}]}`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out, drop := SanitizeChunk(line)
+		if drop || out == nil {
+			b.Fatal("chunk dropped")
+		}
+		_ = out
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #67/#95 — tool-schema cache + $ref inlining.
+// ---------------------------------------------------------------------------
+
+// TestSchemaCacheHitAndMiss verifies the normalized-schema cache: the second
+// normalization of the same raw schema is a hit returning a deep clone, and
+// mutating the returned map never corrupts the cached entry.
+func TestSchemaCacheHitAndMiss(t *testing.T) {
+	resetSchemaCache()
+	t.Cleanup(resetSchemaCache)
+
+	params := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"a": map[string]any{"type": []any{"string", "null"}}},
+	}
+	budget := maxSchemaNodes
+	first := normalizeToolSchemaCached(params, &budget)
+	if hits, misses := schemaCacheStats(); hits != 0 || misses != 1 {
+		t.Fatalf("after first normalize: hits=%d misses=%d, want 0/1", hits, misses)
+	}
+
+	budget2 := maxSchemaNodes
+	second := normalizeToolSchemaCached(params, &budget2)
+	if hits, misses := schemaCacheStats(); hits != 1 || misses != 1 {
+		t.Fatalf("after second normalize: hits=%d misses=%d, want 1/1", hits, misses)
+	}
+	assertJSONEq(t, mustJSON(t, second), map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"a": map[string]any{"type": "string"}},
+	})
+
+	// A cache hit returns a clone: mutating it must not poison the cache.
+	second["type"] = "mutated"
+	budget3 := maxSchemaNodes
+	third := normalizeToolSchemaCached(params, &budget3)
+	if third["type"] == "mutated" {
+		t.Error("cached value aliased by caller mutation")
+	}
+	if first["type"] == "mutated" {
+		t.Error("first-call result aliases the cache entry")
+	}
+}
+
+// TestInlineLocalSchemaRefs pins the #95 $ref inlining: "#/..." JSON pointers
+// resolve against the schema root (including deep pointers and refs with
+// siblings, merged over the target), and $defs/definitions are stripped.
+func TestInlineLocalSchemaRefs(t *testing.T) {
+	params := map[string]any{
+		"$defs": map[string]any{
+			"Args": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"x":      map[string]any{"type": "integer"},
+					"nested": map[string]any{"$ref": "#/$defs/Inner"},
+				},
+			},
+			"Inner": map[string]any{"type": "string"},
+		},
+		"type": "object",
+		"properties": map[string]any{
+			"args": map[string]any{"$ref": "#/$defs/Args", "description": "the args"},
+		},
+	}
+	body := map[string]any{
+		"model":    "m",
+		"messages": []any{},
+		"tools": []any{map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": "f", "parameters": params},
+		}},
+	}
+	out, err := NormalizeRequest(mustJSON(t, body), "")
+	if err != nil {
+		t.Fatalf("NormalizeRequest: %v", err)
+	}
+	got := decode(t, out)
+	fn := got["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	assertJSONEq(t, mustJSON(t, fn["parameters"]), map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"args": map[string]any{
+				"type":        "object",
+				"description": "the args",
+				"properties": map[string]any{
+					"x":      map[string]any{"type": "integer"},
+					"nested": map[string]any{"type": "string"},
+				},
+			},
+		},
+	})
+}
+
+// TestSchemaRefCycleGuard pins the #95 cycle guard: a $ref that re-enters a
+// ref already on the current descent path resolves to {} instead of looping.
+func TestSchemaRefCycleGuard(t *testing.T) {
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"a": map[string]any{"$ref": "#/$defs/A"},
+		},
+		"$defs": map[string]any{
+			"A": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"b": map[string]any{"$ref": "#/$defs/A"}},
+			},
+		},
+	}
+	body := map[string]any{
+		"model":    "m",
+		"messages": []any{},
+		"tools": []any{map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": "f", "parameters": params},
+		}},
+	}
+	out, err := NormalizeRequest(mustJSON(t, body), "")
+	if err != nil {
+		t.Fatalf("NormalizeRequest: %v", err)
+	}
+	got := decode(t, out)
+	fn := got["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	assertJSONEq(t, mustJSON(t, fn["parameters"]), map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"a": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"b": map[string]any{}},
+			},
+		},
+	})
+}
+
+// TestSchemaUnresolvableRefSiblings pins #95's unresolvable-ref handling: a
+// bare unresolvable ref is kept (existing behavior), while the remaining
+// siblings of an unresolvable ref are still visited.
+func TestSchemaUnresolvableRefSiblings(t *testing.T) {
+	cases := []struct {
+		name   string
+		params map[string]any
+		want   any
+	}{
+		{
+			name:   "bare unresolvable ref kept",
+			params: map[string]any{"$ref": "#/definitions/Missing"},
+			want:   map[string]any{"$ref": "#/definitions/Missing"},
+		},
+		{
+			name:   "unresolvable ref with siblings keeps siblings",
+			params: map[string]any{"$ref": "#/definitions/Missing", "description": "d"},
+			want:   map[string]any{"description": "d"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]any{
+				"model":    "m",
+				"messages": []any{},
+				"tools": []any{map[string]any{
+					"type":     "function",
+					"function": map[string]any{"name": "f", "parameters": tc.params},
+				}},
+			}
+			out, err := NormalizeRequest(mustJSON(t, body), "")
+			if err != nil {
+				t.Fatalf("NormalizeRequest: %v", err)
+			}
+			got := decode(t, out)
+			fn := got["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+			assertJSONEq(t, mustJSON(t, fn["parameters"]), tc.want)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #84 — DeepSeek prompt-cache cache_control injection.
+// ---------------------------------------------------------------------------
+
+func TestInjectCacheControl(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "system", "content": "sys"},
+		map[string]any{"role": "user", "content": "u1"},
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "u2"},
+			map[string]any{"type": "text", "text": "u3", "cache_control": map[string]any{"type": "existing"}},
+		}},
+		map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "u4"}}},
+		map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "u5"}}},
+		map[string]any{"role": "user", "content": "plain string"}, // non-block content skipped
+	}
+	InjectCacheControl(messages)
+
+	blocks := func(i int) []any {
+		return messages[i].(map[string]any)["content"].([]any)
+	}
+	// Indices 2 and 3 (the stable context prefix) get ephemeral hints.
+	if cc := blocks(2)[0].(map[string]any)["cache_control"]; cc == nil {
+		t.Error("messages[2] block 0 missing cache_control")
+	}
+	if cc := blocks(2)[1].(map[string]any)["cache_control"].(map[string]any); cc["type"] != "existing" {
+		t.Errorf("messages[2] block 1 cache_control overwritten: %v", cc)
+	}
+	if cc := blocks(3)[0].(map[string]any)["cache_control"]; cc == nil {
+		t.Error("messages[3] block 0 missing cache_control")
+	}
+	// Everything outside indices 2-3 is untouched.
+	if _, ok := messages[0].(map[string]any)["cache_control"]; ok {
+		t.Error("messages[0] gained cache_control")
+	}
+	if _, ok := messages[1].(map[string]any)["cache_control"]; ok {
+		t.Error("messages[1] gained cache_control")
+	}
+	if cc := blocks(4)[0].(map[string]any)["cache_control"]; cc != nil {
+		t.Error("messages[4] gained cache_control (beyond the prefix window)")
+	}
+	if got := messages[5].(map[string]any)["content"]; got != "plain string" {
+		t.Errorf("non-block content touched: %v", got)
+	}
+}
+
+func TestNormalizeRequestCacheControlInjection(t *testing.T) {
+	mkBody := func(model string) map[string]any {
+		content := func(text string) []any {
+			return []any{map[string]any{"type": "text", "text": text}}
+		}
+		return map[string]any{
+			"model": model,
+			"messages": []any{
+				map[string]any{"role": "system", "content": "sys"},
+				map[string]any{"role": "user", "content": "u1"},
+				map[string]any{"role": "user", "content": content("u2")},
+				map[string]any{"role": "user", "content": content("u3")},
+			},
+		}
+	}
+	hasHints := func(out []byte) bool {
+		got := decode(t, out)
+		for i, m := range got["messages"].([]any) {
+			if i < 2 || i > 3 {
+				continue
+			}
+			blocks, _ := m.(map[string]any)["content"].([]any)
+			for _, b := range blocks {
+				if _, ok := b.(map[string]any)["cache_control"]; ok {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	t.Run("default on for deepseek", func(t *testing.T) {
+		t.Setenv("CACHE_CONTROL_INJECTION", "")
+		out, err := NormalizeRequest(mustJSON(t, mkBody("deepseek/deepseek-v4-flash")), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		if !hasHints(out) {
+			t.Error("deepseek request without cache_control hints")
+		}
+	})
+
+	t.Run("disabled via env", func(t *testing.T) {
+		t.Setenv("CACHE_CONTROL_INJECTION", "false")
+		out, err := NormalizeRequest(mustJSON(t, mkBody("deepseek/deepseek-v4-flash")), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		if hasHints(out) {
+			t.Error("cache_control injected with CACHE_CONTROL_INJECTION=false")
+		}
+	})
+
+	t.Run("non-deepseek model untouched", func(t *testing.T) {
+		t.Setenv("CACHE_CONTROL_INJECTION", "")
+		out, err := NormalizeRequest(mustJSON(t, mkBody("minimax/minimax-m3")), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		if hasHints(out) {
+			t.Error("cache_control injected for non-deepseek model")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Issue #101 — DeepSeek thinking-block translation.
+// ---------------------------------------------------------------------------
+
+func TestDeepSeekThinkingTranslation(t *testing.T) {
+	cases := []struct {
+		name     string
+		model    string
+		effort   string
+		wantType string
+		wantEff  string
+	}{
+		{"flash low maps to high", "deepseek/deepseek-v4-flash", "low", "enabled", "high"},
+		{"flash medium clamps down to low then high", "deepseek/deepseek-v4-flash", "medium", "enabled", "high"},
+		{"flash high stays high", "deepseek/deepseek-v4-flash", "high", "enabled", "high"},
+		{"flash max stays max", "deepseek/deepseek-v4-flash", "max", "enabled", "max"},
+		{"flash xhigh clamps down to high", "deepseek/deepseek-v4-flash", "xhigh", "enabled", "high"},
+		{"pro low clamps up to high", "deepseek/deepseek-v4-pro", "low", "enabled", "high"},
+		{"pro max stays max", "deepseek/deepseek-v4-pro", "max", "enabled", "max"},
+		{"bare model id tolerated", "deepseek-v4-flash", "max", "enabled", "max"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]any{
+				"model":            tc.model,
+				"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
+				"reasoning_effort": tc.effort,
+			}
+			out, err := NormalizeRequest(mustJSON(t, body), "")
+			if err != nil {
+				t.Fatalf("NormalizeRequest: %v", err)
+			}
+			got := decode(t, out)
+			if _, ok := got["reasoning_effort"]; ok {
+				t.Errorf("reasoning_effort kept for deepseek model: %v", got["reasoning_effort"])
+			}
+			thinking, ok := got["thinking"].(map[string]any)
+			if !ok {
+				t.Fatalf("thinking block missing: %v", got)
+			}
+			if thinking["type"] != tc.wantType {
+				t.Errorf("thinking.type = %v, want %q", thinking["type"], tc.wantType)
+			}
+			if thinking["reasoning_effort"] != tc.wantEff {
+				t.Errorf("thinking.reasoning_effort = %v, want %q", thinking["reasoning_effort"], tc.wantEff)
+			}
+		})
+	}
+
+	t.Run("reasoning.enabled=false disables thinking", func(t *testing.T) {
+		body := map[string]any{
+			"model":     "deepseek/deepseek-v4-flash",
+			"messages":  []any{map[string]any{"role": "user", "content": "hi"}},
+			"reasoning": map[string]any{"enabled": false},
+		}
+		out, err := NormalizeRequest(mustJSON(t, body), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		got := decode(t, out)
+		thinking, ok := got["thinking"].(map[string]any)
+		if !ok {
+			t.Fatalf("thinking block missing: %v", got)
+		}
+		if thinking["type"] != "disabled" {
+			t.Errorf("thinking.type = %v, want disabled", thinking["type"])
+		}
+		if _, hasEff := thinking["reasoning_effort"]; hasEff {
+			t.Errorf("disabled thinking carries an effort: %v", thinking)
+		}
+		if _, ok := got["reasoning_effort"]; ok {
+			t.Error("reasoning_effort kept alongside disabled thinking")
+		}
+	})
+
+	t.Run("no effort requested adds no thinking", func(t *testing.T) {
+		body := map[string]any{
+			"model":    "deepseek/deepseek-v4-flash",
+			"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		}
+		out, err := NormalizeRequest(mustJSON(t, body), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		got := decode(t, out)
+		if _, ok := got["thinking"]; ok {
+			t.Errorf("thinking block added without an effort request: %v", got["thinking"])
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Issue #65 — per-model reasoning effort clamping.
+// ---------------------------------------------------------------------------
+
+func TestClampReasoningEffort(t *testing.T) {
+	cases := []struct {
+		name      string
+		requested string
+		allowed   []string
+		want      string
+	}{
+		{"max within allowance", "max", []string{"low", "high", "max"}, "max"},
+		{"high within allowance", "high", []string{"low", "high", "max"}, "high"},
+		{"medium clamps down to low", "medium", []string{"low", "high", "max"}, "low"},
+		{"all above requested gives lowest", "low", []string{"high", "max"}, "high"},
+		{"below everything gives lowest", "minimal", []string{"low", "high", "max"}, "low"},
+		{"unknown effort falls back", "banana", []string{"low", "high", "max"}, defaultReasoningEffort},
+		{"empty requested falls back", "", []string{"low"}, defaultReasoningEffort},
+		{"nil allowance falls back", "high", nil, defaultReasoningEffort},
+		{"empty allowance falls back", "high", []string{}, defaultReasoningEffort},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clampReasoningEffort(tc.requested, tc.allowed, defaultReasoningEffort); got != tc.want {
+				t.Errorf("clampReasoningEffort(%q, %v) = %q, want %q", tc.requested, tc.allowed, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEffortsForModel(t *testing.T) {
+	if got := effortsForModel("deepseek/deepseek-v4-flash"); !reflect.DeepEqual(got, []string{"low", "high", "max"}) {
+		t.Errorf("flash efforts = %v", got)
+	}
+	if got := effortsForModel("deepseek/deepseek-v4-pro"); !reflect.DeepEqual(got, []string{"high", "max"}) {
+		t.Errorf("pro efforts = %v", got)
+	}
+	// Unlisted models get the full ladder (no clamping).
+	if got := effortsForModel("minimax/minimax-m3"); !reflect.DeepEqual(got, reasoningLadder[:]) {
+		t.Errorf("unlisted efforts = %v, want full ladder", got)
+	}
+
+	// Runtime override (registry data when present), nil → hardcoded table.
+	SetModelEffortLookup(func(model string) []string {
+		if model == "custom/model" {
+			return []string{"low"}
+		}
+		return nil
+	})
+	t.Cleanup(func() { SetModelEffortLookup(nil) })
+	if got := effortsForModel("custom/model"); !reflect.DeepEqual(got, []string{"low"}) {
+		t.Errorf("overridden efforts = %v, want [low]", got)
+	}
+	if got := effortsForModel("deepseek/deepseek-v4-flash"); !reflect.DeepEqual(got, []string{"low", "high", "max"}) {
+		t.Errorf("nil override must fall back to the table, got %v", got)
+	}
+}
+
+func TestNormalizeRequestEffortClamp(t *testing.T) {
+	effortFor := func(model, effort string) string {
+		body := map[string]any{
+			"model":            model,
+			"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
+			"reasoning_effort": effort,
+		}
+		out, err := NormalizeRequest(mustJSON(t, body), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		return decode(t, out)["reasoning_effort"].(string)
+	}
+
+	// gpt-5.6-luna tops out at max: xhigh clamps down to high.
+	if got := effortFor("openai/gpt-5.6-luna", "xhigh"); got != "high" {
+		t.Errorf("gpt-5.6-luna xhigh = %q, want high", got)
+	}
+	// Unlisted models pass every rung through.
+	if got := effortFor("minimax/minimax-m3", "ultra"); got != "ultra" {
+		t.Errorf("minimax-m3 ultra = %q, want ultra", got)
+	}
+	// Unrecognized effort falls back to the default.
+	if got := effortFor("openai/gpt-5.6-luna", "banana"); got != defaultReasoningEffort {
+		t.Errorf("unknown effort = %q, want %q", got, defaultReasoningEffort)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #44 — reasoning folded into delta.content for legacy clients.
+// ---------------------------------------------------------------------------
+
+func TestReasoningInContent(t *testing.T) {
+	canonical := `{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"","reasoning_content":"think step"},"finish_reason":null}]}`
+	deltaOf := func(out []byte) map[string]any {
+		got := decode(t, out)
+		return got["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
+	}
+
+	t.Run("default off", func(t *testing.T) {
+		t.Setenv("REASONING_IN_CONTENT", "")
+		out, drop := SanitizeChunk([]byte(canonical))
+		if drop || out == nil {
+			t.Fatal("chunk dropped")
+		}
+		delta := deltaOf(out)
+		if delta["content"] != "" {
+			t.Errorf("content = %v, want empty (no fold when off)", delta["content"])
+		}
+		if delta["reasoning_content"] != "think step" {
+			t.Errorf("reasoning_content = %v, want preserved", delta["reasoning_content"])
+		}
+	})
+
+	t.Run("enabled folds into content", func(t *testing.T) {
+		t.Setenv("REASONING_IN_CONTENT", "true")
+		out, drop := SanitizeChunk([]byte(canonical))
+		if drop || out == nil {
+			t.Fatal("chunk dropped")
+		}
+		delta := deltaOf(out)
+		if delta["content"] != "<think>think step</think>" {
+			t.Errorf("content = %v, want folded think text", delta["content"])
+		}
+		if delta["reasoning_content"] != "think step" {
+			t.Errorf("reasoning_content = %v, want preserved alongside the fold", delta["reasoning_content"])
+		}
+	})
+
+	t.Run("custom tag label", func(t *testing.T) {
+		t.Setenv("REASONING_IN_CONTENT", "thinking")
+		out, drop := SanitizeChunk([]byte(canonical))
+		if drop || out == nil {
+			t.Fatal("chunk dropped")
+		}
+		if c := deltaOf(out)["content"]; c != "<thinking>think step</thinking>" {
+			t.Errorf("content = %v, want the custom tag label", c)
+		}
+	})
+
+	t.Run("fold precedes existing text", func(t *testing.T) {
+		t.Setenv("REASONING_IN_CONTENT", "true")
+		line := `{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"answer","reasoning_content":"r"},"finish_reason":null}]}`
+		out, drop := SanitizeChunk([]byte(line))
+		if drop || out == nil {
+			t.Fatal("chunk dropped")
+		}
+		if c := deltaOf(out)["content"]; c != "<think>r</think>answer" {
+			t.Errorf("content = %v, want reasoning before text", c)
+		}
+	})
+
+	t.Run("reasoning_details never folded", func(t *testing.T) {
+		t.Setenv("REASONING_IN_CONTENT", "true")
+		line := `{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"","reasoning_content":"r","reasoning_details":[{"type":"signature","value":"sig"}]},"finish_reason":null}]}`
+		out, drop := SanitizeChunk([]byte(line))
+		if drop || out == nil {
+			t.Fatal("chunk dropped")
+		}
+		delta := deltaOf(out)
+		if c := delta["content"]; c != "<think>r</think>" {
+			t.Errorf("content = %v, want folded", c)
+		}
+		details, ok := delta["reasoning_details"].([]any)
+		if !ok || len(details) != 1 {
+			t.Fatalf("reasoning_details not replayed verbatim: %v", delta["reasoning_details"])
+		}
+		if d := details[0].(map[string]any); d["type"] != "signature" || d["value"] != "sig" {
+			t.Errorf("reasoning_details mangled: %v", details)
+		}
+	})
+}
+
+func TestAccumulatorReasoningInContent(t *testing.T) {
+	t.Setenv("REASONING_IN_CONTENT", "true")
+	a := NewAccumulator()
+	for _, line := range []string{
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"Hel","reasoning_content":"think "}}]}`,
+		`{"id":"c1","choices":[{"index":0,"delta":{"content":"lo","reasoning_content":"more"},"finish_reason":"stop"}]}`,
+	} {
+		if err := a.Add([]byte(line)); err != nil {
+			t.Fatalf("Add(%q): %v", line, err)
+		}
+	}
+	out := decode(t, a.Finish())
+	msg := out["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "<think>think more</think>Hello" {
+		t.Errorf("content = %v, want folded reasoning before text", msg["content"])
+	}
+	if msg["reasoning_content"] != "think more" {
+		t.Errorf("reasoning_content = %v, want preserved", msg["reasoning_content"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #58 — optional prompt & context compression.
+// ---------------------------------------------------------------------------
+
+func TestCompressMessages(t *testing.T) {
+	shrinkBudget := func(t *testing.T, keepLast int) {
+		t.Helper()
+		old := compressKeepLast
+		compressKeepLast = keepLast
+		t.Cleanup(func() { compressKeepLast = old })
+	}
+	msg := func(role, content string) map[string]any {
+		return map[string]any{"role": role, "content": content}
+	}
+
+	t.Run("budget enforcement with marker", func(t *testing.T) {
+		shrinkBudget(t, 4)
+		msgs := []any{
+			msg("system", "sys"),
+			msg("user", "u1"),
+			msg("assistant", "a1"),
+			msg("user", "u2"),
+			msg("assistant", "a2"),
+			msg("user", "u3"),
+			msg("assistant", "a3"),
+			msg("user", "u4"),
+		}
+		got, dropped := compressMessages(msgs)
+		if dropped != 3 {
+			t.Fatalf("dropped = %d, want 3 (u1, a1, u2)", dropped)
+		}
+		// 8 messages - 3 dropped + 1 marker = 6.
+		if len(got) != 6 {
+			t.Fatalf("len = %d, want 6", len(got))
+		}
+		marker := got[1].(map[string]any)
+		if marker["role"] != "system" {
+			t.Errorf("marker role = %v, want system", marker["role"])
+		}
+		if marker["content"] != "[truncated by freebuff-proxy compression; 3 earlier messages omitted]" {
+			t.Errorf("marker content = %v", marker["content"])
+		}
+		// The trailing window (last 4 messages) is preserved verbatim.
+		for i, want := range []string{"a2", "u3", "a3", "u4"} {
+			if got[2+i].(map[string]any)["content"] != want {
+				t.Errorf("trailing message %d = %v, want %q", i, got[2+i], want)
+			}
+		}
+	})
+
+	t.Run("tool messages never dropped", func(t *testing.T) {
+		shrinkBudget(t, 4)
+		toolMsg := msg("tool", "result")
+		assistantCall := map[string]any{
+			"role":       "assistant",
+			"content":    "",
+			"tool_calls": []any{map[string]any{"id": "call_1", "type": "function"}},
+		}
+		msgs := []any{
+			msg("system", "sys"),
+			msg("user", "u1"),
+			assistantCall,
+			toolMsg,
+			msg("user", "u2"),
+			msg("assistant", "a1"),
+			msg("user", "u3"),
+		}
+		got, dropped := compressMessages(msgs)
+		if dropped != 1 {
+			t.Fatalf("dropped = %d, want 1 (only u1; tool call/result survive)", dropped)
+		}
+		seenCall, seenTool := false, false
+		for _, m := range got {
+			mm, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, has := mm["tool_calls"]; has {
+				seenCall = true
+			}
+			if mm["role"] == "tool" {
+				seenTool = true
+			}
+		}
+		if !seenCall || !seenTool {
+			t.Errorf("tool call/result lost: seenCall=%v seenTool=%v", seenCall, seenTool)
+		}
+		// The tool result's content is never truncated.
+		if got[len(got)-1].(map[string]any)["role"] == "tool" {
+			t.Error("last message should be the user's current turn")
+		}
+	})
+
+	t.Run("last message never dropped or truncated", func(t *testing.T) {
+		shrinkBudget(t, 3)
+		long := strings.Repeat("x", 4096)
+		msgs := []any{
+			msg("system", "sys"),
+			msg("user", "u1"),
+			msg("assistant", "a1"),
+			msg("user", long),
+			msg("user", long),
+		}
+		got, _ := compressMessages(msgs)
+		last := got[len(got)-1].(map[string]any)
+		if last["content"] != long {
+			t.Error("last (current) message was truncated")
+		}
+	})
+
+	t.Run("content cap with marker", func(t *testing.T) {
+		shrinkBudget(t, 10) // no middle drops; capping still applies
+		oldBytes := compressMaxContentBytes
+		compressMaxContentBytes = 16
+		t.Cleanup(func() { compressMaxContentBytes = oldBytes })
+
+		long := strings.Repeat("x", 100)
+		msgs := []any{
+			msg("system", "sys"),
+			msg("user", long),
+			msg("user", long), // the last message: never truncated
+		}
+		got, dropped := compressMessages(msgs)
+		if dropped != 0 {
+			t.Fatalf("dropped = %d, want 0", dropped)
+		}
+		capped := got[1].(map[string]any)["content"].(string)
+		if !strings.HasPrefix(capped, "xxxxxxxx") || !strings.HasSuffix(capped, compressContentMarker) {
+			t.Errorf("capped content = %q, want prefix + marker", capped)
+		}
+		if len(capped) >= 100 {
+			t.Errorf("capped content not truncated: len %d", len(capped))
+		}
+		if got[2].(map[string]any)["content"] != long {
+			t.Error("last message truncated")
+		}
+	})
+
+	t.Run("short conversation untouched", func(t *testing.T) {
+		shrinkBudget(t, 4)
+		msgs := []any{msg("system", "sys"), msg("user", "u1"), msg("assistant", "a1")}
+		got, dropped := compressMessages(msgs)
+		if dropped != 0 || len(got) != len(msgs) {
+			t.Fatalf("short conversation changed: dropped=%d len=%d", dropped, len(got))
+		}
+		for i := range msgs {
+			if got[i].(map[string]any)["content"] != msgs[i].(map[string]any)["content"] {
+				t.Errorf("message %d not identical", i)
+			}
+		}
+	})
+}
+
+func TestNormalizeRequestCompression(t *testing.T) {
+	old := compressKeepLast
+	compressKeepLast = 4
+	t.Cleanup(func() { compressKeepLast = old })
+
+	body := map[string]any{
+		"model":    "m",
+		"messages": []any{},
+	}
+	for i := 0; i < 8; i++ {
+		role := "user"
+		if i%2 == 0 {
+			role = "assistant"
+		}
+		body["messages"] = append(body["messages"].([]any),
+			map[string]any{"role": role, "content": fmt.Sprintf("msg-%d", i)})
+	}
+
+	t.Setenv("COMPRESS_PROMPT", "true")
+	out, err := NormalizeRequest(mustJSON(t, body), "")
+	if err != nil {
+		t.Fatalf("NormalizeRequest: %v", err)
+	}
+	got := decode(t, out)
+	msgs := got["messages"].([]any)
+	// keepLast=4 with 8 messages: indices 0-3 are all plain user/assistant
+	// turns (the first message is NOT the system prompt, so it is droppable)
+	// → 4 dropped, replaced by one marker: 8 - 4 + 1 = 5.
+	if len(msgs) != 5 {
+		t.Fatalf("compressed messages = %d, want 5 (8 - 4 dropped + 1 marker)", len(msgs))
+	}
+	if !strings.Contains(msgs[0].(map[string]any)["content"].(string), "4 earlier messages omitted") {
+		t.Errorf("marker missing: %v", msgs[0])
+	}
+
+	t.Setenv("COMPRESS_PROMPT", "false")
+	out, err = NormalizeRequest(mustJSON(t, body), "")
+	if err != nil {
+		t.Fatalf("NormalizeRequest: %v", err)
+	}
+	if got := decode(t, out); len(got["messages"].([]any)) != 8 {
+		t.Errorf("COMPRESS_PROMPT=false still compressed: %d messages", len(got["messages"].([]any)))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #63/#67 — benchmark for the tool-schema normalization cache.
+// ---------------------------------------------------------------------------
+
+func BenchmarkNormalizeToolSchema(b *testing.B) {
+	params := map[string]any{
+		"$defs": map[string]any{
+			"Args": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"x":      map[string]any{"type": "integer"},
+					"nested": map[string]any{"$ref": "#/$defs/Inner"},
+				},
+			},
+			"Inner": map[string]any{"type": "string"},
+		},
+		"type": "object",
+		"properties": map[string]any{
+			"args": map[string]any{"$ref": "#/$defs/Args", "description": "the args"},
+		},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		budget := maxSchemaNodes
+		_ = normalizeToolSchemaCached(params, &budget)
+	}
 }

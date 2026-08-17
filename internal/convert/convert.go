@@ -13,11 +13,16 @@ package convert
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -96,6 +101,180 @@ func ExtractReasoningEffort(payload map[string]any) string {
 	return ""
 }
 
+// ---------------------------------------------------------------------------
+// Reasoning effort normalization (issue #65 clamp + #101 DeepSeek thinking).
+// Ported from freebuff/common/src/constants/reasoning-effort.ts
+// (clampReasoningEffort) and codebuff-fork/web/src/llm-api/
+// deepseek-request-body.ts (toDeepSeekReasoningEffort / thinking block).
+// ---------------------------------------------------------------------------
+
+// reasoningLadder is the one reasoning-effort vocabulary, strictly ascending.
+// Its ORDER is load-bearing: clamping does index arithmetic on it.
+var reasoningLadder = [...]string{"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+
+// defaultReasoningEffort is used when a request asks for an effort that is
+// not on the ladder (mirrors DEFAULT_REASONING_EFFORT = 'high').
+const defaultReasoningEffort = "high"
+
+// modelReasoningEfforts is the per-model effort allowance, mirroring
+// freebuff2api-workers/worker.js MODEL_EFFORTS and freebuff-models.ts:
+// deepseek-v4-flash exposes [low, high, max] (no medium), deepseek-v4-pro
+// [high, max], gpt-5.6-luna low..max, muse-spark low..xhigh. Models absent
+// from the table get the full ladder (no clamping). The table is refreshable
+// at runtime via SetModelEffortLookup.
+var modelReasoningEfforts = map[string][]string{
+	"deepseek/deepseek-v4-flash":      {"low", "high", "max"},
+	"deepseek/deepseek-v4-pro":        {"high", "max"},
+	"openai/gpt-5.6-luna":             {"low", "medium", "high", "max"},
+	"meta/muse-spark-1.2-contributor": {"low", "medium", "high", "xhigh"},
+}
+
+// modelEffortLookup, when set, overrides modelReasoningEfforts for the model
+// in question. Main wires this to registry data when the registry exposes
+// per-model effort arrays; the hardcoded table is the fallback.
+var modelEffortLookup atomic.Pointer[func(string) []string]
+
+// SetModelEffortLookup installs a per-model effort lookup used by the
+// reasoning clamp. The function receives a model id and returns the allowed
+// effort rungs (ascending ladder order), or nil to fall back to the
+// hardcoded table. Passing nil removes the override.
+func SetModelEffortLookup(fn func(string) []string) {
+	if fn == nil {
+		modelEffortLookup.Store(nil)
+		return
+	}
+	modelEffortLookup.Store(&fn)
+}
+
+// effortsForModel returns the allowed effort rungs for a model: the override
+// lookup when it answers, else the hardcoded table (with the full ladder for
+// unlisted models).
+func effortsForModel(model string) []string {
+	if p := modelEffortLookup.Load(); p != nil {
+		if allowed := (*p)(model); allowed != nil {
+			return allowed
+		}
+	}
+	if allowed, ok := modelReasoningEfforts[model]; ok {
+		return allowed
+	}
+	return reasoningLadder[:]
+}
+
+// reasoningRank returns the position of effort on the ladder, or -1 when the
+// effort is not a rung.
+func reasoningRank(effort string) int {
+	for i, rung := range reasoningLadder {
+		if rung == effort {
+			return i
+		}
+	}
+	return -1
+}
+
+// clampReasoningEffort clamps requested DOWN to the nearest allowed rung no
+// higher than requested (official clampReasoningEffort semantics): when every
+// allowed rung is above what was asked for, the lowest allowed rung wins;
+// when requested is absent or unrecognized, fallback wins. It never rejects
+// and never changes the model.
+func clampReasoningEffort(requested string, allowed []string, fallback string) string {
+	if len(allowed) == 0 {
+		return fallback
+	}
+	wanted := reasoningRank(requested)
+	if wanted < 0 {
+		return fallback
+	}
+	best := -1
+	for _, candidate := range allowed {
+		rank := reasoningRank(candidate)
+		if rank < 0 || rank > wanted {
+			continue
+		}
+		if rank > best {
+			best = rank
+		}
+	}
+	if best >= 0 {
+		return reasoningLadder[best]
+	}
+	// Everything on offer is above what was asked for: give the least of them.
+	lowest := allowed[0]
+	for _, candidate := range allowed[1:] {
+		if reasoningRank(candidate) < reasoningRank(lowest) {
+			lowest = candidate
+		}
+	}
+	return lowest
+}
+
+// toDeepSeekReasoningEffort maps an effort onto the DeepSeek vocabulary:
+// max/xhigh → "max", everything else → "high" (codebuff-fork
+// toDeepSeekReasoningEffort).
+func toDeepSeekReasoningEffort(effort string) string {
+	if effort == "max" || effort == "xhigh" {
+		return "max"
+	}
+	return "high"
+}
+
+// isDeepSeekModel reports whether the route is one of the DeepSeek V4 models
+// that speak the thinking block and accept prompt-cache hints. Tolerates
+// both the registry's full ids and bare model ids.
+func isDeepSeekModel(model string) bool {
+	return strings.HasSuffix(model, "deepseek-v4-flash") || strings.HasSuffix(model, "deepseek-v4-pro")
+}
+
+// normalizeReasoning rewrites the outbound reasoning_effort for the target
+// model:
+//
+//   - DeepSeek models: reasoning_effort is translated into the thinking block
+//     ({type: enabled|disabled, reasoning_effort: high|max}) per issue #101
+//     (codebuff-fork buildDeepSeekRequestBody), with the effort first clamped
+//     to the model's allowance per issue #65.
+//   - Other models: reasoning_effort is clamped to the model's allowed rungs
+//     (down-nearest, never rejected; unknown efforts fall back to "high").
+//   - reasoning.enabled === false or thinking.type "disabled" suppresses the
+//     effort entirely (DeepSeek: thinking {type: "disabled"}).
+func normalizeReasoning(payload, out map[string]any) {
+	model, _ := out["model"].(string)
+	eff := ""
+	if v, ok := out["reasoning_effort"].(string); ok && v != "" {
+		eff = strings.ToLower(strings.TrimSpace(v))
+	}
+	if eff == "" {
+		eff = ExtractReasoningEffort(payload)
+	}
+
+	disabled := false
+	if rObj, ok := payload["reasoning"].(map[string]any); ok {
+		if en, ok := rObj["enabled"].(bool); ok && !en {
+			disabled = true
+		}
+	}
+
+	switch {
+	case disabled:
+		if isDeepSeekModel(model) {
+			out["thinking"] = map[string]any{"type": "disabled"}
+		}
+		delete(out, "reasoning_effort")
+	case eff == "" || eff == "none" || eff == "disabled":
+		// No effort requested: leave the body untouched.
+	default:
+		clamped := clampReasoningEffort(eff, effortsForModel(model), defaultReasoningEffort)
+		if isDeepSeekModel(model) {
+			out["thinking"] = map[string]any{
+				"type":             "enabled",
+				"reasoning_effort": toDeepSeekReasoningEffort(clamped),
+			}
+			delete(out, "reasoning_effort")
+		} else {
+			out["reasoning_effort"] = clamped
+		}
+	}
+}
+
 // NormalizeRequest sanitizes a client OpenAI chat-completions request body:
 //
 //   - keeps ONLY the whitelisted upstream keys (plus messages and model);
@@ -130,12 +309,23 @@ func NormalizeRequest(body []byte, modelOverride string) ([]byte, error) {
 	if modelOverride != "" {
 		out["model"] = modelOverride
 	}
-	if _, hasEffort := out["reasoning_effort"]; !hasEffort {
-		if eff := ExtractReasoningEffort(payload); eff != "" && eff != "none" && eff != "disabled" {
-			out["reasoning_effort"] = eff
+	normalizeReasoning(payload, out)
+	normalizeRoles(out)
+	// Optional prompt compression (#58): drops middle non-tool turns and caps
+	// long content, env-gated (COMPRESS_PROMPT=true), never touching tool
+	// calls/results or the current message.
+	if compressionEnabled() {
+		if msgs, ok := out["messages"].([]any); ok {
+			out["messages"], _ = compressMessages(msgs)
 		}
 	}
-	normalizeRoles(out)
+	// DeepSeek prompt-cache hints (#84): cache_control ephemeral on the stable
+	// context prefix (messages at indices 2-3), env-gated default on.
+	if model, _ := out["model"].(string); deepseekCacheControlEnabled() && isDeepSeekModel(model) {
+		if msgs, ok := out["messages"].([]any); ok {
+			InjectCacheControl(msgs)
+		}
+	}
 	normalizeToolSchemas(out)
 	return json.Marshal(out)
 }
@@ -155,12 +345,224 @@ func normalizeRoles(payload map[string]any) {
 }
 
 // ---------------------------------------------------------------------------
+// Optional prompt & context compression (issue #58).
+//
+// Env-gated (COMPRESS_PROMPT=true, default off) and deliberately
+// conservative: only plain user/assistant content turns strictly inside the
+// middle of the conversation are dropped, tool calls/results and the last
+// message are never touched, and long content is capped with an explicit
+// summary marker. Tests may shrink the budget vars.
+// ---------------------------------------------------------------------------
+
+const (
+	// compressMarkerPrefix/Suffix form the summary marker inserted where the
+	// truncation begins: "[truncated by freebuff-proxy compression; N earlier
+	// messages omitted]".
+	compressMarkerPrefix = "[truncated by freebuff-proxy compression; "
+	compressMarkerSuffix = " earlier messages omitted]"
+	// compressContentMarker is appended to a kept message whose content was
+	// capped.
+	compressContentMarker = "[truncated by freebuff-proxy compression]"
+)
+
+var (
+	// compressKeepLast is the number of trailing messages that are always
+	// kept (the current turn and recent context).
+	compressKeepLast = 10
+	// compressMaxContentBytes caps string content on kept user/assistant
+	// turns (never the last message, never tool results).
+	compressMaxContentBytes = 8 << 10
+)
+
+// compressionEnabled reports whether prompt compression is on
+// (COMPRESS_PROMPT=true).
+func compressionEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("COMPRESS_PROMPT")))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// compressMessages compresses a message list in place: middle user/assistant
+// content turns beyond the trailing budget are dropped and summarized by ONE
+// marker message; long content on kept user/assistant turns is capped. Tool
+// results, assistant tool_calls, system messages and the last message are
+// never dropped or truncated. Returns the (possibly new) slice and the
+// number of messages omitted.
+func compressMessages(messages []any) ([]any, int) {
+	capLongContents(messages)
+	n := len(messages)
+	if n <= compressKeepLast {
+		return messages, 0
+	}
+	keepStart := n - compressKeepLast // first index of the trailing window
+
+	// Pass 1: count droppable middle turns and where the marker goes.
+	dropped := 0
+	markerIdx := -1
+	for i := 0; i < keepStart; i++ {
+		m, ok := messages[i].(map[string]any)
+		if !ok {
+			continue // non-map entry: cannot classify, keep it
+		}
+		if mustKeepMessage(m) {
+			continue // system prompt, tool results, assistant tool_calls
+		}
+		dropped++
+		if markerIdx < 0 {
+			markerIdx = i
+		}
+	}
+	if dropped == 0 {
+		return messages, 0
+	}
+
+	// Pass 2: rebuild, replacing the dropped span with one marker message.
+	out := make([]any, 0, n-dropped+1)
+	for i := 0; i < n; i++ {
+		if i < keepStart {
+			m, ok := messages[i].(map[string]any)
+			if ok && !mustKeepMessage(m) {
+				if i == markerIdx {
+					out = append(out, map[string]any{
+						"role":    "system",
+						"content": fmt.Sprintf("%s%d%s", compressMarkerPrefix, dropped, compressMarkerSuffix),
+					})
+				}
+				continue
+			}
+		}
+		out = append(out, messages[i])
+	}
+	return out, dropped
+}
+
+func roleOf(m map[string]any) string {
+	role, _ := m["role"].(string)
+	return role
+}
+
+// mustKeepMessage reports whether a message must survive compression: tool
+// results, assistant tool_calls and non-user/assistant roles (system,
+// developer, function) are never dropped — dropping them would break the
+// tool-call schema or lose instructions.
+func mustKeepMessage(m map[string]any) bool {
+	switch roleOf(m) {
+	case "user":
+		return false
+	case "assistant":
+		if _, has := m["tool_calls"]; has {
+			return true
+		}
+		return false
+	default:
+		return true // system, developer, tool, function, unknown
+	}
+}
+
+// capLongContents truncates string content longer than compressMaxContentBytes
+// on kept user/assistant turns, appending the summary marker. The last
+// message and tool messages are never touched.
+func capLongContents(messages []any) {
+	if len(messages) == 0 {
+		return
+	}
+	for i := 0; i < len(messages)-1; i++ { // never the last (current) message
+		m, ok := messages[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		switch roleOf(m) {
+		case "user", "assistant":
+		default:
+			continue
+		}
+		if _, has := m["tool_calls"]; has {
+			continue
+		}
+		content, ok := m["content"].(string)
+		if !ok || len(content) <= compressMaxContentBytes {
+			continue
+		}
+		m["content"] = truncateRunes(content, compressMaxContentBytes) + "…" + compressContentMarker
+	}
+}
+
+// truncateRunes cuts s to at most maxBytes bytes on a rune boundary.
+func truncateRunes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := 0
+	for cut = range s {
+		if cut >= maxBytes {
+			break
+		}
+	}
+	return s[:cut]
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek prompt-cache cache_control injection (issue #84).
+// Ported from freebuff-reverse/internal/channels/freebuff/model.go
+// injectCacheControl.
+// ---------------------------------------------------------------------------
+
+// deepseekCacheControlEnabled reports whether cache_control injection is on.
+// Default ON; set CACHE_CONTROL_INJECTION=false (or 0/off/no/disabled) to
+// disable, preserving SAFE_MODE behavior.
+func deepseekCacheControlEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("CACHE_CONTROL_INJECTION")))
+	switch v {
+	case "0", "false", "off", "no", "disabled":
+		return false
+	}
+	return true
+}
+
+// InjectCacheControl adds {"type":"ephemeral"} cache_control to every content
+// block of messages at indices 2 and 3 (the stable context prefix) when the
+// block does not already carry one. Messages whose content is not a block
+// array (e.g. plain strings) are skipped untouched. Exportable so the CLI
+// envelope builder can apply the same hints after rewriting messages.
+func InjectCacheControl(messages []any) {
+	for i := 2; i < len(messages) && i < 4; i++ {
+		msg, ok := messages[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := msg["content"]
+		if !ok {
+			continue
+		}
+		blocks, ok := content.([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range blocks {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, exists := block["cache_control"]; !exists {
+				block["cache_control"] = map[string]any{"type": "ephemeral"}
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Tool-schema normalization (ported from proxy-freebuff/lib/convert.js,
 // normalizeToolSchemas / normalizeSchemaMap, lines ~40-154).
 // ---------------------------------------------------------------------------
 
 // normalizeToolSchemas normalizes fn.parameters for every function tool in
-// the payload, in place.
+// the payload, in place. Each tool's parameters are normalized through the
+// schema cache (#67): the raw schema JSON hash + starting node budget key a
+// bounded, mutex-guarded LRU, so repeated tool-call loops re-send identical
+// context without re-running normalization.
 func normalizeToolSchemas(payload map[string]any) {
 	tools, _ := payload["tools"].([]any)
 	if len(tools) == 0 {
@@ -185,7 +587,7 @@ func normalizeToolSchemas(payload map[string]any) {
 		if !ok {
 			continue
 		}
-		fn["parameters"] = normalizeSchemaMap(params, extractDefinitions(params), maxSchemaDepth, &budget)
+		fn["parameters"] = normalizeToolSchemaCached(params, &budget)
 	}
 	// Inject end_turn tool definition to pass Codebuff's foreign_toolset validation
 	if !hasEndTurn {
@@ -201,6 +603,112 @@ func normalizeToolSchemas(payload map[string]any) {
 			},
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Tool-schema cache (issue #67/#95).
+// ---------------------------------------------------------------------------
+
+// schemaCacheKey identifies one cached normalization: the SHA-256 of the raw
+// schema JSON plus the node budget it was computed under. normalizeSchemaMap
+// is a pure function of (raw schema, starting budget, maxSchemaDepth), so the
+// pair pins the output exactly.
+type schemaCacheKey struct {
+	hash   [sha256.Size]byte
+	budget int
+}
+
+// schemaCacheMax bounds the LRU. Schemas are usually small; 256 entries
+// covers a typical long tool-call loop many times over.
+const schemaCacheMax = 256
+
+// schemaCache is a small mutex-guarded LRU of normalized tool schemas.
+type schemaCacheType struct {
+	mu      sync.Mutex
+	entries map[schemaCacheKey]map[string]any
+	order   []schemaCacheKey // most-recently-used last
+}
+
+var schemaCache = schemaCacheType{entries: make(map[schemaCacheKey]map[string]any)}
+
+// schemaCacheHits/Misses count cache outcomes (tests + diagnostics).
+var (
+	schemaCacheHits   atomic.Uint64
+	schemaCacheMisses atomic.Uint64
+)
+
+// resetSchemaCache clears the cache and its counters (tests).
+func resetSchemaCache() {
+	schemaCache.mu.Lock()
+	schemaCache.entries = make(map[schemaCacheKey]map[string]any)
+	schemaCache.order = schemaCache.order[:0]
+	schemaCache.mu.Unlock()
+	schemaCacheHits.Store(0)
+	schemaCacheMisses.Store(0)
+}
+
+// schemaCacheStats returns the hit/miss counters.
+func schemaCacheStats() (hits, misses uint64) {
+	return schemaCacheHits.Load(), schemaCacheMisses.Load()
+}
+
+// normalizeToolSchemaCached returns the normalized tool schema for params,
+// consulting the cache first. Cache hits return a deep clone (callers must
+// never mutate cached values); misses normalize, store the result and return
+// it directly. The shared per-request budget is decremented only on misses.
+func normalizeToolSchemaCached(params map[string]any, budget *int) map[string]any {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		// Values not produced by encoding/json cannot be hashed reliably:
+		// normalize uncached.
+		return normalizeSchemaMap(params, extractDefinitions(params), params, nil, maxSchemaDepth, budget)
+	}
+	key := schemaCacheKey{hash: sha256.Sum256(raw), budget: *budget}
+	if cached, ok := schemaCacheGet(key); ok {
+		schemaCacheHits.Add(1)
+		return cloneValue(cached, maxSchemaDepth).(map[string]any)
+	}
+	schemaCacheMisses.Add(1)
+	normalized := normalizeSchemaMap(params, extractDefinitions(params), params, nil, maxSchemaDepth, budget)
+	schemaCachePut(key, normalized)
+	return normalized
+}
+
+// schemaCacheGet returns the cached normalized schema for key, promoting it
+// to most-recently-used.
+func schemaCacheGet(key schemaCacheKey) (map[string]any, bool) {
+	schemaCache.mu.Lock()
+	defer schemaCache.mu.Unlock()
+	v, ok := schemaCache.entries[key]
+	if !ok {
+		return nil, false
+	}
+	for i, k := range schemaCache.order {
+		if k == key {
+			schemaCache.order = append(schemaCache.order[:i], schemaCache.order[i+1:]...)
+			break
+		}
+	}
+	schemaCache.order = append(schemaCache.order, key)
+	return v, true
+}
+
+// schemaCachePut stores normalized under key, evicting the least-recently-used
+// entry when the cache is full.
+func schemaCachePut(key schemaCacheKey, normalized map[string]any) {
+	schemaCache.mu.Lock()
+	defer schemaCache.mu.Unlock()
+	if _, ok := schemaCache.entries[key]; ok {
+		schemaCache.entries[key] = normalized
+		return
+	}
+	if len(schemaCache.entries) >= schemaCacheMax {
+		oldest := schemaCache.order[0]
+		delete(schemaCache.entries, oldest)
+		schemaCache.order = schemaCache.order[1:]
+	}
+	schemaCache.entries[key] = normalized
+	schemaCache.order = append(schemaCache.order, key)
 }
 
 // extractDefinitions merges a schema node's "definitions" and "$defs" maps
@@ -244,27 +752,69 @@ func mergeDefinitions(parent, local map[string]any) map[string]any {
 	return merged
 }
 
-// normalizeSchemaMap normalizes one JSON-schema node: resolves bare $ref
-// nodes against the definition table, recurses into values (depth-capped and
-// node-budgeted), drops definitions/$defs/nullable, simplifies nullable
-// anyOf/oneOf, and cleans up type/enum/const fields. The returned map is
-// always freshly allocated except at the depth cap or budget exhaustion,
-// where the node is returned as-is.
-func normalizeSchemaMap(node map[string]any, defs map[string]any, maxDepth int, budget *int) map[string]any {
+// normalizeSchemaMap normalizes one JSON-schema node: resolves $ref nodes
+// against the definition table AND the schema root (issue #95 — JSON-pointer
+// lookup with sibling merging and a cycle guard), recurses into values
+// (depth-capped and node-budgeted), drops definitions/$defs/nullable,
+// simplifies nullable anyOf/oneOf, and cleans up type/enum/const fields.
+//
+// root is the tool's raw parameters schema, used to resolve "#/..." JSON
+// pointers (inlineLocalSchemaRefs semantics); refStack tracks the refs on the
+// current descent path so a re-entered ref resolves to {} instead of looping.
+// The returned map is always freshly allocated except at the depth cap or
+// budget exhaustion, where the node is returned as-is.
+func normalizeSchemaMap(node map[string]any, defs map[string]any, root map[string]any, refStack map[string]bool, maxDepth int, budget *int) map[string]any {
 	if maxDepth <= 0 || *budget <= 0 {
 		return node // cap: leave the remaining structure untouched
 	}
 	*budget--
 	defs = mergeDefinitions(defs, extractDefinitions(node))
-	if replaced, ok := tryResolveRef(node, defs, maxDepth); ok {
-		if resolved, isMap := replaced.(map[string]any); isMap {
-			return normalizeSchemaMap(resolved, defs, maxDepth-1, budget)
+
+	if ref, _ := node["$ref"].(string); ref != "" && strings.HasPrefix(ref, "#/") {
+		if refStack[ref] {
+			return map[string]any{} // cycle guard: re-entered ref resolves to {}
+		}
+		nextStack := make(map[string]bool, len(refStack)+1)
+		for k, v := range refStack {
+			nextStack[k] = v
+		}
+		nextStack[ref] = true
+
+		// 1. Bare refs against the merged definition table (existing
+		//    behavior; also handles #/definitions/<name> and #/$defs/<name>).
+		if replaced, ok := tryResolveRef(node, defs, maxDepth); ok {
+			if resolved, isMap := replaced.(map[string]any); isMap {
+				return normalizeSchemaMap(resolved, defs, root, nextStack, maxDepth-1, budget)
+			}
+			return node
+		}
+
+		// 2. JSON-pointer resolution against the schema root, merging $ref
+		//    siblings over the resolved target (inlineLocalSchemaRefs).
+		if target, ok := lookupJsonPointer(root, ref); ok {
+			resolved := normalizeSchemaValue(target, defs, root, nextStack, maxDepth-1, budget)
+			rm, isMap := resolved.(map[string]any)
+			if !isMap {
+				return node
+			}
+			if siblings := withoutRef(node); len(siblings) > 0 {
+				merged := mergeMaps(rm, siblings) // siblings win, JS {...resolved, ...siblings}
+				return normalizeSchemaMap(merged, defs, root, refStack, maxDepth-1, budget)
+			}
+			return rm
+		}
+
+		// 3. Unresolvable: keep bare refs as-is (existing behavior); visit
+		//    the remaining siblings when the ref carries any.
+		if siblings := withoutRef(node); len(siblings) > 0 {
+			return normalizeSchemaMap(siblings, defs, root, refStack, maxDepth-1, budget)
 		}
 		return node
 	}
+
 	normalized := make(map[string]any, len(node))
 	for key, value := range node {
-		normalized[key] = normalizeSchemaValue(value, defs, maxDepth-1, budget)
+		normalized[key] = normalizeSchemaValue(value, defs, root, refStack, maxDepth-1, budget)
 	}
 	delete(normalized, "definitions")
 	delete(normalized, "$defs")
@@ -279,19 +829,78 @@ func normalizeSchemaMap(node map[string]any, defs map[string]any, maxDepth int, 
 
 // normalizeSchemaValue recurses into arrays and objects; scalars pass
 // through untouched.
-func normalizeSchemaValue(value any, defs map[string]any, maxDepth int, budget *int) any {
+func normalizeSchemaValue(value any, defs map[string]any, root map[string]any, refStack map[string]bool, maxDepth int, budget *int) any {
 	switch v := value.(type) {
 	case []any:
 		out := make([]any, len(v))
 		for i, e := range v {
-			out[i] = normalizeSchemaValue(e, defs, maxDepth, budget)
+			out[i] = normalizeSchemaValue(e, defs, root, refStack, maxDepth, budget)
 		}
 		return out
 	case map[string]any:
-		return normalizeSchemaMap(v, defs, maxDepth, budget)
+		return normalizeSchemaMap(v, defs, root, refStack, maxDepth, budget)
 	default:
 		return value
 	}
+}
+
+// lookupJsonPointer resolves a "#/..." JSON pointer against the schema root,
+// decoding ~1 → "/" and ~0 → "~" per segment (JS decodeJsonPointerSegment in
+// openai-compatible-prepare-tools.ts). Array indices resolve numerically.
+func lookupJsonPointer(root map[string]any, pointer string) (any, bool) {
+	if !strings.HasPrefix(pointer, "#/") {
+		return nil, false
+	}
+	var current any = root
+	for _, segment := range strings.Split(pointer[2:], "/") {
+		segment = strings.ReplaceAll(segment, "~1", "/")
+		segment = strings.ReplaceAll(segment, "~0", "~")
+		switch c := current.(type) {
+		case map[string]any:
+			v, ok := c[segment]
+			if !ok {
+				return nil, false
+			}
+			current = v
+		case []any:
+			idx, err := strconv.Atoi(segment)
+			if err != nil || idx < 0 || idx >= len(c) {
+				return nil, false
+			}
+			current = c[idx]
+		default:
+			return nil, false
+		}
+	}
+	return current, true
+}
+
+// withoutRef returns a copy of node with the "$ref" key removed, or nil when
+// node has no $ref key.
+func withoutRef(node map[string]any) map[string]any {
+	if _, ok := node["$ref"]; !ok {
+		return nil
+	}
+	out := make(map[string]any, len(node)-1)
+	for k, v := range node {
+		if k != "$ref" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// mergeMaps combines base with override; override wins on key collision
+// (JS object spread semantics).
+func mergeMaps(base, override map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(override))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
 }
 
 // tryResolveRef resolves a node that is a BARE {"$ref": "..."} (no sibling
@@ -471,6 +1080,51 @@ func jsonRepr(v any) string {
 }
 
 // ---------------------------------------------------------------------------
+// Reasoning-in-content injection (issue #44).
+//
+// Some legacy clients never render a reasoning channel; when
+// REASONING_IN_CONTENT is set (default off), reasoning_content is folded into
+// delta.content as "<tag>...</tag>" text so those clients still see the
+// reasoning. The reasoning channel is preserved alongside, and
+// reasoning_details is never folded (it is replayed verbatim).
+// ---------------------------------------------------------------------------
+
+// reasoningInContentTag is the default think-tag label when the env var is a
+// bare boolean.
+const reasoningInContentTag = "think"
+
+// reasoningInContentMode returns the think-tag label when reasoning folding is
+// enabled, or "" when off. The env var REASONING_IN_CONTENT may be a boolean
+// (true → "think") or an explicit tag word ("thinking" → "thinking").
+func reasoningInContentMode() string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("REASONING_IN_CONTENT")))
+	switch v {
+	case "", "0", "false", "off", "no", "disabled":
+		return ""
+	case "1", "true", "yes", "on":
+		return reasoningInContentTag
+	}
+	return v
+}
+
+// foldReasoningIntoContent appends the <tag>reasoning</tag> text to the
+// delta's content when folding is enabled. Reasoning precedes text (the
+// model layer enqueues reasoning deltas before text deltas); non-string
+// content is left untouched.
+func foldReasoningIntoContent(delta map[string]any, reasoning string) {
+	tag := reasoningInContentMode()
+	if tag == "" || reasoning == "" {
+		return
+	}
+	switch c := delta["content"].(type) {
+	case string:
+		delta["content"] = "<" + tag + ">" + reasoning + "</" + tag + ">" + c
+	case nil:
+		delta["content"] = "<" + tag + ">" + reasoning + "</" + tag + ">"
+	}
+}
+
+// ---------------------------------------------------------------------------
 // SSE framing (ported from freebuff-api-kiprana sse.py encode_sse).
 // ---------------------------------------------------------------------------
 
@@ -519,6 +1173,18 @@ func parseSSEData(line []byte) ([]byte, bool) {
 	return nil, false // other SSE fields (event:, id:, retry:)
 }
 
+// chunkMapPool reuses the top-level decode map across SanitizeChunk calls.
+// The pool hands out exclusive ownership and maps are cleared on reuse, so
+// concurrent streams are safe.
+var chunkMapPool = sync.Pool{
+	New: func() any { return make(map[string]any, 8) },
+}
+
+// cleanMapPool reuses the sanitized output map across SanitizeChunk calls.
+var cleanMapPool = sync.Pool{
+	New: func() any { return make(map[string]any, 5) },
+}
+
 // SanitizeChunk cleans ONE upstream SSE data line (with or without the
 // "data: " prefix) for relay to the client:
 //
@@ -526,35 +1192,58 @@ func parseSSEData(line []byte) ([]byte, bool) {
 //   - id/object/created/model are ensured (default id "chatcmpl-"+hex,
 //     object "chat.completion.chunk", created now, model "")
 //   - reasoning_content stays in delta as its own key and is never merged
-//     into content; an explicit null content is removed
+//     into content (unless REASONING_IN_CONTENT is enabled, issue #44);
+//     an explicit null content is removed
 //   - system_fingerprint/logprobs/usage/finish_reason pass through
 //
 // Output is compact JSON. Malformed or non-JSON lines are dropped.
+//
+// Chunks that already satisfy every invariant are returned WITHOUT
+// re-encoding: the returned slice then aliases line (a zero-allocation fast
+// path), so callers must copy it if they retain it past the current
+// processing step.
+//
 // Ported from freebuff-api-kiprana sanitize_stream_chunk.
 func SanitizeChunk(line []byte) ([]byte, bool) {
 	data, ok := parseSSEData(line)
 	if !ok {
 		return nil, true
 	}
-	var chunk map[string]any
+	chunk := chunkMapPool.Get().(map[string]any)
+	clear(chunk)
 	if err := json.Unmarshal(data, &chunk); err != nil {
+		chunkMapPool.Put(chunk)
 		return nil, true
 	}
-	clean := sanitizeChunk(chunk)
-	if clean == nil {
+	// Fast path: the chunk is already in sanitized shape, so re-encoding it
+	// would be a no-op. Emit the raw payload (a subslice of line) untouched.
+	// The reasoning-in-content fold changes output, so it disables the path.
+	if reasoningInContentMode() == "" && !needsSanitize(chunk) {
+		chunkMapPool.Put(chunk)
+		return data, false
+	}
+	clean := cleanMapPool.Get().(map[string]any)
+	result := sanitizeChunk(chunk, clean)
+	chunkMapPool.Put(chunk)
+	if result == nil {
+		clear(clean)
+		cleanMapPool.Put(clean)
 		return nil, true
 	}
-	out, err := json.Marshal(clean)
+	out, err := json.Marshal(result)
+	clear(result)
+	cleanMapPool.Put(result)
 	if err != nil {
 		return nil, true
 	}
 	return out, false
 }
 
-// sanitizeChunk implements the per-chunk cleanup; returns nil to drop.
-func sanitizeChunk(chunk map[string]any) map[string]any {
+// sanitizeChunk implements the per-chunk cleanup into the pooled clean map;
+// returns nil to drop the chunk. clean is cleared by the caller on drop.
+func sanitizeChunk(chunk map[string]any, clean map[string]any) map[string]any {
 	if errVal, hasErr := chunk["error"]; hasErr && errVal != nil {
-		clean := make(map[string]any, 5)
+		clear(clean)
 		if id, ok := chunk["id"].(string); ok && id != "" {
 			clean["id"] = id
 		}
@@ -593,7 +1282,7 @@ func sanitizeChunk(chunk map[string]any) map[string]any {
 		return clean
 	}
 
-	clean := make(map[string]any, 5)
+	clear(clean)
 	if id, ok := chunk["id"].(string); ok && id != "" {
 		clean["id"] = id
 	} else {
@@ -638,6 +1327,10 @@ func sanitizeChunk(chunk map[string]any) map[string]any {
 			delete(delta, "reasoning_content")
 			if s, isStr := rc.(string); isStr {
 				delta["reasoning_content"] = s
+				// Issue #44: fold reasoning into content as <think> text for
+				// clients that don't render a reasoning channel. reasoning_details
+				// is never folded.
+				foldReasoningIntoContent(delta, s)
 			}
 		}
 		if v, ok := delta["content"]; ok && v == nil {
@@ -658,6 +1351,106 @@ func sanitizeChunk(chunk map[string]any) map[string]any {
 		return nil
 	}
 	return clean
+}
+
+// needsSanitize reports whether sanitizeChunk would change the decoded chunk
+// in any way. When it returns false the chunk is already in output shape and
+// can be relayed verbatim (the SanitizeChunk zero-allocation fast path).
+func needsSanitize(chunk map[string]any) bool {
+	if _, hasErr := chunk["error"]; hasErr {
+		return true // error chunks are rebuilt entirely
+	}
+	id, ok := chunk["id"].(string)
+	if !ok || id == "" {
+		return true // default id injected
+	}
+	if obj, _ := chunk["object"].(string); obj != "chat.completion.chunk" {
+		return true
+	}
+	cv, ok := chunk["created"]
+	if !ok || !isJSONInteger(cv) {
+		return true
+	}
+	if c, _ := numInt64(cv); c <= 0 {
+		return true // default created injected
+	}
+	if _, ok := chunk["model"].(string); !ok {
+		return true
+	}
+	choices, ok := chunk["choices"].([]any)
+	if !ok {
+		return true
+	}
+	usage, hasUsage := chunk["usage"]
+	if hasUsage && usage == nil {
+		return true // null usage is dropped
+	}
+	if len(choices) == 0 && (!hasUsage || usage == nil) {
+		return true // the chunk would be dropped outright
+	}
+	if fp, hasFP := chunk["system_fingerprint"]; hasFP {
+		if s, ok := fp.(string); !ok || s == "" {
+			return true
+		}
+	}
+	for k := range chunk {
+		switch k {
+		case "id", "object", "created", "model", "choices", "system_fingerprint", "usage":
+		default:
+			return true // unknown top-level keys are dropped
+		}
+	}
+	for _, raw := range choices {
+		c, ok := raw.(map[string]any)
+		if !ok {
+			return true // non-object choices are dropped
+		}
+		idx, ok := c["index"]
+		if !ok || !isJSONInteger(idx) {
+			return true // default index 0 injected / fraction truncated
+		}
+		delta, ok := c["delta"].(map[string]any)
+		if !ok {
+			return true // empty delta injected
+		}
+		if content, has := delta["content"]; has && content == nil {
+			return true // null content removed
+		}
+		if rc, has := delta["reasoning_content"]; has {
+			if _, isStr := rc.(string); !isStr {
+				return true // non-string reasoning_content dropped
+			}
+		}
+		if _, ok := c["finish_reason"]; !ok {
+			return true // explicit null finish_reason injected
+		}
+		if lp, has := c["logprobs"]; has && lp == nil {
+			return true // null logprobs dropped
+		}
+		for k := range c {
+			switch k {
+			case "index", "delta", "finish_reason", "logprobs":
+			default:
+				return true // unknown choice keys are dropped
+			}
+		}
+	}
+	return false
+}
+
+// isJSONInteger reports whether v is a JSON number whose sanitize conversion
+// round-trips: integral AND representable as int64 (encoding/json decodes
+// numbers as float64; sanitize truncates fractions via numInt64). A value
+// like 1e20 is integral but saturates int64, so it must still take the
+// sanitize path.
+func isJSONInteger(v any) bool {
+	switch n := v.(type) {
+	case float64:
+		return n == math.Trunc(n) && n == float64(int64(n))
+	case int, int64:
+		return true
+	}
+	return false
 }
 
 // numInt64 extracts an integer from a JSON-decoded number.
@@ -835,9 +1628,17 @@ func (a *Accumulator) addToolCall(tc map[string]any) {
 // are stitched by index and sorted, finish_reason is the last non-empty one
 // seen ("stop" when none), and usage is the last one seen (zeroed when none).
 func (a *Accumulator) Finish() []byte {
+	content := strings.Join(a.contentParts, "")
+	// Issue #44: fold reasoning into message content for clients that don't
+	// render the reasoning channel (same env toggle as the streaming path).
+	if tag := reasoningInContentMode(); tag != "" {
+		if rc := strings.Join(a.reasoningParts, ""); rc != "" {
+			content = "<" + tag + ">" + rc + "</" + tag + ">" + content
+		}
+	}
 	msg := map[string]any{
 		"role":    "assistant",
-		"content": strings.Join(a.contentParts, ""),
+		"content": content,
 	}
 	if len(a.toolCalls) > 0 {
 		keys := make([]int, 0, len(a.toolCalls))

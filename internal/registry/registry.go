@@ -18,6 +18,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,22 @@ import (
 
 // RawBase is the upstream source of the Codebuff TS constant files.
 const RawBase = "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/"
+
+// JsDelivrBase mirrors RawBase through the jsDelivr CDN. Tried after the raw
+// source fails: raw.githubusercontent is throttled or blocked in some CI and
+// regions (mirrors freebuff2api-workers' DYNAMIC_MODELS_*_SOURCES pattern,
+// where every source carries a raw + jsDelivr pair).
+const JsDelivrBase = "https://cdn.jsdelivr.net/gh/CodebuffAI/codebuff@main/common/src/constants/"
+
+// mirrorFor returns the jsDelivr mirror for a raw source URL, or "" when the
+// URL is not a raw source (SetSources overrides are used as-is and never
+// mirrored).
+func mirrorFor(url string) string {
+	if strings.HasPrefix(url, RawBase) {
+		return JsDelivrBase + strings.TrimPrefix(url, RawBase)
+	}
+	return ""
+}
 
 // sourceFiles are fetched in order; the first file is the one the agent
 // blocks are parsed from (free-agents.ts), matching the JS.
@@ -99,10 +116,11 @@ type Registry struct {
 	cfg    atomic.Pointer[config.Config] // swapped atomically on reload (SetConfig)
 	client *http.Client                  // fetch client; redirects followed, fetchTimeout applied
 
-	sources      []string // override of the default 5 source URLs (tests)
-	modelToAgent map[string]string
-	allModels    []string // sorted
-	agentModels  []agentModels
+	sources       []string // override of the default 5 source URLs (tests)
+	lastAttempted []string // URLs tried during the most recent Refresh, in order
+	modelToAgent  map[string]string
+	allModels     []string // sorted
+	agentModels   []agentModels
 }
 
 // New returns a Registry that fetches from the default Codebuff sources.
@@ -142,26 +160,37 @@ func (r *Registry) SetSources(urls []string) {
 }
 
 // Refresh fetches the sources in parallel and atomically replaces the
-// registry state. On any fetch or parse failure the previous state is kept
-// and the error returned.
+// registry state. Each source file is tried against its raw URL first and its
+// jsDelivr mirror second; on any fetch or parse failure the previous state is
+// kept and the error returned. Every URL actually attempted is recorded for
+// LastAttemptedSources (-doctor output).
 func (r *Registry) Refresh(ctx context.Context) error {
-	sources := r.sourceURLs()
+	candidates := r.sourceCandidates()
 
-	texts := make([]string, len(sources))
-	errs := make([]error, len(sources))
+	texts := make([]string, len(candidates))
+	errs := make([]error, len(candidates))
+	attempted := make([][]string, len(candidates))
 	var wg sync.WaitGroup
-	for i, src := range sources {
+	for i, urls := range candidates {
 		wg.Add(1)
-		go func(i int, src string) {
+		go func(i int, urls []string) {
 			defer wg.Done()
-			texts[i], errs[i] = fetchText(ctx, r.client, src)
-		}(i, src)
+			texts[i], attempted[i], errs[i] = fetchSource(ctx, r.client, urls)
+		}(i, urls)
 	}
 	wg.Wait()
 
+	tried := make([]string, 0, len(candidates)*2)
+	for _, a := range attempted {
+		tried = append(tried, a...)
+	}
+	r.mu.Lock()
+	r.lastAttempted = tried
+	r.mu.Unlock()
+
 	for i, err := range errs {
 		if err != nil {
-			return fmt.Errorf("registry refresh: fetch %s: %w", sources[i], err)
+			return fmt.Errorf("registry refresh: fetch %s: %w", attempted[i][len(attempted[i])-1], err)
 		}
 	}
 
@@ -183,6 +212,34 @@ func (r *Registry) Refresh(ctx context.Context) error {
 	r.allModels = allModels
 	r.mu.Unlock()
 	return nil
+}
+
+// fetchSource tries each candidate URL in order until one succeeds, recording
+// every attempted URL. The last error is returned when all fail. This is the
+// raw-then-mirror fallback: the jsDelivr mirror is only attempted after the
+// raw source fails.
+func fetchSource(ctx context.Context, client *http.Client, urls []string) (string, []string, error) {
+	attempted := make([]string, 0, len(urls))
+	var lastErr error
+	for _, u := range urls {
+		attempted = append(attempted, u)
+		text, err := fetchText(ctx, client, u)
+		if err == nil {
+			return text, attempted, nil
+		}
+		lastErr = err
+	}
+	return "", attempted, lastErr
+}
+
+// LastAttemptedSources returns the URLs tried during the most recent Refresh
+// (primary raw source plus any jsDelivr mirrors attempted after a failure),
+// in fetch order. Intended for -doctor output; empty before the first
+// refresh and after LoadFallback.
+func (r *Registry) LastAttemptedSources() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return slices.Clone(r.lastAttempted)
 }
 
 // LoadFallback replaces the registry state with the hardcoded fallback map,
@@ -266,6 +323,27 @@ func (r *Registry) sourceURLs() []string {
 		urls[i] = RawBase + f
 	}
 	return urls
+}
+
+// sourceCandidates returns the per-file URL lists tried by Refresh, in order:
+// the primary URL first, then its jsDelivr mirror for the default sources.
+// SetSources overrides are used as-is (one URL per entry — mirrors belong to
+// the default raw sources).
+func (r *Registry) sourceCandidates() [][]string {
+	r.mu.RLock()
+	custom := len(r.sources) > 0
+	r.mu.RUnlock()
+	primaries := r.sourceURLs()
+	out := make([][]string, len(primaries))
+	for i, u := range primaries {
+		out[i] = []string{u}
+		if !custom {
+			if m := mirrorFor(u); m != "" {
+				out[i] = append(out[i], m)
+			}
+		}
+	}
+	return out
 }
 
 // fetchText GETs url with the Accept/UA headers of the JS port. Redirects are
