@@ -375,10 +375,13 @@ func TestBridgeIdleSweepSkipsBusy(t *testing.T) {
 // TestBridgeEvictionAllBusyKeepsCap pins the all-busy eviction behavior:
 // when every cached entry holds an outstanding lease, a new distinct token
 // cannot evict any of them (FINISHing a busy entry would kill the in-flight
-// chat). The new entry is itself unleased at creation time, so LRU eviction
-// picks it as the victim and the cache stays at maxBridgeEntries — the
-// audit's "grows past the cap" claim does not hold (documented discrepancy:
-// the new entry is always evictable, so the cap is never exceeded).
+// chat). The new entry is itself unleased at creation time, but it must
+// ALSO never be evicted: bridgeEntryFor hands it back for immediate use —
+// admitting a session and starting a run on an entry that was dropped from
+// the cache would leave that run and session invisible to bridgeMaintain
+// and Pool.Shutdown (leaked upstream + a daily session slot burned per new
+// client under saturation). The cache may sit one over the cap until an
+// older entry's lease drains and the idle sweep reclaims it.
 func TestBridgeEvictionAllBusyKeepsCap(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -399,24 +402,28 @@ func TestBridgeEvictionAllBusyKeepsCap(t *testing.T) {
 		held = append(held, lease)
 	}
 
-	// A 33rd distinct token: the existing entries are all busy, so the new
-	// (still unleased) entry is the only evictable victim and the cache
-	// stays at the cap.
+	// A 33rd distinct token: the existing entries are all busy, and the new
+	// (still unleased) entry cannot be its own eviction victim either — no
+	// eviction happens this pass and the cache sits at cap+1.
 	lease33, err := p.AcquireBridge(context.Background(), "client-tok-new", modelA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := p.bridgeLen(); got != maxBridgeEntries {
-		t.Errorf("bridge entries = %d, want %d (cap maintained; new entry self-evicted)", got, maxBridgeEntries)
+	if got := p.bridgeLen(); got != maxBridgeEntries+1 {
+		t.Errorf("bridge entries = %d, want %d (new entry kept; cap briefly exceeded until a lease drains)", got, maxBridgeEntries+1)
 	}
-	if e := p.bridgeToken("client-tok-new"); e != nil {
-		t.Error("new entry still cached after all-busy eviction, want evicted")
+	if e := p.bridgeToken("client-tok-new"); e == nil {
+		t.Error("new entry not cached after all-busy creation, want kept (its run would otherwise leak)")
 	}
 	// The busy entries all survived.
 	for i := 0; i < maxBridgeEntries; i++ {
 		if e := p.bridgeToken(fmt.Sprintf("client-tok-%02d", i)); e == nil {
 			t.Errorf("busy entry client-tok-%02d evicted", i)
 		}
+	}
+	// No runs were FINISHed: nothing was evictable this pass.
+	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+		t.Errorf("finished runs = %d, want 0 (nothing evictable while all entries busy)", len(got))
 	}
 	for _, l := range held {
 		p.LeaseRelease(l)

@@ -167,7 +167,7 @@ if [ "$MODE" = "save" ]; then
   CONFIG_DIR="$HOME/.config/manicode"
   CRED_PATH="$CONFIG_DIR/credentials.json"
   mkdir -p "$CONFIG_DIR"
-  cat > "$CRED_PATH" <<CRED
+  ( umask 077; cat > "$CRED_PATH" <<CRED
 {
   "default": {
     "id": "$USER_ID",
@@ -179,6 +179,8 @@ if [ "$MODE" = "save" ]; then
   }
 }
 CRED
+  )
+  chmod 600 "$CRED_PATH" 2>/dev/null || true
   gray "  Saved to: $CRED_PATH"
 fi
 
@@ -214,6 +216,8 @@ case "$MODE" in
         warn "  No .env found; created empty $TARGET_ENV"
       fi
     fi
+    # The proxy treats .env as 0600; floor perms before writing the token in.
+    chmod 600 "$TARGET_ENV" 2>/dev/null || true
     if [ -n "$AUTH_TOKEN" ] && grep -qF "$AUTH_TOKEN" "$TARGET_ENV"; then
       gray "  Token already present in $TARGET_ENV; skipped."
     elif grep -q '^AUTH_TOKENS=' "$TARGET_ENV"; then

@@ -940,14 +940,29 @@ func (p *Pool) Chat(ctx context.Context, lease *Lease, opts upstream.ChatOptions
 		return rc, err
 	}
 	toks := p.toks.Load()
-	if lease.Token < 0 || lease.Token >= len(*toks) {
-		return nil, errors.New("pool: chat: invalid lease token")
+	// Fixed-token leases dispatch through their backing entry — the
+	// authoritative owner pinned by Acquire. A concurrent RemoveLastToken+
+	// AddToken can leave the lease's Token index out of range (chat would
+	// fail with "invalid lease token") or reused by a DIFFERENT token (chat
+	// would go through the wrong account's client and charge the wrong
+	// usage/error path); the entry is a stable pointer immune to both.
+	// Synthetic leases without an entry keep the historical index path.
+	entry := lease.entry
+	if entry == nil {
+		if lease.Token < 0 || lease.Token >= len(*toks) {
+			return nil, errors.New("pool: chat: invalid lease token")
+		}
+		entry = (*toks)[lease.Token]
 	}
-	rc, err := (*toks)[lease.Token].client.ChatCompletions(ctx, opts, body)
+	rc, err := entry.client.ChatCompletions(ctx, opts, body)
 	if err == nil {
 		// Only chats that actually went upstream count against the daily
 		// cap; errors are not recorded.
-		p.recordChat(lease.Token)
+		if lease.entry != nil {
+			p.recordChatEntry(lease.entry)
+		} else {
+			p.recordChat(lease.Token)
+		}
 		p.requestsServed.Add(1)
 	}
 	return rc, err
@@ -1002,10 +1017,10 @@ func (p *Pool) Shutdown(ctx context.Context) {
 		entryCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
 		entry.runs.FinishAllRuns(entryCtx)
 		if snap := entry.runs.Snapshot(); snap.ActiveRuns > 0 {
-			errs = append(errs, fmt.Sprintf("bridge %s: %d runs left after shutdown", entry.token, snap.ActiveRuns))
+			errs = append(errs, fmt.Sprintf("bridge %s: %d runs left after shutdown", bridgeTokenLabel(entry), snap.ActiveRuns))
 		}
 		if err := entry.session.Shutdown(entryCtx); err != nil {
-			errs = append(errs, fmt.Sprintf("bridge %s: shutdown session: %v", entry.token, err))
+			errs = append(errs, fmt.Sprintf("bridge %s: shutdown session: %v", bridgeTokenLabel(entry), err))
 		}
 		cancel()
 	}
@@ -1153,7 +1168,43 @@ func (p *Pool) recordChat(token int) {
 	p.msgsPerToken[token] = append(history[first:], time.Now())
 }
 
-// usageCount returns how many successful chats token sent within the last
+// recordChatEntry appends one successful upstream chat for the lease's
+// backing entry and prunes its usage history outside the 24h window. The
+// entry is located by pointer in the CURRENT token list so the usage lands
+// on the right token: after a concurrent RemoveLastToken+AddToken, the
+// lease's Token index may point at a different token (or be out of range),
+// and charging by index would mis-record. An entry that is no longer in the
+// pool (removed while the request was in flight) skips the recording.
+func (p *Pool) recordChatEntry(entry *tokenEntry) {
+	if entry == nil {
+		return
+	}
+	p.usageMu.Lock()
+	defer p.usageMu.Unlock()
+	for idx, tok := range *p.toks.Load() {
+		if tok != entry {
+			continue
+		}
+		// Authoritative bound under the lock: the msgsPerToken slice is
+		// rebuilt under usageMu by AddToken/RemoveLastToken/RemoveAllTokens,
+		// and a removal racing this snapshot can leave the entry present in
+		// toks but absent from the usage slice — never index past it.
+		if idx < 0 || idx >= len(p.msgsPerToken) {
+			return
+		}
+		cutoff := time.Now().Add(-usageWindow)
+		history := p.msgsPerToken[idx]
+		first := 0
+		for first < len(history) && history[first].Before(cutoff) {
+			first++
+		}
+		p.msgsPerToken[idx] = append(history[first:], time.Now())
+		return
+	}
+	// Entry removed from the pool: skip recording rather than charge a
+	// reused index.
+}
+
 // usageWindow, pruning expired timestamps.
 func (p *Pool) usageCount(token int) int {
 	toks := p.toks.Load()
@@ -1245,7 +1296,7 @@ func (p *Pool) bridgeEntryFor(clientToken string) (*bridgeEntry, error) {
 	// the session-call timeout, so running it under bridgeMu would stall
 	// every other bridge operation (AcquireBridge, bridgeRecordChat,
 	// BridgeCount, bridgeMaintain) for the full eviction duration.
-	victims := p.bridgeEvictLocked()
+	victims := p.bridgeEvictLocked(entry)
 	p.bridgeMu.Unlock()
 
 	for _, victim := range victims {
@@ -1273,9 +1324,13 @@ func (p *Pool) bridgeTouch(clientToken string) {
 // LRU order and returned so the caller can FINISH their runs best-effort
 // (bounded by the client's session-call timeout) AFTER releasing bridgeMu —
 // the upstream FINISH calls must not run under the lock, or a full cache
-// would stall every other bridge operation for the whole eviction. Caller
-// holds bridgeMu.
-func (p *Pool) bridgeEvictLocked() []*bridgeEntry {
+// would stall every other bridge operation for the whole eviction. keep is
+// the entry that was just created by the caller; it is excluded from the
+// victim scan (like busy entries) because bridgeEntryFor hands it back for
+// immediate use — evicting it here would leave its run and admitted session
+// outside the cache, where neither bridgeMaintain nor Pool.Shutdown would
+// ever sweep them. Caller holds bridgeMu.
+func (p *Pool) bridgeEvictLocked(keep *bridgeEntry) []*bridgeEntry {
 	var victims []*bridgeEntry
 	for len(p.bridgeOrder) > maxBridgeEntries {
 		// Scan from the LRU end for an entry WITHOUT outstanding leases:
@@ -1291,6 +1346,17 @@ func (p *Pool) bridgeEvictLocked() []*bridgeEntry {
 				// Stale LRU token (cache entry dropped elsewhere): trim it
 				// and keep scanning.
 				p.bridgeOrder = removeBridgeOrder(p.bridgeOrder, oldest)
+				continue
+			}
+			// The just-created entry is never its own eviction victim: the
+			// caller will admit a session and START a run on it, and an
+			// entry outside the cache is invisible to bridgeMaintain and
+			// Pool.Shutdown — a leaked upstream run + admitted session
+			// burning a daily slot per new client under saturation. Skip it
+			// like a busy entry; the cache may briefly sit one over the cap
+			// until an older entry's lease drains.
+			if entry == keep {
+				i++
 				continue
 			}
 			if entry.runs.InflightCount() > 0 {
@@ -1391,6 +1457,18 @@ func (p *Pool) bridgeToken(clientToken string) *bridgeEntry {
 	p.bridgeMu.Lock()
 	defer p.bridgeMu.Unlock()
 	return p.bridge[clientToken]
+}
+
+// bridgeTokenLabel returns a short non-reversible label for a bridge
+// entry's client token, safe for logs: the sha256 of the token, hex,
+// truncated to 8 chars. The raw client token must never reach logs (logring
+// retains them for /admin/logs), so shutdown and diagnostics use the label,
+// not the token.
+func bridgeTokenLabel(entry *bridgeEntry) string {
+	if entry == nil || entry.client == nil {
+		return "bridge"
+	}
+	return "token-" + entry.client.TokenKey()[:8]
 }
 
 // bestDailyLimit picks the daily-cap error whose window frees first: the

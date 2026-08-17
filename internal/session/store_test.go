@@ -476,6 +476,121 @@ func TestStoreReadErrorDoesNotClobberFileUnreadableFile(t *testing.T) {
 	}
 }
 
+// TestStorePendingMutationSurvivesReadFailure is the P3 regression: a
+// Save/Remove made while the file was unreadable was kept in memory but
+// never flushed; when the file became readable again the reload rebuilt
+// s.data from disk, silently discarding the in-window update — the
+// following flush persisted WITHOUT it, so a restart could not resume that
+// session and burned a daily slot. Pending mutations must be merged back
+// over the disk content on the successful reload and flushed.
+func TestStorePendingMutationSurvivesReadFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are not enforced on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	seed := NewStore(path)
+	seed.Save("a", &cachedState{status: "active", instanceID: "inst-a", expiresAt: time.Now().Add(time.Hour)})
+
+	// Make the FILE unreadable but leave the directory writable.
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Errorf("restoring file perms: %v", err)
+		}
+	}()
+
+	store := NewStore(path)
+	if got := store.Load("a"); got != nil {
+		t.Fatalf("Load on unreadable store = %+v, want nil", got)
+	}
+	// A mutation made while the file is unreadable cannot flush.
+	store.Save("b", &cachedState{status: "active", instanceID: "inst-b", expiresAt: time.Now().Add(time.Hour)})
+
+	// Restore access before reloading.
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The successful reload must merge the in-window mutation back over the
+	// disk content: 'b' survives alongside the pre-existing 'a'.
+	if got := store.Load("b"); got == nil || got.instanceID != "inst-b" {
+		t.Fatalf("Load('b') after reload = %+v, want inst-b (in-window update lost)", got)
+	}
+	if got := store.Load("a"); got == nil || got.instanceID != "inst-a" {
+		t.Fatalf("Load('a') after reload = %+v, want inst-a (disk content preserved)", got)
+	}
+
+	// The merged map is flushed: a fresh store over the same file resumes
+	// 'b' — a restart would not have burned a daily slot.
+	if got := NewStore(path).Load("b"); got == nil || got.instanceID != "inst-b" {
+		t.Fatalf("fresh Load('b') = %+v, want inst-b (merge not persisted)", got)
+	}
+	if got := NewStore(path).Load("a"); got == nil || got.instanceID != "inst-a" {
+		t.Fatalf("fresh Load('a') = %+v, want inst-a", got)
+	}
+}
+
+// TestStorePendingMutationSurvivesReadFailurePortable is the same P3
+// regression as TestStorePendingMutationSurvivesReadFailure but forces the
+// read failure PORTABLY — the store file is replaced by a directory, so
+// os.ReadFile fails with a non-ErrNotExist error on every platform (chmod
+// 000 is not enforced on Windows). This keeps the pending-merge path
+// exercised on Windows boxes where the chmod-based test skips.
+func TestStorePendingMutationSurvivesReadFailurePortable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	seed := NewStore(path)
+	seed.Save("a", &cachedState{status: "active", instanceID: "inst-a", expiresAt: time.Now().Add(time.Hour)})
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace the file with a directory: reads fail, and a flush would also
+	// fail (temp creation is blocked by the path being a directory), so the
+	// read-failure window holds on every platform.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(path)
+	if got := store.Load("a"); got != nil {
+		t.Fatalf("Load on unreadable store = %+v, want nil", got)
+	}
+	// A mutation made while the store is unreadable cannot flush.
+	store.Save("b", &cachedState{status: "active", instanceID: "inst-b", expiresAt: time.Now().Add(time.Hour)})
+
+	// Restore the original file.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The successful reload must merge the in-window mutation back over the
+	// disk content, and the merged map must be flushed (fresh store sees it).
+	if got := store.Load("b"); got == nil || got.instanceID != "inst-b" {
+		t.Fatalf("Load('b') after reload = %+v, want inst-b (in-window update lost)", got)
+	}
+	if got := store.Load("a"); got == nil || got.instanceID != "inst-a" {
+		t.Fatalf("Load('a') after reload = %+v, want inst-a (disk content preserved)", got)
+	}
+	if got := NewStore(path).Load("b"); got == nil || got.instanceID != "inst-b" {
+		t.Fatalf("fresh Load('b') = %+v, want inst-b (merge not persisted)", got)
+	}
+}
+
 // TestStoreVersionMismatchIgnoredThenReplaced is S14: a store file with a
 // version other than storeVersion is ignored (empty view), and the next Save
 // replaces it wholesale with the current version.

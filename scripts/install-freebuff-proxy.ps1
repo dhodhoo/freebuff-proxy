@@ -256,7 +256,7 @@ if (-not $NoEnv) {
 
 function Set-EnvValue([string]$key, [string]$value) {
   if ($NoEnv) { return }
-  $content = if (Test-Path -LiteralPath $envPath) { Get-Content -LiteralPath $envPath -Raw } else { "" }
+  $content = if (Test-Path -LiteralPath $envPath) { [System.IO.File]::ReadAllText($envPath, [System.Text.Encoding]::UTF8) } else { "" }
   if ($content -match "(?m)^$([regex]::Escape($key))=.*$") {
     $content = $content -replace "(?m)^$([regex]::Escape($key))=.*$", "$key=$value"
   } else {

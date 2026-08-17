@@ -25,6 +25,12 @@ import (
 // mirrors the registry's 2MiB source cap with a generous release-asset limit).
 const maxUpdateDownloadBytes = 64 << 20
 
+// maxUpdateArchiveEntryBytes caps a single archive member read so a
+// decompression-amplified release archive (zip bomb / gzip bomb) cannot
+// OOM the updater: the archive bytes themselves are capped at
+// maxUpdateDownloadBytes, but a gzip/zip member can decompress to far more.
+const maxUpdateArchiveEntryBytes = maxUpdateDownloadBytes
+
 // defaultReleasesURL is the GitHub API endpoint checked for the latest
 // release. FREEBUFF_UPDATE_API_URL overrides it so tests (and self-hosted
 // mirrors) can point -update at a fake release server.
@@ -122,7 +128,12 @@ func runUpdate() {
 	req.Header.Set("User-Agent", "freebuff-proxy/"+version)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	// No per-request timeout: the request context (30s) bounds the whole
+	// update, and a fixed 15s timeout would abort a slow-but-healthy
+	// download of the 64MB release asset (~4.3MB/s floor). The release
+	// metadata, asset, and checksums requests all share this same bounded
+	// budget.
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: check latest release: %v\n", err)
@@ -136,7 +147,11 @@ func runUpdate() {
 	}
 
 	var rel githubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	// FREEBUFF_UPDATE_API_URL can point at an arbitrary server: bound the
+	// release-JSON decode body (S7 invariant) so a misbehaving endpoint
+	// cannot stream an unbounded payload into memory. A truncated or
+	// malformed body surfaces as a decode error and aborts the update.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rel); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: decode release json: %v\n", err)
 		os.Exit(1)
 	}
@@ -313,6 +328,21 @@ func verifyChecksum(ctx context.Context, client *http.Client, checksumURL, asset
 	return fmt.Errorf("checksum mismatch! Calculated: %s for %s", computedHex, assetFilename)
 }
 
+// readArchiveEntry reads one release-archive member through a cap: entries
+// larger than maxUpdateArchiveEntryBytes are rejected with "release archive
+// entry too large" instead of being loaded unboundedly — and never
+// installed truncated. kind ("zip" or "tar") only labels error messages.
+func readArchiveEntry(r io.Reader, kind string) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxUpdateArchiveEntryBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s entry: %w", kind, err)
+	}
+	if len(b) > maxUpdateArchiveEntryBytes {
+		return nil, fmt.Errorf("release archive entry too large (exceeds %d-byte cap)", maxUpdateArchiveEntryBytes)
+	}
+	return b, nil
+}
+
 // extractBinaryFromArchive returns the bytes of binaryName found anywhere in
 // the release archive (a goreleaser zip or tar.gz; the binary may be nested
 // under a versioned directory). An unreadable archive or an absent binary is
@@ -331,10 +361,10 @@ func extractBinaryFromArchive(assetURL string, assetBytes []byte, binaryName str
 			if err != nil {
 				return nil, fmt.Errorf("open zip file: %w", err)
 			}
-			b, readErr := io.ReadAll(rc)
+			b, readErr := readArchiveEntry(rc, "zip")
 			_ = rc.Close()
 			if readErr != nil {
-				return nil, fmt.Errorf("read zip entry: %w", readErr)
+				return nil, readErr
 			}
 			return b, nil
 		}
@@ -357,9 +387,9 @@ func extractBinaryFromArchive(assetURL string, assetBytes []byte, binaryName str
 		if filepath.Base(hdr.Name) != binaryName {
 			continue
 		}
-		b, readErr := io.ReadAll(tr)
+		b, readErr := readArchiveEntry(tr, "tar")
 		if readErr != nil {
-			return nil, fmt.Errorf("read tar entry: %w", readErr)
+			return nil, readErr
 		}
 		return b, nil
 	}

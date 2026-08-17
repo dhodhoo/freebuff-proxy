@@ -57,6 +57,40 @@ func testConfig(baseURL string, mut func(*config.Config)) *config.Config {
 	return cfg
 }
 
+// TestProxyURLErrorsRedactCredentials verifies malformed proxy URLs never
+// leak the userinfo password into error messages (parse errors are logged
+// verbatim at startup and in the egress probe).
+func TestProxyURLErrorsRedactCredentials(t *testing.T) {
+	const (
+		socks = "socks5://alice:s3cret@"
+		httpP = "http://alice:s3cret@: bad"
+		bad   = "s3cret"
+	)
+
+	if _, _, err := parseSocks5(socks); err == nil || strings.Contains(err.Error(), bad) {
+		t.Errorf("parseSocks5(%q) err = %v, want a redacted no-host error", socks, err)
+	}
+
+	if _, err := New("tok", testConfig("", func(c *config.Config) { c.SOCKS5Proxy = socks })); err == nil || strings.Contains(err.Error(), bad) {
+		t.Errorf("SOCKS5_PROXY=%q err = %v, want a redacted error", socks, err)
+	}
+	if _, err := New("tok", testConfig("", func(c *config.Config) { c.HTTPProxy = httpP })); err == nil || strings.Contains(err.Error(), bad) {
+		t.Errorf("HTTP_PROXY=%q err = %v, want a redacted error", httpP, err)
+	}
+
+	// The redactor itself: password masked, username kept, no-userinfo and
+	// unparseable URLs passed through untouched.
+	if got := redactProxyURL("socks5://alice:s3cret@127.0.0.1:1080"); got != "socks5://alice:***@127.0.0.1:1080" {
+		t.Errorf("redactProxyURL = %q, want password masked", got)
+	}
+	if got := redactProxyURL("socks5://127.0.0.1:1080"); got != "socks5://127.0.0.1:1080" {
+		t.Errorf("redactProxyURL(no userinfo) = %q, want unchanged", got)
+	}
+	if got := redactProxyURL("://unparseable"); got != "://unparseable" {
+		t.Errorf("redactProxyURL(unparseable) = %q, want unchanged", got)
+	}
+}
+
 // TestChatCompletionsStreamBodySurvives streams three chunks with real
 // delays and asserts the whole body reads back. Regression: do() used to
 // defer-cancel the request context when the response headers arrived, which
@@ -822,6 +856,42 @@ func TestHTTPConnectDial(t *testing.T) {
 			t.Errorf("error = %q, want proxy 403 status", err)
 		}
 	})
+
+	t.Run("silent proxy times out", func(t *testing.T) {
+		// A proxy that accepts TCP but never answers CONNECT must not leak a
+		// dial goroutine and conn forever: the exchange is deadline-bounded.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Hold the conn open, never write a response.
+			_, _ = io.Copy(io.Discard, conn)
+		}()
+
+		old := httpConnectTimeout
+		httpConnectTimeout = 100 * time.Millisecond
+		defer func() { httpConnectTimeout = old }()
+
+		dial := httpConnectDial(&url.URL{Scheme: "http", Host: ln.Addr().String()})
+		start := time.Now()
+		conn, err := dial(context.Background(), "tcp", "origin.example:443")
+		if err == nil {
+			_ = conn.Close()
+			t.Fatal("CONNECT to a silent proxy succeeded, want timeout error")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("CONNECT timeout took %v, want bounded by the 100ms deadline", elapsed)
+		}
+		if !strings.Contains(err.Error(), "CONNECT origin.example:443") {
+			t.Errorf("timeout error = %q, want the target address", err)
+		}
+	})
 }
 
 // TestCrossHostRedirectStripsToken verifies a cross-host redirect does not
@@ -830,6 +900,44 @@ func TestHTTPConnectDial(t *testing.T) {
 // Same-host redirects keep their credentials (CDN / bare-host -> www).
 func TestCrossHostRedirectStripsToken(t *testing.T) {
 	const token = "tok-secret-redirect"
+
+	t.Run("scheme downgrade strips token", func(t *testing.T) {
+		// https -> http to the SAME host (plaintext) must drop both
+		// credential headers; the token must never cross onto a cleartext
+		// hop, even when the hostname is unchanged.
+		check := func(t *testing.T, from, to string, wantStripped bool) {
+			t.Helper()
+			client, err := New(token, testConfig("http://127.0.0.1:1", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			via := []*http.Request{{
+				URL:    mustParseURL(t, from),
+				Header: http.Header{},
+			}}
+			via[0].Header.Set("x-codebuff-api-key", token)
+			via[0].Header.Set("Authorization", "Bearer "+token)
+			req := &http.Request{URL: mustParseURL(t, to), Header: via[0].Header.Clone()}
+			if err := client.http.CheckRedirect(req, via); err != nil {
+				t.Fatalf("CheckRedirect: %v", err)
+			}
+			gotKey := req.Header.Get("x-codebuff-api-key")
+			gotAuth := req.Header.Get("Authorization")
+			if wantStripped {
+				if gotKey != "" || gotAuth != "" {
+					t.Errorf("redirect %s -> %s kept credentials (key %q auth %q), want stripped", from, to, gotKey, gotAuth)
+				}
+			} else {
+				if gotKey != token || gotAuth != "Bearer "+token {
+					t.Errorf("redirect %s -> %s stripped credentials (key %q auth %q), want kept", from, to, gotKey, gotAuth)
+				}
+			}
+		}
+		check(t, "https://www.codebuff.com", "http://www.codebuff.com", true)
+		check(t, "https://www.codebuff.com", "http://www.codebuff.com:8080", true)
+		check(t, "https://www.codebuff.com", "https://www.codebuff.com", false)
+		check(t, "http://www.codebuff.com", "https://www.codebuff.com", false)
+	})
 
 	keySeen := make(chan string, 1)
 	authSeen := make(chan string, 1)
@@ -892,6 +1000,15 @@ func TestCrossHostRedirectStripsToken(t *testing.T) {
 	if got := <-sameKey; got != token {
 		t.Errorf("same-host redirect carried x-codebuff-api-key %q, want %q kept", got, token)
 	}
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", raw, err)
+	}
+	return u
 }
 
 func TestClientIDFormat(t *testing.T) {
@@ -1914,6 +2031,17 @@ func TestRetryRotatesPinnedFingerprint(t *testing.T) {
 	}
 	if got := rt.seenHeaders[1].Get("User-Agent"); got != stealth.ProfileSafari18.UserAgent {
 		t.Errorf("attempt 2 User-Agent = %q, want safari18 (rotated)", got)
+	}
+	// The retry rotated to Safari18, which has no Client Hints: the Chromium
+	// Sec-CH-UA* headers from attempt 1 must be GONE, not carried onto a
+	// Safari TLS fingerprint.
+	if got := rt.seenHeaders[0].Get("Sec-CH-UA"); got == "" {
+		t.Error("attempt 1 Sec-CH-UA empty, want chrome126 client hints")
+	}
+	for _, hdr := range []string{"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"} {
+		if got := rt.seenHeaders[1].Get(hdr); got != "" {
+			t.Errorf("attempt 2 %s = %q, want deleted (Safari18 has no Client Hints)", hdr, got)
+		}
 	}
 }
 

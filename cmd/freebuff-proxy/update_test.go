@@ -498,6 +498,28 @@ func TestExtractBinaryFromArchive(t *testing.T) {
 	}
 }
 
+// TestExtractBinaryFromArchiveOversizedEntry pins the decompression-
+// amplification guard: an archive member larger than the entry cap must be
+// rejected with "release archive entry too large" instead of being loaded
+// unboundedly (or installed truncated). Exercised through the real
+// production path for both archive formats with a cap+1 entry of zeros
+// (highly compressible, so the archives stay small).
+func TestExtractBinaryFromArchiveOversizedEntry(t *testing.T) {
+	const binaryName = "freebuff-proxy"
+	for _, ext := range []string{".zip", ".tar.gz"} {
+		t.Run(ext, func(t *testing.T) {
+			archive := releaseArchiveBytes(t, ext, binaryName, make([]byte, maxUpdateArchiveEntryBytes+1))
+			_, err := extractBinaryFromArchive("https://example.com/release"+ext, archive, binaryName)
+			if err == nil {
+				t.Fatal("extractBinaryFromArchive succeeded, want entry-too-large error")
+			}
+			if !strings.Contains(err.Error(), "release archive entry too large") {
+				t.Errorf("extractBinaryFromArchive error = %v, want 'release archive entry too large'", err)
+			}
+		})
+	}
+}
+
 // --- release JSON decode + platform asset matching ---
 
 func TestReleaseJSONDecodeAndAssetMatch(t *testing.T) {

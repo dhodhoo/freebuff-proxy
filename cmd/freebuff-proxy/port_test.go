@@ -67,6 +67,26 @@ func TestWindowsPortPIDFromOutput(t *testing.T) {
 	}
 }
 
+// TestWindowsPortPIDFromPowerShellOutput pins the Get-NetTCPConnection
+// fallback parser: the first numeric PID wins, non-numeric stray lines are
+// skipped, and empty output yields "".
+func TestWindowsPortPIDFromPowerShellOutput(t *testing.T) {
+	// Multiple listening connections print one OwningProcess per line.
+	multi := "44420\n111\n"
+	if got := windowsPortPIDFromPowerShellOutput(multi); got != "44420" {
+		t.Errorf("windowsPortPIDFromPowerShellOutput(multi) = %q, want 44420", got)
+	}
+	// A stray non-numeric line (e.g. a warning) before the PID is skipped.
+	stray := "WARNING: something\n1234\n"
+	if got := windowsPortPIDFromPowerShellOutput(stray); got != "1234" {
+		t.Errorf("windowsPortPIDFromPowerShellOutput(stray) = %q, want 1234", got)
+	}
+	// No listener: empty output (SilentlyContinue) → empty.
+	if got := windowsPortPIDFromPowerShellOutput(""); got != "" {
+		t.Errorf("windowsPortPIDFromPowerShellOutput(empty) = %q, want empty", got)
+	}
+}
+
 func TestTaskNameFromCSV(t *testing.T) {
 	if got := taskNameFromCSV(`"freebuff-proxy-dash.exe","44420","Console","1","50,776 K"`); got != "freebuff-proxy-dash.exe" {
 		t.Errorf("taskNameFromCSV = %q, want freebuff-proxy-dash.exe", got)
@@ -155,9 +175,13 @@ func TestPrintPortInUseHintText(t *testing.T) {
 		printPortInUseHint(":3457", errors.New("bind: address already in use"))
 		close(done)
 	}()
+	// Generous budget: on Windows the port-owner detection spawns PowerShell
+	// (~1-3s cold start) when netstat finds no listener for the port, and the
+	// test must still complete. The piped-stderr no-op itself is instant — a
+	// real regression (blocking on Enter) would hang past any budget.
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("printPortInUseHint blocked on piped stderr")
 	}
 	_ = w.Close()

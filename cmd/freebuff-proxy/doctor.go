@@ -69,6 +69,21 @@ func doctorTargetHost(upstreamBaseURL string) string {
 	return "www.codebuff.com"
 }
 
+// doctorTargetPort returns the TCP port the doctor's TLS check probes, from
+// the upstream base URL. It defaults to "443" when the URL carries no
+// explicit port (or is unparseable/hostless), keeping the default
+// codebuff.com behavior identical. A self-hosted UPSTREAM_BASE_URL with an
+// explicit port (e.g. https://host:8443) must probe that port, not 443 —
+// otherwise the TLS diagnostic fails falsely against a healthy config.
+func doctorTargetPort(upstreamBaseURL string) string {
+	if u, err := url.Parse(upstreamBaseURL); err == nil && u.Host != "" {
+		if _, port, err := net.SplitHostPort(u.Host); err == nil && port != "" {
+			return port
+		}
+	}
+	return "443"
+}
+
 // tokenFormatWarn returns the doctor's warning for a configured token, or
 // "" when its format looks valid. "Bearer " prefixes (the token value must
 // be bare in .env) and the cb_xxx/cb_yyy placeholders are flagged.
@@ -183,6 +198,7 @@ func runDoctor(configPath string) {
 
 	// DNS & TLS reachability check
 	targetHost := doctorTargetHost(cfg.UpstreamBaseURL)
+	targetPort := doctorTargetPort(cfg.UpstreamBaseURL)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -194,12 +210,12 @@ func runDoctor(configPath string) {
 	}
 
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	tlsConn, err := tls.DialWithDialer(dialer, "tcp", targetHost+":443", &tls.Config{ServerName: targetHost})
+	tlsConn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(targetHost, targetPort), &tls.Config{ServerName: targetHost})
 	if err != nil {
-		fail(fmt.Sprintf("TLS connection to %s:443 failed: %v", targetHost, err))
+		fail(fmt.Sprintf("TLS connection to %s:%s failed: %v", targetHost, targetPort, err))
 	} else {
 		_ = tlsConn.Close()
-		ok(fmt.Sprintf("TLS connection to %s:443 succeeded", targetHost))
+		ok(fmt.Sprintf("TLS connection to %s:%s succeeded", targetHost, targetPort))
 	}
 
 	// Egress region check: one live probe of the direct outbound path

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -123,6 +124,31 @@ func Socks5Dialer(addr string) (func(ctx context.Context, network, addr string) 
 	}, nil
 }
 
+// proxyUserinfoRe matches the userinfo portion of a (possibly malformed)
+// proxy URL so the password can be masked even when url.Parse rejects it.
+var proxyUserinfoRe = regexp.MustCompile(`^(.*?://[^:]*:)[^@]*@`)
+
+// redactProxyURL returns raw with any userinfo password masked, so proxy
+// URLs never leak credentials through error messages (probe failures are
+// logged verbatim by the egress loop). Unparseable URLs fall back to a
+// regex mask.
+func redactProxyURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return proxyUserinfoRe.ReplaceAllString(raw, `${1}***@`)
+	}
+	// Slice the raw string instead of url.UserPassword("***"): the latter
+	// percent-escapes the asterisks (%2A%2A%2A).
+	rest := raw[strings.Index(raw, "://")+3:]
+	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+		userinfo := rest[:at]
+		if colon := strings.IndexByte(userinfo, ':'); colon >= 0 {
+			return raw[:len(raw)-len(rest)+colon+1] + "***" + rest[at:]
+		}
+	}
+	return raw
+}
+
 // parseSocks5 normalizes a configured proxy address to host:port plus its
 // credentials. A bare host:port or a socks5:// URL (with optional userinfo)
 // are accepted; the userinfo becomes the SOCKS5 auth.
@@ -136,10 +162,12 @@ func parseSocks5(raw string) (addr string, auth *proxy.Auth, err error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", nil, fmt.Errorf("egress: invalid proxy address %q: %w", raw, err)
+		// url.Parse's own error text embeds the raw URL (password included);
+		// drop it and keep the redacted form.
+		return "", nil, fmt.Errorf("egress: invalid proxy URL %s", redactProxyURL(raw))
 	}
 	if u.Host == "" {
-		return "", nil, fmt.Errorf("egress: proxy address %q has no host", raw)
+		return "", nil, fmt.Errorf("egress: proxy address %s has no host", redactProxyURL(raw))
 	}
 	if u.User != nil {
 		pass, _ := u.User.Password()

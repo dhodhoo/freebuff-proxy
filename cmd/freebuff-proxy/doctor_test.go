@@ -198,6 +198,30 @@ func TestDoctorTargetHost(t *testing.T) {
 	}
 }
 
+// TestDoctorTargetPort pins the TLS-check port derivation: an explicit port
+// on UPSTREAM_BASE_URL must be probed (https://host:8443 → "8443"), while a
+// URL without one — and any fallback case — keeps the default "443" so the
+// stock codebuff.com behavior is unchanged.
+func TestDoctorTargetPort(t *testing.T) {
+	cases := []struct{ name, upstream, want string }{
+		{"bare host defaults 443", "https://www.codebuff.com", "443"},
+		{"bare host with path", "https://www.codebuff.com/", "443"},
+		{"explicit port", "https://host:8443", "8443"},
+		{"explicit port with path", "https://host:8443/v1", "8443"},
+		{"ipv4 with port", "http://127.0.0.1:8080/v1", "8080"},
+		{"ipv6 with port", "https://[::1]:8443", "8443"},
+		{"empty falls back", "", "443"},
+		{"unparseable falls back", "not a url", "443"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := doctorTargetPort(tc.upstream); got != tc.want {
+				t.Errorf("doctorTargetPort(%q) = %q, want %q", tc.upstream, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRunDoctorBrokenConfigExits1 pins the doctor's config-failure path
 // end to end: a missing config file prints "[FAIL] Config loading failed",
 // a summary line, and exits 1 — before any DNS/TLS/egress probe runs (the

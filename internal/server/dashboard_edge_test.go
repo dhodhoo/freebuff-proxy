@@ -761,6 +761,33 @@ func TestDashboardCSRFSecFetchSiteCombos(t *testing.T) {
 	}
 }
 
+// TestDashboardCSRFLoginGate: the login POST consumes the per-IP attempt
+// budget, so it must carry the same CSRF gate as the other mutating admin
+// routes — a cross-origin POST is rejected before it can burn a victim's
+// login attempts (repeatable cross-site lockout DoS). Header-less clients
+// (curl, API clients, tests) still pass through and can log in.
+func TestDashboardCSRFLoginGate(t *testing.T) {
+	ts := dashboardServer(t, "secret", nil)
+
+	status, body := csrfPost(t, ts.URL, "", "/admin/login", "token=secret", map[string]string{"Origin": "http://evil.example"})
+	if status != http.StatusForbidden {
+		t.Fatalf("cross-origin login POST status = %d, want 403", status)
+	}
+	if !strings.Contains(body, "Cross-origin request rejected.") {
+		t.Errorf("cross-origin login body = %q, want rejection message", body)
+	}
+
+	// Header-less POST (curl/legacy clients) must still authenticate.
+	resp := postLogin(t, ts.URL+"/admin/login", "secret")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("header-less login POST status = %d, want 302", resp.StatusCode)
+	}
+	if cookies := resp.Cookies(); len(cookies) != 1 {
+		t.Errorf("header-less login cookies = %d, want 1", len(cookies))
+	}
+}
+
 // --- cookie / auth edges ---
 
 // TestDashboardMalformedCookieRedirects: a cookie value without the expiry

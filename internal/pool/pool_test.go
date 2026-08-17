@@ -687,6 +687,63 @@ func TestPoolChat(t *testing.T) {
 	}
 }
 
+// TestChatDispatchesThroughLeaseEntry is the regression guard for the P2
+// chat dispatch bug: Chat used the lease's Token index against a FRESH
+// token snapshot, so a concurrent RemoveAllTokens+AddToken left the index
+// pointing at a DIFFERENT token — the chat went through the wrong account's
+// client and its usage/error path charged the wrong token (or the index was
+// out of range and the chat failed outright). The lease's backing entry is
+// the authoritative owner pinned at Acquire: Chat must dispatch through it
+// and skip usage recording once the entry is no longer in the pool.
+func TestChatDispatchesThroughLeaseEntry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"` + modelA + `","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`)
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origEntry := lease.entry
+	if origEntry == nil {
+		t.Fatal("acquired lease has no backing entry")
+	}
+	opts := upstream.ChatOptions{Model: modelA, RunID: lease.Run.RunID, SessionInstanceID: lease.SessionInstanceID}
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"ping"}]}`)
+
+	// Rebuild the token list under the in-flight lease: the lease's Token
+	// index (0) now belongs to a DIFFERENT token's entry.
+	p.RemoveAllTokens(context.Background())
+	if _, err := p.AddToken("new-token"); err != nil {
+		t.Fatal(err)
+	}
+	if (*p.toks.Load())[0] == origEntry {
+		t.Fatal("test setup: index 0 still the original entry")
+	}
+
+	rc, err := p.Chat(context.Background(), lease, opts, body)
+	if err != nil {
+		t.Fatalf("chat through stale lease failed: %v", err)
+	}
+	_ = rc.Close()
+	p.LeaseRelease(lease)
+
+	// The chat went out on the ORIGINAL token's client, not the new token
+	// that reused its index.
+	if len(mock.RecordedChatHeaders) != 1 {
+		t.Fatalf("upstream chat calls = %d, want 1", len(mock.RecordedChatHeaders))
+	}
+	if got := mock.RecordedChatHeaders[0].Get("Authorization"); got != "Bearer tok-0" {
+		t.Errorf("upstream Authorization = %q, want %q (chat went through the wrong token)", got, "Bearer tok-0")
+	}
+
+	// The removed entry's usage must NOT be charged to the new index-0 token.
+	if got := p.usageCount(0); got != 0 {
+		t.Errorf("usage on reused index = %d, want 0 (removed entry's chat must not charge the new token)", got)
+	}
+}
+
 func TestUnknownModel(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()

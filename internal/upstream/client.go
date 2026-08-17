@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -453,7 +454,8 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 	case cfg.HTTPProxy != "":
 		proxyURL, err := url.Parse(cfg.HTTPProxy)
 		if err != nil {
-			return nil, fmt.Errorf("upstream: HTTP_PROXY: %w", err)
+			// url.Parse's error text embeds the raw URL (password included).
+			return nil, fmt.Errorf("upstream: HTTP_PROXY %s is invalid", redactProxyURL(cfg.HTTPProxy))
 		}
 		if stealthProf != nil {
 			// Go's transport ignores DialTLSContext for proxied HTTPS requests:
@@ -493,10 +495,12 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 			}
 			// Go strips Authorization/Cookie on cross-host redirects but not
 			// x-codebuff-api-key, which carries the same raw token. Drop both
-			// when the redirect target is a different host so the token never
-			// leaks to a redirect target; same-host redirects (e.g. CDN or
-			// bare-host -> www) keep their credentials.
-			if !strings.EqualFold(via[0].URL.Host, req.URL.Host) {
+			// when the redirect target is a different host OR downgrades the
+			// scheme https->http (same host, plaintext) so the token never
+			// leaks to a redirect target; same-scheme same-host redirects
+			// (e.g. CDN or bare-host -> www) keep their credentials.
+			if !strings.EqualFold(via[0].URL.Host, req.URL.Host) ||
+				(strings.EqualFold(via[0].URL.Scheme, "https") && strings.EqualFold(req.URL.Scheme, "http")) {
 				req.Header.Del("Authorization")
 				req.Header.Del("x-codebuff-api-key")
 			}
@@ -1659,6 +1663,31 @@ func padBase36(id string) string {
 	return id
 }
 
+// proxyUserinfoRe matches the userinfo portion of a (possibly malformed)
+// proxy URL so the password can be masked even when url.Parse rejects it.
+var proxyUserinfoRe = regexp.MustCompile(`^(.*?://[^:]*:)[^@]*@`)
+
+// redactProxyURL returns raw with any userinfo password masked, so proxy
+// URLs never leak credentials through error messages (parse errors are
+// logged verbatim at startup and in the egress probe). Unparseable URLs
+// fall back to a regex mask.
+func redactProxyURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return proxyUserinfoRe.ReplaceAllString(raw, `${1}***@`)
+	}
+	// Slice the raw string instead of url.UserPassword("***"): the latter
+	// percent-escapes the asterisks (%2A%2A%2A).
+	rest := raw[strings.Index(raw, "://")+3:]
+	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+		userinfo := rest[:at]
+		if colon := strings.IndexByte(userinfo, ':'); colon >= 0 {
+			return raw[:len(raw)-len(rest)+colon+1] + "***" + rest[at:]
+		}
+	}
+	return raw
+}
+
 // parseSocks5 normalizes a SOCKS5 proxy URL to host:port plus its
 // credentials. A bare host:port or a socks5:// URL (with optional userinfo)
 // are accepted; the userinfo becomes the SOCKS5 auth so authenticated
@@ -1675,10 +1704,12 @@ func parseSocks5(raw string) (addr string, auth *proxy.Auth, err error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", nil, err
+		// url.Parse's own error text embeds the raw URL (password included);
+		// drop it and keep the redacted form.
+		return "", nil, errors.New("proxy URL " + redactProxyURL(raw) + " is invalid")
 	}
 	if u.Host == "" {
-		return "", nil, fmt.Errorf("proxy URL %q has no host", raw)
+		return "", nil, fmt.Errorf("proxy URL %s has no host", redactProxyURL(raw))
 	}
 	if u.User != nil {
 		pass, _ := u.User.Password()
@@ -1686,6 +1717,11 @@ func parseSocks5(raw string) (addr string, auth *proxy.Auth, err error) {
 	}
 	return u.Host, auth, nil
 }
+
+// httpConnectTimeout bounds the CONNECT request/response exchange with the
+// proxy (mirroring the stdlib's 1-minute connect timeout). Var so tests can
+// shrink it; production never changes it.
+var httpConnectTimeout = time.Minute
 
 // httpConnectDial returns a dial function that reaches addr through an HTTP
 // CONNECT proxy: it dials the proxy, issues "CONNECT addr", and returns the
@@ -1712,6 +1748,15 @@ func httpConnectDial(proxyURL *url.URL) func(ctx context.Context, network, addr 
 			pass, _ := proxyURL.User.Password()
 			req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
 		}
+		// A proxy that accepts TCP but never answers CONNECT must not leak a
+		// dial goroutine and an open conn per request forever: bound the
+		// write+read of the CONNECT exchange with a deadline (mirroring the
+		// stdlib's 1-minute connect timeout), and clear it once the tunnel is
+		// established so it does not carry into the TLS handshake.
+		if err := conn.SetDeadline(time.Now().Add(httpConnectTimeout)); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("upstream: CONNECT %s: set deadline: %w", addr, err)
+		}
 		if err := req.Write(conn); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("upstream: CONNECT %s: %w", addr, err)
@@ -1720,8 +1765,12 @@ func httpConnectDial(proxyURL *url.URL) func(ctx context.Context, network, addr 
 		resp, err := http.ReadResponse(br, req)
 		if err != nil {
 			_ = conn.Close()
+			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+				return nil, fmt.Errorf("upstream: CONNECT %s: proxy did not answer within 1m: %w", addr, err)
+			}
 			return nil, fmt.Errorf("upstream: CONNECT %s response: %w", addr, err)
 		}
+		_ = conn.SetDeadline(time.Time{})
 		if resp.StatusCode != http.StatusOK {
 			_ = conn.Close()
 			return nil, fmt.Errorf("upstream: CONNECT %s: proxy %s", addr, resp.Status)

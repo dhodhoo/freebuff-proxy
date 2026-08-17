@@ -58,13 +58,20 @@ type Store struct {
 	// flag is cleared once a load succeeds (the on-disk content is then
 	// established and a flush is safe again).
 	readFailed bool
+	// pending records mutations that could not be flushed while readFailed
+	// was set (key → state written, nil for a removal). loadLocked merges
+	// them back over the disk content on the next successful reload so the
+	// in-window updates survive instead of being silently discarded by the
+	// rebuild (a lost update would leave a restart unable to resume the
+	// session, burning a daily slot). Guarded by mu.
+	pending map[string]*persistedState
 }
 
 // NewStore builds a store backed by path. The file is read lazily on the
 // first Load; NewStore never fails (a missing/unreadable file is treated as
 // empty and a later Save overwrites it).
 func NewStore(path string) *Store {
-	return &Store{path: path}
+	return &Store{path: path, pending: make(map[string]*persistedState)}
 }
 
 func (s *Store) loadLocked() {
@@ -78,6 +85,7 @@ func (s *Store) loadLocked() {
 		slog.Warn("session store: file too large, ignoring", "path", s.path, "bytes", fi.Size())
 		s.loaded = true
 		s.readFailed = false
+		s.applyPendingLocked()
 		return
 	}
 
@@ -87,6 +95,7 @@ func (s *Store) loadLocked() {
 			// First run: a missing file is a valid empty store.
 			s.loaded = true
 			s.readFailed = false
+			s.applyPendingLocked()
 		} else {
 			// Leave loaded=false so the next Load (or Save) retries the
 			// read instead of permanently freezing an empty view that a
@@ -105,12 +114,14 @@ func (s *Store) loadLocked() {
 		slog.Warn("session store: parse failed, ignoring", "path", s.path, "err", err)
 		s.loaded = true
 		s.readFailed = false
+		s.applyPendingLocked()
 		return
 	}
 	if file.Version != storeVersion {
 		slog.Warn("session store: version mismatch, ignoring", "path", s.path, "version", file.Version)
 		s.loaded = true
 		s.readFailed = false
+		s.applyPendingLocked()
 		return
 	}
 	if file.Sessions != nil {
@@ -126,6 +137,7 @@ func (s *Store) loadLocked() {
 	}
 	s.loaded = true
 	s.readFailed = false
+	s.applyPendingLocked()
 }
 
 // Load returns the persisted cached state for key, or nil when absent or
@@ -143,6 +155,9 @@ func (s *Store) Load(key string) *cachedState {
 	// impossible and keeping them only delays the inevitable re-create.
 	if !ps.GracePeriodEndsAt.IsZero() && time.Now().After(ps.GracePeriodEndsAt) {
 		delete(s.data, key)
+		if s.flushLockedUnlessReadFailed() {
+			s.recordPendingLocked(key, nil)
+		}
 		return nil
 	}
 	return &cachedState{
@@ -172,7 +187,9 @@ func (s *Store) Save(key string, cs *cachedState) {
 
 	if cs == nil || (cs.instanceID == "" && cs.status != "queued") {
 		delete(s.data, key)
-		s.flushLockedUnlessReadFailed()
+		if s.flushLockedUnlessReadFailed() {
+			s.recordPendingLocked(key, nil)
+		}
 		return
 	}
 	s.data[key] = persistedState{
@@ -188,7 +205,10 @@ func (s *Store) Save(key string, cs *cachedState) {
 		CountryCode:        cs.countryCode,
 		CountryBlockReason: cs.countryBlockReason,
 	}
-	s.flushLockedUnlessReadFailed()
+	if s.flushLockedUnlessReadFailed() {
+		ps := s.data[key]
+		s.recordPendingLocked(key, &ps)
+	}
 }
 
 // Remove drops key from the store (session invalidated/ended at runtime).
@@ -211,7 +231,9 @@ func (s *Store) Remove(key, expectedInstanceID string) {
 		return
 	}
 	delete(s.data, key)
-	s.flushLockedUnlessReadFailed()
+	if s.flushLockedUnlessReadFailed() {
+		s.recordPendingLocked(key, nil)
+	}
 }
 
 // flushLockedUnlessReadFailed writes the current map atomically unless the
@@ -219,12 +241,50 @@ func (s *Store) Remove(key, expectedInstanceID string) {
 // over an unreadable file would destroy every other token's persisted entry.
 // The in-memory update is kept so the store stays consistent once the file
 // becomes readable again; a warn log is the only signal that persistence was
-// skipped.
-func (s *Store) flushLockedUnlessReadFailed() {
+// skipped. Returns true when the flush was skipped (file unreadable) so the
+// caller records the mutation into pending — otherwise a later successful
+// reload would rebuild s.data from disk and silently drop the update.
+func (s *Store) flushLockedUnlessReadFailed() bool {
 	if s.readFailed {
 		slog.Warn("session store: file unreadable, skipping persist (in-memory update kept)", "path", s.path)
+		return true
+	}
+	s.flushLocked()
+	return false
+}
+
+// recordPendingLocked remembers a mutation that could not be flushed because
+// the file was unreadable (readFailed): the key with the state that was
+// written, or nil for a removal. A later successful loadLocked merges
+// pending back over the disk content so the in-window update survives the
+// reload instead of being lost. Caller holds s.mu.
+func (s *Store) recordPendingLocked(key string, ps *persistedState) {
+	if s.pending == nil {
+		s.pending = make(map[string]*persistedState)
+	}
+	s.pending[key] = ps
+}
+
+// applyPendingLocked merges mutations recorded while the file was unreadable
+// back over the freshly-loaded disk view and persists the result: a nil
+// value removes the key, a non-nil value restores the in-memory update that
+// was never flushed. Without this, a Save/Remove made during the failure
+// window would be silently discarded by the reload, and the following flush
+// would persist WITHOUT it — a restart then fails to resume that session
+// and burns a daily slot. The merged map is flushed immediately so the disk
+// catches up. Caller holds s.mu.
+func (s *Store) applyPendingLocked() {
+	if len(s.pending) == 0 {
 		return
 	}
+	for key, ps := range s.pending {
+		if ps == nil {
+			delete(s.data, key)
+		} else {
+			s.data[key] = *ps
+		}
+	}
+	clear(s.pending)
 	s.flushLocked()
 }
 

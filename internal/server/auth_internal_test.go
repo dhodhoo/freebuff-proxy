@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -228,6 +229,40 @@ func TestWriteErrorExistingMappingsUnchanged(t *testing.T) {
 	status, body = errorResponse(t, &upstream.WaitingRoomError{RetryAfter: time.Minute})
 	if status != http.StatusServiceUnavailable || body.Error.Code != "waiting_room_queued" {
 		t.Errorf("waiting room: status=%d code=%q, want 503 waiting_room_queued", status, body.Error.Code)
+	}
+}
+
+// TestRestoreEnvFileUnreadable pins the mode-switch rollback guard: when the
+// previous .env existed but was unreadable (oldErr not os.ErrNotExist), the
+// rollback must NOT delete the file — removing it would destroy an operator's
+// present-but-unreadable .env (regression for the P3 finding). POSIX-only:
+// chmod 000 does not block reads on Windows.
+func TestRestoreEnvFileUnreadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 000 does not make a file unreadable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(".env", 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chmod(".env", 0o644); err != nil {
+			t.Errorf("restoring .env perms: %v", err)
+		}
+	}()
+	_, readErr := os.ReadFile(".env")
+	if readErr == nil || errors.Is(readErr, os.ErrNotExist) {
+		t.Fatalf("setup: ReadFile = %v, want a non-NotExist error", readErr)
+	}
+	restoreEnvFile(nil, readErr)
+	if _, statErr := os.Stat(".env"); statErr != nil {
+		t.Errorf("restoreEnvFile removed a present-but-unreadable .env: %v", statErr)
 	}
 }
 

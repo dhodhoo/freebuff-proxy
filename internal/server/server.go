@@ -114,7 +114,12 @@ func (s *Server) Handler() http.Handler {
 	// Config (read + write) and logs expose secrets and are gated further:
 	// with ADMIN_TOKEN unset they require a loopback client.
 	mux.HandleFunc("GET /admin/login", s.handleAdminLogin)
-	mux.HandleFunc("POST /admin/login", s.handleAdminLogin)
+	// POST /admin/login consumes the per-IP login-attempt budget, so it must
+	// carry the same CSRF gate as the other mutating admin routes: without it
+	// a malicious page could fire cross-origin POSTs with wrong tokens and
+	// lock the victim out of the dashboard (5 fails → 1-minute lockout,
+	// repeatable). GET stays unwrapped — it just renders the login page.
+	mux.HandleFunc("POST /admin/login", s.adminCSRF(http.HandlerFunc(s.handleAdminLogin)))
 	mux.Handle("GET /admin", s.dashboardAuth(s.dash.Page("overview")))
 	mux.Handle("GET /admin/tokens", s.dashboardAuth(s.dash.Page("tokens")))
 	mux.Handle("GET /admin/models", s.dashboardAuth(s.dash.Page("models")))
@@ -1106,13 +1111,17 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 }
 
 // restoreEnvFile writes old content back to .env, or removes the file when it
-// did not exist before. Best-effort rollback for failed mode switches.
+// did not exist before. Best-effort rollback for failed mode switches. When
+// the previous .env existed but was unreadable (oldErr not os.ErrNotExist),
+// nothing is done: removing it would destroy the operator's file, and the old
+// bytes needed for a restore were never read.
 func restoreEnvFile(old []byte, oldErr error) {
-	if oldErr != nil {
+	switch {
+	case oldErr == nil:
+		_ = writeFileAtomic(".env", old)
+	case errors.Is(oldErr, os.ErrNotExist):
 		_ = os.Remove(".env")
-		return
 	}
-	_ = writeFileAtomic(".env", old)
 }
 
 // dialTarget returns the host:port to dial for an upstream base host,
@@ -1141,17 +1150,25 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 		checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Configuration: pooled mode, %d token(s)", len(cfg.AuthTokens))})
 	}
 
-	// Upstream reachability: DNS + TLS to the configured base host.
+	// Upstream reachability: DNS + TLS to the configured base host. The DNS
+	// lookup uses the bare host, not u.Host verbatim: "host:8443" would be
+	// treated as a literal DNS name and NXDOMAIN, a false red row (the -doctor
+	// tool strips the port the same way). The display and dial target keep the
+	// port so the TCP row still connects to the real endpoint.
 	targetHost := "www.codebuff.com"
+	dnsHost := targetHost
 	if u, err := url.Parse(cfg.UpstreamBaseURL); err == nil && u.Host != "" {
 		targetHost = u.Host
+		if h := u.Hostname(); h != "" {
+			dnsHost = h
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	if _, err := net.DefaultResolver.LookupHost(ctx, targetHost); err != nil {
-		checks = append(checks, dashboard.DiagCheck{Message: "DNS lookup failed for " + targetHost + ": " + err.Error()})
+	if _, err := net.DefaultResolver.LookupHost(ctx, dnsHost); err != nil {
+		checks = append(checks, dashboard.DiagCheck{Message: "DNS lookup failed for " + dnsHost + ": " + err.Error()})
 	} else {
-		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "DNS resolves " + targetHost})
+		checks = append(checks, dashboard.DiagCheck{OK: true, Message: "DNS resolves " + dnsHost})
 	}
 	hostForDial := dialTarget(targetHost)
 	if conn, err := net.DialTimeout("tcp", hostForDial, 5*time.Second); err != nil {
@@ -1240,10 +1257,19 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 	newCfg, err := config.Load(s.configPath)
 	if err != nil {
-		if oldErr == nil {
+		switch {
+		case oldErr == nil:
 			_ = writeFileAtomic(envPath, old)
-		} else {
+		case errors.Is(oldErr, os.ErrNotExist):
+			// The .env did not exist before the save: remove the rejected
+			// write so the state matches.
 			_ = os.Remove(envPath)
+		default:
+			// The previous .env existed but was unreadable (permissions, ACL):
+			// deleting it would destroy the operator's file. Leave the newly
+			// written content and warn — a restore is impossible without the
+			// old bytes.
+			s.logger.Warn("dashboard config save rejected; previous .env unreadable, not restored", "readErr", oldErr, "err", err)
 		}
 		s.logger.Warn("dashboard config save rejected", "err", err)
 		s.dash.RenderConfigResult(w, r, false, "Configuration rejected: "+err.Error())

@@ -164,15 +164,16 @@ func needsQuote(s string) bool {
 // sensitiveHeaders are redacted in dumps and request logs; keys are compared
 // lower-cased so direct (non-canonical) header assignments are covered too.
 var sensitiveHeaders = map[string]struct{}{
-	"authorization": {},
-	"x-api-key":     {},
-	"cookie":        {},
-	"set-cookie":    {},
+	"authorization":      {},
+	"x-api-key":          {},
+	"x-codebuff-api-key": {},
+	"cookie":             {},
+	"set-cookie":         {},
 }
 
 // RedactHeaders returns a copy of h with the values of sensitive headers
-// (Authorization, x-api-key, Cookie, Set-Cookie) replaced by "[redacted]".
-// The input header is not modified.
+// (Authorization, x-api-key, x-codebuff-api-key, Cookie, Set-Cookie) replaced
+// by "[redacted]". The input header is not modified.
 func RedactHeaders(h http.Header) map[string][]string {
 	out := make(map[string][]string, len(h))
 	for k, vs := range h {
@@ -190,13 +191,15 @@ func RedactHeaders(h http.Header) map[string][]string {
 
 // sanitizeName makes a request path safe to embed in a dump file name on
 // every platform: separators, dots and each character that is invalid in
-// Windows file names are replaced with underscores.
+// Windows file names are replaced with underscores. The 60-rune cap is
+// truncation-safe: a byte slice cut could split a multi-byte UTF-8 sequence
+// and produce an invalid file name, so the cap counts runes instead.
 func sanitizeName(p string) string {
 	for _, r := range `/\:*?"<>|.` {
 		p = strings.ReplaceAll(p, string(r), "_")
 	}
-	if len(p) > 60 {
-		p = p[:60]
+	if r := []rune(p); len(r) > 60 {
+		p = string(r[:60])
 	}
 	return p
 }

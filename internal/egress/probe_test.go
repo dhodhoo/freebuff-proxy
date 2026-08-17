@@ -157,6 +157,25 @@ func TestSocks5Dialer(t *testing.T) {
 	}
 }
 
+// TestSocks5DialerRedactsCredentials guards the proxy parse errors: a
+// malformed URL carrying userinfo must never leak the password into the
+// error text (probe failures are logged verbatim).
+func TestSocks5DialerRedactsCredentials(t *testing.T) {
+	const (
+		noHost = "socks5://alice:s3cret@"
+		badURL = "socks5://alice:s3cret@: bad"
+		pass   = "s3cret"
+	)
+	for _, raw := range []string{noHost, badURL} {
+		if _, err := Socks5Dialer(raw); err == nil {
+			t.Errorf("Socks5Dialer(%q) succeeded, want error", raw)
+			continue
+		} else if strings.Contains(err.Error(), pass) {
+			t.Errorf("Socks5Dialer(%q) error %q leaks the password", raw, err)
+		}
+	}
+}
+
 // poll waits up to timeout for cond to hold, failing the test otherwise.
 func poll(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()

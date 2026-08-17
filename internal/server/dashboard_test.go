@@ -2,12 +2,14 @@ package server_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -599,6 +601,48 @@ func TestDashboardConfigSaveRejectedRollsBack(t *testing.T) {
 	}
 }
 
+// TestDashboardConfigSaveRejectedUnreadableEnv pins the rollback guard for a
+// present-but-unreadable .env: os.ReadFile fails for reasons other than
+// absence (permissions, ACL), so the rollback must NOT remove the file —
+// deleting it would destroy the operator's .env even though writeFileAtomic
+// (temp + rename) could overwrite it. The rejected save leaves the newly
+// written content in place and reports the rejection. POSIX-only: chmod 000
+// does not block reads on Windows.
+func TestDashboardConfigSaveRejectedUnreadableEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 000 does not make a file unreadable on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+	t.Chdir(t.TempDir())
+	// Present-but-unreadable: a file ReadFile cannot open, while the
+	// rename-over in writeFileAtomic still succeeds (only the directory needs
+	// write permission).
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(".env", 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(".env"); err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("setup: ReadFile = %v, want a non-NotExist error", err)
+	}
+	ts := dashboardServer(t, "secret", nil)
+	cookie := authedCookie(t, ts)
+
+	// LISTEN_ADDR without a port fails Validate — the save is rejected after
+	// the .env was overwritten; the rollback must leave the file in place.
+	resp := postConfig(t, ts.URL, cookie, "LISTEN_ADDR=127.0.0.1\n")
+	defer func() { _ = resp.Body.Close() }()
+	if !strings.Contains(bodyOf(t, resp), "Configuration rejected") {
+		t.Error("rejected save missing error class")
+	}
+	if _, statErr := os.Stat(".env"); statErr != nil {
+		t.Errorf(".env deleted by the rollback of an unreadable original: %v", statErr)
+	}
+}
+
 // The config page renders the effective values with secrets redacted.
 func TestDashboardConfigPage(t *testing.T) {
 	t.Chdir(t.TempDir())
@@ -942,7 +986,9 @@ func TestDashboardTokenRemoveRollsBackOnPersistFailure(t *testing.T) {
 // handleDiag must not append ":443" to an UpstreamBaseURL that already
 // carries a port: the mock URL (http://127.0.0.1:PORT) is dialed as-is and
 // reported reachable (a host that already has a port must never become
-// "host:PORT:443").
+// "host:PORT:443"). The DNS row must also strip the port: LookupHost of
+// "127.0.0.1:PORT" would treat the whole string as a DNS name and NXDOMAIN,
+// a false red row next to a green TCP row (regression for the P3 finding).
 func TestDashboardDiagPortHandling(t *testing.T) {
 	t.Chdir(t.TempDir())
 	mock := testutil.NewMock()
@@ -983,6 +1029,12 @@ func TestDashboardDiagPortHandling(t *testing.T) {
 	body := bodyOf(t, resp)
 	if !strings.Contains(body, "TCP reachable 127.0.0.1:") {
 		t.Errorf("diag did not dial the ported mock host:\n%s", body)
+	}
+	if !strings.Contains(body, "DNS resolves 127.0.0.1") {
+		t.Errorf("diag DNS row used the host:port as a DNS name:\n%s", body)
+	}
+	if strings.Contains(body, "DNS lookup failed") {
+		t.Errorf("diag DNS row failed for a host with an explicit port:\n%s", body)
 	}
 	if strings.Contains(body, ":443") {
 		t.Errorf("diag appended :443 to a host that already carries a port:\n%s", body)

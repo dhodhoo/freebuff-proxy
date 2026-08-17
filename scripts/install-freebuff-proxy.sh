@@ -497,11 +497,16 @@ MINIENV
 }
 ensure_env_file
 
+# esc_val <str> - escape sed replacement metacharacters (&, \ and the |
+# delimiter used below) so a value can be spliced into a `s|...|...|` script
+# verbatim without corrupting the .env.
+esc_val() { printf '%s' "$1" | sed -e 's/[&\\|]/\\&/g'; }
+
 set_env() {
   [ "$NO_ENV" = "1" ] && return 0
   local key="$1" val="$2"
   if grep -q "^$key=" "$ENVPATH" 2>/dev/null; then
-    sed -i.bak "s|^$key=.*|$key=$val|" "$ENVPATH" && rm -f "$ENVPATH.bak"
+    sed -i.bak "s|^$key=.*|$key=$(esc_val "$val")|" "$ENVPATH" && rm -f "$ENVPATH.bak"
   else
     printf '%s=%s\n' "$key" "$val" >> "$ENVPATH"
   fi

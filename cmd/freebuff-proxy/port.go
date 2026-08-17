@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // isPortInUse reports whether err is a bind failure because the address is
@@ -65,12 +67,66 @@ func portOwner(port string) string {
 }
 
 // windowsPortPID finds the LISTENING PID for port from netstat -ano output.
+// When netstat finds nothing, falls back to PowerShell's Get-NetTCPConnection
+// (-State Listen is locale-independent, unlike netstat's localized state
+// strings — e.g. German "ABHÖREN" — so the fallback works on non-English
+// Windows where the netstat parse misses).
 func windowsPortPID(port string) string {
 	out, err := exec.Command("netstat", "-ano").Output()
 	if err != nil {
 		return ""
 	}
-	return windowsPortPIDFromOutput(string(out), port)
+	if pid := windowsPortPIDFromOutput(string(out), port); pid != "" {
+		return pid
+	}
+	return windowsPortPIDFromPowerShell(port)
+}
+
+// windowsPortPIDPowerShellTimeout bounds the PowerShell fallback query: the
+// diagnostic is best-effort, and a hung PowerShell must not stall the
+// bind-failure hint indefinitely.
+const windowsPortPIDPowerShellTimeout = 4 * time.Second
+
+// windowsPortPIDFromPowerShell queries the LISTENING PID for port via
+// PowerShell: "Get-NetTCPConnection -State Listen -LocalPort <port>". The
+// -State Listen keyword is English on every locale, so it works where the
+// netstat parse fails. The command forces UTF-8 console output (powershell
+// 5.1 otherwise writes UTF-16LE to pipes, which would NUL-mangle the PID)
+// and is bounded by windowsPortPIDPowerShellTimeout. Returns the first
+// numeric PID, or "" when none is listening or the query fails.
+func windowsPortPIDFromPowerShell(port string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), windowsPortPIDPowerShellTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command",
+		"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; (Get-NetTCPConnection -State Listen -LocalPort "+port+" -ErrorAction SilentlyContinue).OwningProcess").Output()
+	if err != nil {
+		return ""
+	}
+	return windowsPortPIDFromPowerShellOutput(string(out))
+}
+
+// windowsPortPIDFromPowerShellOutput extracts the first numeric PID from
+// Get-NetTCPConnection output — one OwningProcess per line when multiple
+// connections listen. Pure so the parsing is testable without PowerShell.
+func windowsPortPIDFromPowerShellOutput(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		pid := strings.TrimSpace(line)
+		if pid == "" {
+			continue
+		}
+		// A PID is pure digits; skip any stray non-numeric output.
+		numeric := true
+		for _, r := range pid {
+			if r < '0' || r > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric {
+			return pid
+		}
+	}
+	return ""
 }
 
 // windowsPortPIDFromOutput parses netstat -ano text: the local address field

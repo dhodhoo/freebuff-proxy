@@ -131,6 +131,7 @@ func TestRedactHeaders(t *testing.T) {
 	h.Set("Authorization", "Bearer topsecret")
 	h.Add("x-api-key", "key-1")
 	h.Add("x-api-key", "key-2")
+	h.Set("X-Codebuff-Api-Key", "cb_secret")
 	h.Set("Cookie", "session=abc")
 	h.Set("Set-Cookie", "sid=xyz")
 	h.Set("Content-Type", "application/json")
@@ -141,7 +142,7 @@ func TestRedactHeaders(t *testing.T) {
 	if h.Get("Authorization") != "Bearer topsecret" {
 		t.Error("RedactHeaders modified the input header")
 	}
-	for _, k := range []string{"Authorization", "X-Api-Key", "Cookie", "Set-Cookie"} {
+	for _, k := range []string{"Authorization", "X-Api-Key", "X-Codebuff-Api-Key", "Cookie", "Set-Cookie"} {
 		if v := got[k][0]; v != "[redacted]" {
 			t.Errorf("RedactHeaders[%q] = %q, want [redacted]", k, v)
 		}
@@ -343,8 +344,9 @@ func TestQuoteMessageEdges(t *testing.T) {
 
 // TestSanitizeNameBoundary pins the 60-rune truncation boundary and the
 // character replacement: shorter names are unchanged, exactly-60 stays 60,
-// longer names are cut to 60, and invalid file-name characters are
-// replaced with underscores.
+// longer names are cut to 60, invalid file-name characters are replaced with
+// underscores, and multi-byte input is truncated by runes so no UTF-8
+// sequence is ever split.
 func TestSanitizeNameBoundary(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -367,6 +369,18 @@ func TestSanitizeNameBoundary(t *testing.T) {
 	}
 	if got := sanitizeName(`a\b:c*d?e"f<g>h|i.`); got != "a_b_c_d_e_f_g_h_i_" {
 		t.Errorf("sanitizeName(specials) = %q", got)
+	}
+
+	// 61 two-byte runes (122 bytes): a byte slice cut at 60 would split a
+	// rune and emit invalid UTF-8; rune-based truncation yields 60 whole
+	// runes that are valid UTF-8.
+	multi := strings.Repeat("é", 61)
+	got := sanitizeName(multi)
+	if n := len([]rune(got)); n != 60 {
+		t.Errorf("sanitizeName(61×é) = %d runes, want 60", n)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeName(61×é) produced invalid UTF-8: %q", got)
 	}
 }
 

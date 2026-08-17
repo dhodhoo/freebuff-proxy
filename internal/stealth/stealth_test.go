@@ -122,6 +122,24 @@ func TestApplyProfileHeaders(t *testing.T) {
 			t.Errorf("Sec-Fetch-Site = %q, want cross-site", got)
 		}
 	})
+
+	t.Run("no-hint profile deletes stale Chromium hints", func(t *testing.T) {
+		// Rotation path: a Chrome request retried under Safari/Firefox must
+		// not keep the Chromium client-hint headers (they would mismatch the
+		// new TLS fingerprint).
+		h := http.Header{}
+		ApplyProfileHeaders(h, ProfileChrome120)
+		ApplyProfileHeaders(h, ProfileFirefox120)
+
+		for _, hdr := range []string{"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"} {
+			if v := h.Get(hdr); v != "" {
+				t.Errorf("%s = %q after Firefox apply, want deleted", hdr, v)
+			}
+		}
+		if got := h.Get("User-Agent"); got != ProfileFirefox120.UserAgent {
+			t.Errorf("User-Agent = %q, want Firefox UA", got)
+		}
+	})
 }
 
 func TestSanitizeAndApply(t *testing.T) {

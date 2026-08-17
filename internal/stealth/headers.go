@@ -52,6 +52,11 @@ func SanitizeHeaders(h http.Header) {
 //
 // Sec-CH-UA-Mobile is set to "?0" for Chromium profiles because real desktop
 // Chrome always sends it; its absence is detectable.
+//
+// Profiles without Client Hints (Safari, Firefox) have empty SecChUA and
+// SecChUAPlatform: applying such a profile over a previous Chromium one (the
+// transient-retry rotation path) must DELETE the stale hints, not leave a
+// Chromium header set on a non-Chromium TLS fingerprint.
 func ApplyProfileHeaders(h http.Header, p *Profile) {
 	if p.UserAgent != "" {
 		h.Set("User-Agent", p.UserAgent)
@@ -59,9 +64,14 @@ func ApplyProfileHeaders(h http.Header, p *Profile) {
 	if p.SecChUA != "" {
 		h.Set("Sec-CH-UA", p.SecChUA)
 		h.Set("Sec-CH-UA-Mobile", "?0")
+	} else {
+		h.Del("Sec-CH-UA")
+		h.Del("Sec-CH-UA-Mobile")
 	}
 	if p.SecChUAPlatform != "" {
 		h.Set("Sec-CH-UA-Platform", p.SecChUAPlatform)
+	} else {
+		h.Del("Sec-CH-UA-Platform")
 	}
 	if p.AcceptLanguage != "" {
 		h.Set("Accept-Language", p.AcceptLanguage)
