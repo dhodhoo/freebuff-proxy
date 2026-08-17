@@ -2802,6 +2802,7 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var be *upstream.BanError
 	var cbe *upstream.CountryBlockedError
 	var ce *upstream.CreditsError
+	var cde *upstream.CapacityDeferredError
 	switch {
 	case errors.As(err, &be):
 		status, code = http.StatusForbidden, "account_banned"
@@ -2840,6 +2841,23 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.As(err, &uwr):
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message, retryAfter = uwr.Error(), uwr.RetryAfter
+	case errors.As(err, &cde):
+		// #105 (server half): the client's capacity-deferred retry budget
+		// (TRANSIENT_RETRIES) is exhausted, so the free tier's transient
+		// capacity queue is surfaced to downstream clients as 429 +
+		// Retry-After — they must honor the window, not hammer a 502/503.
+		// MUST precede the generic errors.As(err, &ue) branch: the error
+		// unwraps to a Retryable UpstreamError, which would otherwise be
+		// swallowed as 503 upstream_retryable.
+		status, code = http.StatusTooManyRequests, "free_mode_capacity_deferred"
+		message = cde.Body
+		if message == "" {
+			message = cde.Error()
+		}
+		retryAfter = cde.RetryAfter
+		if retryAfter <= 0 {
+			retryAfter = 10 * time.Second
+		}
 	case errors.As(err, &ue):
 		if ue.Retryable {
 			// deployment_outside_hours etc.: temporarily unavailable, worth

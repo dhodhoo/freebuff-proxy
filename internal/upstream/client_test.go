@@ -3072,8 +3072,9 @@ func TestClassifyCapacityDeferred(t *testing.T) {
 	if !errors.Is(err, ErrCapacityDeferred) {
 		t.Errorf("err = %v, want ErrCapacityDeferred", err)
 	}
-	// Unwraps to a Retryable UpstreamError so generic server paths surface
-	// 503 upstream_retryable once the client-side budget is exhausted.
+	// Unwraps to a Retryable UpstreamError (errors.As finds it), but
+	// writeError surfaces 429 free_mode_capacity_deferred + Retry-After
+	// via its dedicated CapacityDeferredError branch (#105).
 	var ue *UpstreamError
 	if !errors.As(err, &ue) || !ue.Retryable {
 		t.Errorf("err = %v, want unwrap to Retryable UpstreamError", err)

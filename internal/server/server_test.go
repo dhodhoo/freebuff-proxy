@@ -1593,6 +1593,70 @@ func TestUpstreamRetryableNotBlindRetried(t *testing.T) {
 	}
 }
 
+// TestChatCapacityDeferredSurfaced429 verifies #105 (server half): once the
+// client-side capacity-deferred budget is exhausted, the gateway surfaces the
+// free tier's transient capacity queue as 429 free_mode_capacity_deferred +
+// Retry-After (the upstream window) — never the old bare 502 upstream_
+// unavailable or a generic 503 upstream_retryable — so downstream clients
+// honor the window instead of re-POSTing immediately. The mock sees exactly
+// one chat call: the typed error unwraps to a Retryable UpstreamError, so
+// chatAttempt must not blind-retry it a second time.
+func TestChatCapacityDeferredSurfaced429(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var chatCalls atomic.Int32
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		chatCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"code":"free_mode_capacity_deferred","message":"Free mode is at capacity; your request will be retried automatically","retryAfterMs":7000}}`)
+	}
+	// TRANSIENT_RETRIES=0 = exhausted budget: the client surfaces the typed
+	// CapacityDeferredError immediately (no in-place retry, no retry-after
+	// sleep), so the server mapping is exercised on the first call.
+	ts, _ := newTestServerCfg(t, nil, func(cfg *config.Config) { cfg.TransientRetries = 0 }, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: %s", resp.StatusCode, data)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "7" {
+		t.Errorf("Retry-After = %q, want 7 (the upstream window, ceil seconds)", ra)
+	}
+	if !strings.Contains(string(data), `"code":"free_mode_capacity_deferred"`) {
+		t.Errorf("body missing free_mode_capacity_deferred code: %s", data)
+	}
+	if got := chatCalls.Load(); got != 1 {
+		t.Errorf("upstream chat calls = %d, want 1 (no blind retry after budget exhaustion)", got)
+	}
+}
+
+// TestChatCapacityDeferredDefaultRetryAfter verifies the 10s Retry-After
+// fallback when the upstream free_mode_capacity_deferred response carries no
+// retry-after window (the AI SDK's default honor window).
+func TestChatCapacityDeferredDefaultRetryAfter(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"code":"free_mode_capacity_deferred","message":"Free mode is at capacity; your request will be retried automatically"}}`)
+	}
+	ts, _ := newTestServerCfg(t, nil, func(cfg *config.Config) { cfg.TransientRetries = 0 }, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429: %s", resp.StatusCode, data)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "10" {
+		t.Errorf("Retry-After = %q, want 10 (default window)", ra)
+	}
+	if !strings.Contains(string(data), `"code":"free_mode_capacity_deferred"`) {
+		t.Errorf("body missing free_mode_capacity_deferred code: %s", data)
+	}
+}
+
 // TestBridgeModeHealthzReportsMode pins the healthz "mode" field in pure
 // bridge mode.
 func TestBridgeModeHealthzReportsMode(t *testing.T) {

@@ -255,8 +255,9 @@ func (e *CreditsError) Unwrap() error { return ErrCredits }
 // automatically. The client retries it in-place against the SAME lease and
 // session (up to TRANSIENT_RETRIES extra attempts) before surfacing it; it
 // is never a token cooldown and never a session invalidation. Unwrap yields
-// a Retryable UpstreamError so generic server paths surface it as a
-// retryable 503 once the client-side budget is exhausted.
+// a Retryable UpstreamError so errors.As finds it, but writeError has a
+// dedicated branch: it surfaces as 429 free_mode_capacity_deferred with
+// Retry-After once the client-side budget is exhausted (#105) — not a 503.
 type CapacityDeferredError struct {
 	Status     int
 	RetryAfter time.Duration
