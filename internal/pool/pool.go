@@ -72,7 +72,8 @@ const retiredDrainGrace = 2 * time.Minute
 // token. The caller must call Pool.LeaseRelease when the request completes
 // or fails (it decrements the run's inflight counter).
 type Lease struct {
-	Token             int // index into config.AuthTokens (-1 for bridge leases)
+	Token             int    // index into config.AuthTokens (-1 for bridge leases)
+	Model             string // the model this lease's session/run is bound to (authoritative for opts.Model; may differ from the requested model after #100 fallback)
 	AgentID           string
 	Run               *runs.Run
 	SessionInstanceID string       // "" when the session is disabled
@@ -685,7 +686,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		p.lastActive = time.Now()
 		p.idleFinished = false
 		p.lastActiveMu.Unlock()
-		return &Lease{Token: idx, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
+		return &Lease{Token: idx, Model: model, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
 			TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, entry: tok}, nil
 	}
 
@@ -756,22 +757,36 @@ func (p *Pool) acquireOrder(toks *[]*tokenEntry, start int, model string) ([]int
 	// reasons — the caller does that in one place.
 	eligible := func(idx int) bool {
 		tok := (*toks)[idx]
-		if time.Now().Before(tok.runs.CooldownUntil()) {
-			return false
-		}
-		if cfg.MaxMessagesPerDay > 0 && p.usageCount(idx) >= cfg.MaxMessagesPerDay {
-			return false
-		}
+		// Quota-capped tokens are excluded from BOTH the hot set and the
+		// cold fallback: their rate-limit reasons ride back in quotaLimited,
+		// so the pool surfaces a real 429 when every token is capped.
 		if _, _, capped := quotaRemaining(tok, model); capped {
 			return false
 		}
 		return true
 	}
 
+	// Cooldown and daily-message-capped tokens stay ELIGIBLE for the cold
+	// fallback (they are simply not hot): the failover loop visits them and
+	// records their remembered ban/country-block/rate-limit/ip-capped/daily
+	// reasons, matching the historical linear-failover behavior. Excluding
+	// them here would drop those reasons from the error matrix when a hot
+	// token fails (review finding).
+	eligibleForHot := func(idx int) bool {
+		tok := (*toks)[idx]
+		if time.Now().Before(tok.runs.CooldownUntil()) {
+			return false
+		}
+		if cfg.MaxMessagesPerDay > 0 && p.usageCount(idx) >= cfg.MaxMessagesPerDay {
+			return false
+		}
+		return eligible(idx)
+	}
+
 	var hot []int
 	for offset := 0; offset < len(*toks); offset++ {
 		idx := (start + offset) % len(*toks)
-		if !eligible(idx) || !tokenHasLiveSession((*toks)[idx]) {
+		if !eligibleForHot(idx) || !tokenHasLiveSession((*toks)[idx]) {
 			continue
 		}
 		hot = append(hot, idx)
@@ -1012,7 +1027,7 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 	p.lastActive = time.Now()
 	p.idleFinished = false
 	p.lastActiveMu.Unlock()
-	return &Lease{Token: -1, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
+	return &Lease{Token: -1, Model: model, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
 		TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, Bridge: entry}, nil
 }
 
@@ -1402,8 +1417,12 @@ func (p *Pool) Shutdown(ctx context.Context) {
 		tokCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
 		tok.runs.Shutdown(tokCtx)
 		cancel()
-		if snap := tok.runs.Snapshot(); snap.ActiveRuns > 0 {
-			errs = append(errs, fmt.Sprintf("token-%d: %d runs left after shutdown", i+1, snap.ActiveRuns))
+		// With run persistence the runs are intentionally kept alive for
+		// restart-resume — not a drain failure (review P3).
+		if !tok.runs.KeptForPersistence() {
+			if snap := tok.runs.Snapshot(); snap.ActiveRuns > 0 {
+				errs = append(errs, fmt.Sprintf("token-%d: %d runs left after shutdown", i+1, snap.ActiveRuns))
+			}
 		}
 	}
 

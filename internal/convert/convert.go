@@ -252,6 +252,15 @@ func normalizeReasoning(payload, out map[string]any) {
 			disabled = true
 		}
 	}
+	// A client that explicitly disables thinking (Anthropic-style
+	// thinking:{type:"disabled"}) must win even when reasoning_effort is
+	// also present (review P2): re-enabling thinking the client turned off
+	// is a silent behavioral override.
+	if tObj, ok := payload["thinking"].(map[string]any); ok {
+		if tt, ok := tObj["type"].(string); ok && strings.EqualFold(strings.TrimSpace(tt), "disabled") {
+			disabled = true
+		}
+	}
 
 	switch {
 	case disabled:

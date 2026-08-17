@@ -3887,6 +3887,43 @@ func TestChatCompletionsRetriesCapacityDeferredSameSession(t *testing.T) {
 			t.Errorf("upstream chat calls = %d, want 1 (retries disabled)", got)
 		}
 	})
+
+	t.Run("budget resets per request", func(t *testing.T) {
+		// Regression (review P1): the capacity-deferred budget must be
+		// per-request, not client-lifetime. Two sequential requests on the
+		// SAME client must each get their own TRANSIENT_RETRIES budget.
+		mock4 := testutil.NewMock()
+		defer mock4.Close()
+		var calls4 atomic.Int32
+		mock4.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			if calls4.Add(1)%2 == 1 { // first call of each request: deferred
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, deferred)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`))
+		}
+		client4, err := New("tok-d", testConfig(mock4.URL(), func(c *config.Config) { c.TransientRetries = 1 }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			rc, err := client4.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+			if err != nil {
+				t.Fatalf("request %d after capacity-deferred retry: %v", i+1, err)
+			}
+			_ = rc.Close()
+		}
+		if got := calls4.Load(); got != 4 {
+			t.Errorf("upstream chat calls = %d, want 4 (2 requests x 2 calls: original + retry each)", got)
+		}
+		if got := client4.CapacityDeferredRetries(); got != 2 {
+			t.Errorf("CapacityDeferredRetries = %d, want 2 (one retry per request)", got)
+		}
+	})
 }
 
 // TestClassifyIpCappedNoPacificMidnight verifies #81: a 429 ip_capped body

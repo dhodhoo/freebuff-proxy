@@ -892,6 +892,7 @@ func (st *anthropicStreamState) ensureText(send func(map[string]any)) {
 	st.textIndex = st.nextBlockIdx
 	st.nextBlockIdx++
 	st.textStarted = true
+	st.textClosed = false // a reopened text block needs its own stop frame
 	send(map[string]any{
 		"type":  "content_block_start",
 		"index": st.textIndex,
@@ -902,13 +903,17 @@ func (st *anthropicStreamState) ensureText(send func(map[string]any)) {
 	})
 }
 
-// closeText closes the text block before tool blocks open.
+// closeText closes the text block before tool blocks open. The textStarted
+// flag is cleared so a LATER text delta reopens the block at a fresh index
+// (review P2 — some GLM/DeepSeek outputs interleave trailing text after
+// tool-call fragments; keeping textStarted set would silently drop it).
 func (st *anthropicStreamState) closeText(send func(map[string]any)) {
 	if !st.textStarted || st.textClosed {
 		return
 	}
 	send(map[string]any{"type": "content_block_stop", "index": st.textIndex})
 	st.textClosed = true
+	st.textStarted = false
 }
 
 // toolState returns (creating on first use) the tool block for an upstream

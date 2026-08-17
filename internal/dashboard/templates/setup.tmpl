@@ -100,8 +100,48 @@ Model ID: {{.Model}}</pre>
 <article class="card step-card">
   <h2><span class="step">+</span> Generate a token via browser login</h2>
   <p class="muted">Headless OAuth wizard (issue #62): start a GitHub login, complete it in the browser, and the proxy adds the resulting token to the pool + <code>.env</code> automatically.</p>
-  <button class="action-btn" id="login-start" hx-post="/admin/login/start" hx-target="#login-wizard" hx-swap="innerHTML">Generate token via browser login</button>
+  <button class="action-btn" id="login-start" onclick="fbLoginStart(this)">Generate token via browser login</button>
   <div id="login-wizard"></div>
+  <script>
+    var fbLoginPollTimer = null;
+    function fbLoginStart(btn) {
+      var box = document.getElementById('login-wizard');
+      btn.disabled = true;
+      box.innerHTML = '<p class="muted">Starting login…</p>';
+      fetch('/admin/login/start', {method: 'POST'})
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.fingerprint) {
+            box.innerHTML = '<p>Open this URL in a browser (and log into GitHub):</p>' +
+              '<p><a href="' + d.login_url + '" target="_blank" rel="noopener" class="pill mono">' + d.login_url + '</a></p>' +
+              '<p class="muted">Waiting for you to complete the login…</p>';
+            fbLoginPollTimer = setInterval(function () { fbLoginPoll(d.fingerprint); }, 3000);
+          } else {
+            box.innerHTML = '<p class="muted">' + (d.message || 'Login start failed — try again.') + '</p>';
+            btn.disabled = false;
+          }
+        })
+        .catch(function () { box.innerHTML = '<p class="muted">Login start failed — try again.</p>'; btn.disabled = false; });
+    }
+    function fbLoginPoll(fp) {
+      var box = document.getElementById('login-wizard');
+      fetch('/admin/login/status?fingerprint=' + encodeURIComponent(fp))
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.status === 'completed') {
+            clearInterval(fbLoginPollTimer);
+            box.innerHTML = '<p class="ok">Token added to the pool (token #' + d.token_index + ') and saved to <code>.env</code>.</p>';
+            document.getElementById('login-start').disabled = false;
+          } else if (d.status === 'error') {
+            clearInterval(fbLoginPollTimer);
+            box.innerHTML = '<p class="muted">Login failed: ' + (d.message || 'unknown error') + '</p>';
+            document.getElementById('login-start').disabled = false;
+          }
+          // pending: keep polling
+        })
+        .catch(function () { /* transient — keep polling */ });
+    }
+  </script>
 </article>
 
 {{if .Models}}

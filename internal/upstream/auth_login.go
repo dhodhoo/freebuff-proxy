@@ -103,6 +103,13 @@ type CLILoginCode struct {
 	FingerprintHash string
 	LoginURL        string
 	ExpiresAt       time.Time
+	// ExpiresAtRaw is the upstream expiresAt echoed verbatim on the status
+	// poll: the protocol is epoch MILLISECONDS (reference
+	// freebuff2api-chenjh/src/login.ts:41 "epoch ms", validated in ms at
+	// :262), and the status backend compares it against Date.now() in ms.
+	// Converting to seconds and re-encoding would make every code look
+	// already-expired (review P2).
+	ExpiresAtRaw int64
 }
 
 // CLILoginUser is the GitHub user metadata returned once the login
@@ -157,8 +164,15 @@ func (c *Client) StartCLILogin(ctx context.Context) (*CLILoginCode, error) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return nil, fmt.Errorf("upstream: decode login code: %w", err)
 	}
-	if decoded.FingerprintHash == "" || decoded.LoginURL == "" || decoded.ExpiresAt <= 0 {
+	if decoded.FingerprintHash == "" || decoded.LoginURL == "" {
 		return nil, fmt.Errorf("upstream: login code response missing fields")
+	}
+	// A missing/zero expiresAt is tolerated with a 1h default, mirroring the
+	// reference (login.ts substitutes Date.now()+60min when absent) — the
+	// login wizard must not die because the server omitted an advisory field
+	// (review P3).
+	if decoded.ExpiresAt <= 0 {
+		decoded.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
 	}
 	if decoded.FingerprintID != "" {
 		fingerprintID = decoded.FingerprintID
@@ -168,6 +182,7 @@ func (c *Client) StartCLILogin(ctx context.Context) (*CLILoginCode, error) {
 		FingerprintHash: decoded.FingerprintHash,
 		LoginURL:        decoded.LoginURL,
 		ExpiresAt:       loginExpiresAt(decoded.ExpiresAt),
+		ExpiresAtRaw:    decoded.ExpiresAt,
 	}, nil
 }
 
@@ -193,7 +208,11 @@ func (c *Client) PollCLILogin(ctx context.Context, code *CLILoginCode) (*CLILogi
 	q := u.Query()
 	q.Set("fingerprintId", code.FingerprintID)
 	q.Set("fingerprintHash", code.FingerprintHash)
-	q.Set("expiresAt", strconv.FormatInt(code.ExpiresAt.Unix(), 10))
+	expiresRaw := code.ExpiresAtRaw
+	if expiresRaw == 0 {
+		expiresRaw = code.ExpiresAt.UnixMilli()
+	}
+	q.Set("expiresAt", strconv.FormatInt(expiresRaw, 10))
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -271,6 +290,11 @@ func (c *Client) ProtocolGitHubLogin(ctx context.Context, username, password, to
 	client := &http.Client{
 		Transport: c.http.Transport,
 		Jar:       jar,
+		// The protocol page walk (login-code -> authorize -> form -> TOTP ->
+		// callback) must not hang on a stalled GitHub page: bound every call
+		// (review P3 — the caller's ctx only covers the whole flow, not
+		// individual page loads).
+		Timeout: loginCallTimeout,
 		// GitHub's OAuth dance redirects many times; the reference allows 12.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 12 {

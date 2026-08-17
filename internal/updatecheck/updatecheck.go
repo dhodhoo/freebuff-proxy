@@ -63,10 +63,18 @@ func (c *Checker) Latest(ctx context.Context) (string, error) {
 	}
 	if c.fetching {
 		// Another render is mid-fetch: wait for it rather than stacking a
-		// second GET.
+		// second GET. Honor ctx cancellation so a canceled waiter does not
+		// spin on the in-flight fetch.
 		for c.fetching {
 			c.mu.Unlock()
-			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				c.mu.Lock()
+				tag := c.latest
+				c.mu.Unlock()
+				return tag, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
 			c.mu.Lock()
 		}
 		tag := c.latest
@@ -84,11 +92,11 @@ func (c *Checker) Latest(ctx context.Context) (string, error) {
 		c.latest = tag
 		c.fetched = time.Now()
 	} else {
-		// Keep the previous value (retry on the next render); a first-ever
-		// failure leaves latest empty.
-		if c.latest != "" {
-			c.fetched = time.Now()
-		}
+		// Keep the previous value (retry on the next render). A first-ever
+		// failure also stamps fetched so the dashboard's frequent polls back
+		// off for CacheTTL instead of hammering api.github.com on every
+		// render (review P2).
+		c.fetched = time.Now()
 	}
 	got := c.latest
 	c.mu.Unlock()

@@ -102,13 +102,14 @@ type Server struct {
 
 // loginFlow is one in-flight headless login (issue #62).
 type loginFlow struct {
-	ID      string // short flow id shown to the client (fingerprint prefix)
-	Code    *upstream.CLILoginCode
-	Started time.Time
-	Done    bool
-	Token   string
-	Error   string
-	Index   int // pooled token index after AddToken (0 when bridge)
+	ID         string // short flow id shown to the client (fingerprint prefix)
+	Code       *upstream.CLILoginCode
+	Started    time.Time
+	Done       bool
+	Completing bool // one status poll is mid-completion (guards double-add)
+	Token      string
+	Error      string
+	Index      int // pooled token index after AddToken (0 when bridge)
 }
 
 // loginFlowTTL drops stale flows (never completed; browser closed).
@@ -1020,9 +1021,10 @@ func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("login wizard: started", "flow", flowID)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"flow_id":    flowID,
-		"login_url":  code.LoginURL,
-		"expires_at": code.ExpiresAt.UTC().Format(time.RFC3339),
+		"flow_id":     flowID,
+		"fingerprint": code.FingerprintID, // full id: the status poll key
+		"login_url":   code.LoginURL,
+		"expires_at":  code.ExpiresAt.UTC().Format(time.RFC3339),
 	})
 }
 
@@ -1044,25 +1046,50 @@ func (s *Server) handleLoginStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONError(w, http.StatusNotFound, "login flow not found or expired — start a new one", "invalid_request_error", "login_flow_missing", 0)
 		return
 	}
-	if flow.Done {
+	// Read the completion state under the lock: concurrent status polls
+	// (second tab, htmx retry) must not both proceed to addTokenPersist —
+	// the completing flag is set before the network poll so exactly one
+	// goroutine owns the add.
+	s.loginMu.Lock()
+	done := flow.Done
+	completing := flow.Completing
+	flow.Completing = true
+	s.loginMu.Unlock()
+	if done {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "token_index": flow.Index, "token": flow.Token})
 		return
 	}
+	if completing {
+		// Another poll is mid-completion; report pending so the client
+		// re-polls instead of double-adding.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		return
+	}
 	status, err := s.authClient.PollCLILogin(r.Context(), flow.Code)
 	if err != nil {
-		// Transient poll failure: keep the flow alive, report pending.
+		// Transient poll failure: keep the flow alive, report pending. A
+		// later poll may retry completion.
+		s.loginMu.Lock()
+		flow.Completing = false
+		s.loginMu.Unlock()
 		s.logger.Debug("login wizard: poll failed", "flow", flow.ID, "err", err)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
 		return
 	}
 	if !status.Done {
+		s.loginMu.Lock()
+		flow.Completing = false
+		s.loginMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
 		return
 	}
 	// Completed: add to the pool + persist to .env (mirrors handleTokenAdd).
+	// All completion fields are written under the lock so a concurrent poll
+	// observing Done reads a consistent record.
 	flow.Done = true
 	flow.Token = status.AuthToken
 	s.loginMu.Lock()
@@ -1071,6 +1098,9 @@ func (s *Server) handleLoginStatus(w http.ResponseWriter, r *http.Request) {
 	index, addErr := s.addTokenPersist(r.Context(), status.AuthToken)
 	if addErr != nil {
 		flow.Error = addErr.Error()
+		s.loginMu.Lock()
+		flow.Completing = false
+		s.loginMu.Unlock()
 		s.logger.Warn("login wizard: token persist failed", "flow", flow.ID, "err", addErr)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": addErr.Error()})
@@ -1924,7 +1954,24 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 		return
 	}
 	defer func() { _ = up.Close() }()
-	defer s.pool.LeaseRelease(lease)
+	// Issue #53: when the downstream client disconnects mid-stream, abandon
+	// the lease instead of a plain release — the run is FINISHed through the
+	// bounded queue (last-in-flight only) so upstream does not keep an
+	// abandoned agent run alive until the 6h rotation. A normal completion
+	// releases the lease as before.
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		if r.Context().Err() != nil {
+			s.pool.LeaseAbandon(lease)
+			return
+		}
+		s.pool.LeaseRelease(lease)
+	}
+	defer release()
 
 	routingAttrs := []any{
 		"token", tokenLabel(lease),
@@ -1988,6 +2035,10 @@ func chatErrClass(err error) string {
 		return "rate_limited"
 	case *upstream.BanError:
 		return "banned"
+	case *upstream.IpCappedError:
+		return "ip_capped"
+	case *upstream.SessionLimitError:
+		return "session_limit_reached"
 	case *upstream.WaitingRoomError, *session.WaitingRoomError:
 		return "waiting_room"
 	case *upstream.UpstreamError:
@@ -2045,8 +2096,24 @@ func (s *Server) chatAttempt(
 		return nil, nil, err
 	}
 
+	// The lease is the authoritative source for the model its session/run
+	// are bound to: after a #100 fallback the acquire returned a lease for
+	// the FALLBACK model while the caller still holds the requested model.
+	// opts.Model, the body model and x-freebuff-model must all agree with
+	// the lease (review P2 — previously the request went upstream labeled
+	// with the requested model against the fallback session/run).
+	effectiveModel := lease.Model
+	if effectiveModel == "" {
+		effectiveModel = model
+	}
+	if effectiveModel != model {
+		if renormalized, nerr := convert.NormalizeRequest(normalized, effectiveModel); nerr == nil {
+			normalized = renormalized
+		}
+	}
+
 	opts := upstream.ChatOptions{
-		Model:             model,
+		Model:             effectiveModel,
 		RunID:             lease.Run.RunID,
 		SessionInstanceID: lease.SessionInstanceID,
 		TraceSessionID:    lease.Run.TraceSessionID,
@@ -2137,11 +2204,24 @@ func (s *Server) chatAttempt(
 			}
 			s.logger.Debug("transient chat error, retrying once", "err", err)
 		}
-		lease, err = acquire(ctx, model)
+		lease, err = acquire(ctx, effectiveModel)
 		if err != nil {
 			return nil, nil, err
 		}
 		released = false
+		// A fresh lease may bind a different model (fallback path): refresh
+		// the effective model + body so opts.Model, the body and the
+		// lease's session/run stay consistent.
+		effectiveModel = lease.Model
+		if effectiveModel == "" {
+			effectiveModel = model
+		}
+		if effectiveModel != model {
+			if renormalized, nerr := convert.NormalizeRequest(normalized, effectiveModel); nerr == nil {
+				normalized = renormalized
+			}
+		}
+		opts.Model = effectiveModel
 		opts.RunID = lease.Run.RunID
 		opts.SessionInstanceID = lease.SessionInstanceID
 	}

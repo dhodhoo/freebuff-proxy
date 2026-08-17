@@ -193,11 +193,18 @@ type RunManager struct {
 	// (test hook for goroutine-leak assertions).
 	finishQueue         chan asyncJob
 	finishStop          chan struct{}
+	finishDrainCtx      context.Context // bounded by Shutdown's deadline; the drain loop abandons queued jobs when it expires (review P2 — unbounded queue drain could stall shutdown for minutes)
 	finishOnce          sync.Once
 	finishStartOnce     sync.Once
 	finishWg            sync.WaitGroup
 	finishExited        chan struct{}
 	inlineFinishTimeout time.Duration
+
+	// keptForPersistence is set by Shutdown when run persistence kept the
+	// active runs alive across restart (issue #40). Pool.Shutdown reads it
+	// to avoid a spurious "runs left after shutdown" warning on a clean
+	// shutdown of a persisted deployment (review P3).
+	keptForPersistence bool
 	// drainQueueCap / drainTTL bound the draining list (issue #55).
 	drainQueueCap int
 	drainTTL      time.Duration
@@ -269,6 +276,14 @@ func (m *RunManager) SetStore(store *session.Store) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.store = store
+}
+
+// KeptForPersistence reports whether the last Shutdown preserved the active
+// runs for restart-resume (issue #40) instead of FINISHing them.
+func (m *RunManager) KeptForPersistence() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.keptForPersistence
 }
 
 // Acquire returns the current run for agentID, starting one on first use or
@@ -435,8 +450,26 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 	// queued, so its FINISHes land before our own claim below, and no job
 	// can start after we snapshot the runs. The worker's finishing-flag
 	// claims are respected by the claim loop (finishing runs are skipped).
+	// The drain is bounded by the same deadline as the rest of Shutdown: a
+	// saturated queue (up to FinishQueueSize jobs x session-call timeout)
+	// must not stall shutdown for minutes (review P2).
+	m.finishDrainCtx = ctx
 	m.finishOnce.Do(func() { close(m.finishStop) })
-	m.finishWg.Wait()
+	// Wait for the drain, but never past the caller's deadline: if the
+	// worker is still draining after ctx expires, the remaining jobs are
+	// abandoned (best-effort FINISHes; the upstream connection dies with
+	// the process anyway).
+	waitDone := make(chan struct{})
+	go func() {
+		m.finishWg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		slog.Warn("runs: finish-queue drain exceeded shutdown deadline; abandoning remaining jobs", "manager", m)
+	}
+	_ = ctx.Err() // lint: ctx is still used by the caller below
 
 	// Run persistence (issue #40): with a store, keep the active runs alive
 	// across the restart like the session keep-alive — FINISHing them here
@@ -453,6 +486,7 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 		for i := range snapshot {
 			m.persistRun(&snapshot[i])
 		}
+		m.keptForPersistence = true
 		if err := m.session.Shutdown(ctx); err != nil {
 			slog.Warn("runs: shutdown session with errors", "errors", err)
 		}
@@ -921,9 +955,14 @@ func (m *RunManager) finishLoop() {
 	for {
 		select {
 		case <-m.finishStop:
-			// Shutdown: drain whatever is queued, then exit.
+			// Shutdown: drain whatever is queued (bounded by the shutdown
+			// deadline — a saturated queue must not stall the process),
+			// then exit. Jobs run on a background ctx so they COMPLETE;
+			// the deadline only abandons the wait (review P2).
 			for {
 				select {
+				case <-m.finishDrainCtx.Done():
+					return
 				case job := <-m.finishQueue:
 					m.runJob(context.Background(), job)
 				default:

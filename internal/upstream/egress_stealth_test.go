@@ -65,14 +65,15 @@ func TestStableEgressPinning(t *testing.T) {
 		t.Errorf("pinned index = %d, want hash index %d", got[0], want)
 	}
 	// A different model hashes to a different pin (per-session stability,
-	// not per-token rigidity).
-	other := stashIndex(c1, "z-ai/glm-5.2")
-	if other == got[0] && stableProxyIndex("tok-a", "z-ai/glm-5.2", 3) == got[0] {
-		// Collision possible with small n; only meaningful when the hashes
-		// differ, so assert the SELECTION follows the hash either way.
-		t.Log("models hashed to the same index with n=3; skipping cross-model assertion")
-	} else if other != stableProxyIndex("tok-a", "z-ai/glm-5.2", 3) {
-		t.Errorf("cross-model index = %d, want hash %d", other, stableProxyIndex("tok-a", "z-ai/glm-5.2", 3))
+	// not per-token rigidity). The selection must follow the hash for the
+	// stashed model regardless of collision, so assert against the hash
+	// unconditionally (review P3 — the previous version self-skipped on a
+	// collision and never verified per-model pinning).
+	glmModel := "z-ai/glm-5.2"
+	glmPin := stableProxyIndex("tok-a", glmModel, 3)
+	other := stashIndex(c1, glmModel)
+	if other != glmPin {
+		t.Errorf("cross-model index = %d, want hash %d", other, glmPin)
 	}
 
 	// Legacy: STABLE_EGRESS=false → tokenIndex % n regardless of model.
@@ -84,14 +85,17 @@ func TestStableEgressPinning(t *testing.T) {
 		t.Errorf("legacy per-token index = %d, want 1 (tokenIndex mod 3)", idx)
 	}
 
-	// A model-less request (session poll) reuses the last model's pin.
+	// A model-less request (session poll) reuses the LAST stashed model's
+	// pin — the stash above left c1 on glmModel, so expect the glm pin, not
+	// the flash pin (review P3: the old assertion expected the flash pin
+	// after a glm stash and would fail misleadingly if the pins differed).
 	pollReq, err := c1.newRequest(context.Background(), http.MethodGet, "/api/v1/freebuff/session", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pollIdx, _ := pollReq.Context().Value(proxyIndexKey{}).(int)
-	if pollIdx != want {
-		t.Errorf("model-less request index = %d, want last-model pin %d", pollIdx, want)
+	if pollIdx != glmPin {
+		t.Errorf("model-less request index = %d, want last-model pin %d", pollIdx, glmPin)
 	}
 }
 
@@ -291,7 +295,12 @@ func TestHTTP2UpstreamWiring(t *testing.T) {
 		}
 	})
 
-	t.Run("stable multi-proxy keeps h2", func(t *testing.T) {
+	t.Run("stable multi-proxy disables h2", func(t *testing.T) {
+		// Review P2: with STABLE_EGRESS, each (token,model) hashes to a
+		// DIFFERENT proxy (per-model pinning), but the http2 transport pools
+		// ONE connection per upstream origin, dialed via the FIRST request's
+		// proxy — so model B would ride model A's proxy, defeating the
+		// per-model pin. h2 must fall back to h1 (redial-per-request) here.
 		c, err := New("tok", testConfig("", func(cfg *config.Config) {
 			cfg.HTTP2Upstream = true
 			cfg.TLSFingerprint = "chrome126"
@@ -301,11 +310,11 @@ func TestHTTP2UpstreamWiring(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !c.http2Upstream {
-			t.Error("stable-egress multi-proxy must keep h2 (pinned proxy reuse is the point)")
+		if c.http2Upstream {
+			t.Error("stable-egress multi-proxy must disable h2 (per-origin reuse would collapse per-model pins)")
 		}
 		if msg := roundTripErr(c); !strings.Contains(msg, "stealth: tcp dial failed") {
-			t.Errorf("stable h2 dial error = %q, want the stealth wrapper", msg)
+			t.Errorf("stable h1 dial error = %q, want the stealth wrapper", msg)
 		}
 	})
 

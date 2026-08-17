@@ -697,9 +697,19 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 	// ignored. Keep h1, which redials per request via DisableKeepAlives.
 	// Stable bindings (STABLE_EGRESS hash pinning and the legacy per-token
 	// binding) reuse the same proxy anyway, so h2 is safe there.
-	if c.http2Upstream && len(c.socksProxies) > 1 &&
+	multiProxy := len(c.socksProxies) > 1
+	if c.http2Upstream && multiProxy &&
 		(c.proxyRotation == "round-robin" || c.proxyRotation == "random") {
 		slog.Warn("HTTP2_UPSTREAM ignored: PROXY_ROTATION round-robin/random with multiple SOCKS5 proxies — h2 connection reuse would defeat per-request rotation; using HTTP/1.1")
+		c.http2Upstream = false
+	}
+	// STABLE_EGRESS deliberately spreads MODELS across proxies (hash
+	// pinning), so the per-origin h2 connection would collapse all of a
+	// multi-model token's egress onto whichever proxy the FIRST request
+	// dialed (review P2). The legacy per-token binding pins one proxy for
+	// the whole client, where h2 reuse is safe; only that case keeps h2.
+	if c.http2Upstream && multiProxy && c.stableEgress {
+		slog.Warn("HTTP2_UPSTREAM ignored: STABLE_EGRESS with multiple SOCKS5 proxies — h2 connection reuse would defeat per-model egress pinning; using HTTP/1.1")
 		c.http2Upstream = false
 	}
 
@@ -830,6 +840,10 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 	// session (opts are unchanged, so the instance id is reused), bounded by
 	// the TRANSIENT_RETRIES budget — never a token cooldown, never a session
 	// invalidation (reference/freebuff-proxy-hengxin proxy.js:652-668).
+	// capacityDeferredAttempts is the per-request budget: a fresh call starts
+	// at zero, so every request gets its own TRANSIENT_RETRIES allowance
+	// (review P1 — the client-lifetime atomic only tracks the metric).
+	capacityDeferredAttempts := 0
 	for {
 		req, err := c.newRequest(withModel(ctx, opts.Model), http.MethodPost, "/api/v1/chat/completions", enveloped)
 		if err != nil {
@@ -866,8 +880,9 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 			releaseCancel(cancel)
 			c.dump("chat", req, resp.StatusCode, bodyText)
 			cerr := c.classify(resp.StatusCode, bodyText, resp.Header)
-			if isCapacityDeferred(cerr) && c.capacityDeferredRetries.Load() < int64(c.transientRetriesLimit) {
-				c.capacityDeferredRetries.Add(1)
+			if isCapacityDeferred(cerr) && capacityDeferredAttempts < c.transientRetriesLimit {
+				capacityDeferredAttempts++
+				c.capacityDeferredRetries.Add(1) // lifetime metric
 				continue
 			}
 			return nil, cerr
