@@ -50,10 +50,13 @@ func main() {
 	showUpdate := flag.Bool("update", false, "check for and download the latest release update")
 	showSetup := flag.Bool("setup", false, "run interactive client configuration helper")
 	testToken := flag.Bool("test-token", false, "probe the first configured token with a real session handshake and exit 0/1")
+	installService := flag.Bool("install-service", false, "register the current binary as a background service and start it (Task Scheduler / systemd --user / launchd)")
+	uninstallService := flag.Bool("uninstall-service", false, "stop and unregister the background service")
+	serviceStatus := flag.Bool("service-status", false, "check whether the background service is registered and running (exit 0 registered, 1 not)")
 	autoYes := flag.Bool("yes", false, "auto-confirm prompts during setup")
 	flag.Parse()
 
-	if w := modeFlagsExclusiveWarning(*showDoctor, *showUpdate, *showSetup, *testToken); w != "" {
+	if w := modeFlagsExclusiveWarning(*showDoctor, *showUpdate, *showSetup, *testToken, *installService, *uninstallService, *serviceStatus); w != "" {
 		fmt.Fprintln(os.Stderr, w)
 	}
 
@@ -72,6 +75,15 @@ func main() {
 	}
 	if *showSetup {
 		runSetup(*autoYes)
+	}
+	if *installService {
+		runServiceInstall()
+	}
+	if *uninstallService {
+		runServiceUninstall()
+	}
+	if *serviceStatus {
+		runServiceStatus()
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -330,11 +342,12 @@ func holdForExitIfConsole() {
 }
 
 // modeFlagsExclusiveWarning returns the warning printed when 2+ of the
-// mutually-exclusive mode flags (-doctor/-update/-setup/-test-token) are
-// set; "" when at most one is set (only the first flag then runs).
-func modeFlagsExclusiveWarning(doctor, update, setup, testToken bool) string {
+// mutually-exclusive mode flags (-doctor/-update/-setup/-test-token/
+// -install-service/-uninstall-service/-service-status) are set; "" when at
+// most one is set (only the first flag then runs).
+func modeFlagsExclusiveWarning(doctor, update, setup, testToken, installService, uninstallService, serviceStatus bool) string {
 	n := 0
-	for _, set := range []bool{doctor, update, setup, testToken} {
+	for _, set := range []bool{doctor, update, setup, testToken, installService, uninstallService, serviceStatus} {
 		if set {
 			n++
 		}
@@ -342,7 +355,7 @@ func modeFlagsExclusiveWarning(doctor, update, setup, testToken bool) string {
 	if n <= 1 {
 		return ""
 	}
-	return "freebuff-proxy: warning: -doctor, -update, -setup and -test-token are mutually exclusive; only the first will run"
+	return "freebuff-proxy: warning: -doctor, -update, -setup, -test-token, -install-service, -uninstall-service and -service-status are mutually exclusive; only the first will run"
 }
 
 // resolveLogLevel applies the effective log-level precedence: a set

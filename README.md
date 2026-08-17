@@ -226,6 +226,9 @@ curl http://127.0.0.1:3457/healthz
 | `-update` | Self-update from the latest GitHub release (SHA-256 verified against `checksums.txt`) |
 | `-setup` | Interactive client setup (detects installed clients) |
 | `-yes` | Auto-confirm `-setup` prompts |
+| `-install-service` | Register the current binary as a background service and start it: Task Scheduler on Windows (per-user, no admin), systemd `--user` unit on Linux, launchd LaunchAgent on macOS. Runs from the executable's directory so `.env` resolves, and auto-starts on logon/boot |
+| `-uninstall-service` | Stop and unregister the background service (idempotent) |
+| `-service-status` | Check whether the service is registered and running; exits `0` when registered, `1` when not (scriptable) |
 
 ---
 

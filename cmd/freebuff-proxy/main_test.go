@@ -256,23 +256,27 @@ func TestVersionFlagPrintsVersion(t *testing.T) {
 }
 
 // TestModeFlagsExclusiveWarning pins the mutually-exclusive-mode warning:
-// 2+ of -doctor/-update/-setup/-test-token prints the warning (only the
-// first flag then runs), at most one set prints nothing.
+// 2+ of -doctor/-update/-setup/-test-token/-install-service/
+// -uninstall-service/-service-status prints the warning (only the first
+// flag then runs), at most one set prints nothing.
 func TestModeFlagsExclusiveWarning(t *testing.T) {
 	cases := []struct {
-		name                             string
-		doctor, update, setup, testToken bool
-		want                             string
+		name                                            string
+		doctor, update, setup, testToken                bool
+		installService, uninstallService, serviceStatus bool
+		want                                            string
 	}{
-		{"none", false, false, false, false, ""},
-		{"single", false, false, true, false, ""},
-		{"two", true, false, true, false, "mutually exclusive"},
-		{"three", true, true, false, true, "mutually exclusive"},
-		{"all four", true, true, true, true, "mutually exclusive"},
+		{"none", false, false, false, false, false, false, false, ""},
+		{"single", false, false, true, false, false, false, false, ""},
+		{"single service", false, false, false, false, true, false, false, ""},
+		{"two", true, false, true, false, false, false, false, "mutually exclusive"},
+		{"three", true, true, false, true, false, false, false, "mutually exclusive"},
+		{"service pair", false, false, false, false, true, true, false, "mutually exclusive"},
+		{"all seven", true, true, true, true, true, true, true, "mutually exclusive"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := modeFlagsExclusiveWarning(tc.doctor, tc.update, tc.setup, tc.testToken)
+			got := modeFlagsExclusiveWarning(tc.doctor, tc.update, tc.setup, tc.testToken, tc.installService, tc.uninstallService, tc.serviceStatus)
 			if tc.want == "" {
 				if got != "" {
 					t.Errorf("modeFlagsExclusiveWarning = %q, want empty", got)
