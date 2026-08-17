@@ -253,6 +253,11 @@ type socks5TestServer struct {
 	gotUser   string
 	gotPass   string
 	authFails int
+	// targets records every CONNECT target addr the proxy was asked to open
+	// (host:port exactly as the client sent it), so tests can assert the
+	// client passed a DOMAIN NAME through (remote DNS) instead of a
+	// pre-resolved IP.
+	targets []string
 }
 
 func newSocks5TestServer(t *testing.T, requireAuth bool, user, pass string) *socks5TestServer {
@@ -369,6 +374,9 @@ func (s *socks5TestServer) handle(c net.Conn) {
 		return
 	}
 	target := net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(port))))
+	s.mu.Lock()
+	s.targets = append(s.targets, target)
+	s.mu.Unlock()
 
 	up, err := net.Dial("tcp", target)
 	if err != nil {
@@ -390,6 +398,32 @@ func (s *socks5TestServer) handle(c net.Conn) {
 	}()
 	_, _ = io.Copy(c, up)
 	<-done
+}
+
+// TestSocks5DialerForwardsHostname guards the remote-DNS contract (issue
+// #56): the dialer must hand the SOCKS5 proxy the RAW hostname (RFC 1928
+// ATYP=3 domain name) so the proxy resolves it — never a locally
+// pre-resolved IP, which would leak the DNS query to the ISP. The test proxy
+// records the CONNECT target it was asked to open; an unresolvable .invalid
+// domain is used so the assertion never touches the real network.
+func TestSocks5DialerForwardsHostname(t *testing.T) {
+	srv := newSocks5TestServer(t, false, "", "")
+	dialer, err := Socks5Dialer("socks5://" + srv.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const host = "egress-test.invalid" // RFC 2606: never resolves, no network I/O
+	_, _ = dialer(context.Background(), "tcp", host+":443")
+
+	srv.mu.Lock()
+	targets := append([]string(nil), srv.targets...)
+	srv.mu.Unlock()
+	if len(targets) != 1 {
+		t.Fatalf("proxy saw %d CONNECT targets %v, want exactly 1", len(targets), targets)
+	}
+	if targets[0] != host+":443" {
+		t.Errorf("proxy received target %q, want the raw hostname %q — the dialer must NOT pre-resolve (remote DNS)", targets[0], host+":443")
+	}
 }
 
 // TestSocks5DialerDialThrough exercises the SOCKS5 dialer end to end against

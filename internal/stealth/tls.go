@@ -21,9 +21,20 @@ import (
 //
 // baseDial provides the underlying TCP dial (e.g. SOCKS5). When nil, a
 // default net.Dialer with 30s timeout is used.
-func Dialer(profile *Profile, baseDial func(ctx context.Context, network, addr string) (net.Conn, error), insecureSkipVerify bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+//
+// alpn pins the ALPN protocols advertised in the ClientHello. nil/empty
+// falls back to ["http/1.1"] — the pre-#51 behavior. For HTTP/2 upstreams
+// pass ["h2", "http/1.1"]: real browsers advertise exactly that, so forcing
+// h1-only is itself a JA4 ALPN mismatch (issue #51). The negotiated protocol
+// MUST match the transport actually used: h2 ALPN with Go's h1 transport
+// breaks (server sends SETTINGS frames the h1 parser chokes on), and h1 ALPN
+// with an http2 transport never negotiates h2.
+func Dialer(profile *Profile, baseDial func(ctx context.Context, network, addr string) (net.Conn, error), insecureSkipVerify bool, alpn []string) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	if profile == nil {
 		profile = DefaultProfile()
+	}
+	if len(alpn) == 0 {
+		alpn = []string{"http/1.1"}
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		connProfile := GetProfileForConnection(profile)
@@ -71,23 +82,24 @@ func Dialer(profile *Profile, baseDial func(ctx context.Context, network, addr s
 			}
 		}
 
-		// Materialize the preset's extensions first, then pin ALPN to
-		// HTTP/1.1. The browser presets advertise "h2,http/1.1" and upstream
-		// would negotiate h2 — but Go's http.Transport cannot use HTTP/2
-		// over a *utls.UConn (its h2 path type-asserts the connection to
-		// *tls.Conn), so it falls back to HTTP/1.x and chokes on the
-		// server's h2 SETTINGS frame ("malformed HTTP response").
+		// Materialize the preset's extensions first, then pin ALPN to the
+		// requested list. The browser presets advertise "h2,http/1.1";
+		// Go's http.Transport cannot dispatch HTTP/2 over a *utls.UConn (its
+		// h2 path type-asserts the conn to *tls.Conn), so the h1 path pins
+		// "http/1.1" and the h2 path (issue #51) passes ["h2","http/1.1"]
+		// and uses an http2.Transport with this same dialer.
 		//
 		// BuildHandshakeState() must run BEFORE the mutation: the first
 		// build applies the preset spec (clobbering uconn.Extensions), and
 		// every later build re-applies the (mutated) extension list.
 		// JA3 hashes extension types, not ALPN values, so the fingerprint is
-		// unaffected.
+		// unaffected; JA4 reads the ALPN list, which is why the h2 list
+		// matters.
 		if err := uConn.BuildHandshakeState(); err != nil {
 			_ = rawConn.Close()
 			return nil, fmt.Errorf("stealth: build handshake state failed: %w", err)
 		}
-		setALPN(uConn, []string{"http/1.1"})
+		setALPN(uConn, alpn)
 		if err := uConn.BuildHandshakeState(); err != nil {
 			_ = rawConn.Close()
 			return nil, fmt.Errorf("stealth: rebuild handshake state failed: %w", err)

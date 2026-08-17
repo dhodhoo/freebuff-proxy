@@ -18,12 +18,13 @@ import (
 var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "HTTP_PROXY",
-	"SOCKS5_PROXY", "SOCKS5_PROXIES", "PROXY_ROTATION", "COST_MODE",
+	"SOCKS5_PROXY", "SOCKS5_PROXIES", "PROXY_ROTATION", "COST_MODE", "USER_ID",
 	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
 	"MODELS_HIDE_UNAVAILABLE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
 	"AUTO_DISCOVER_TOKEN", "TRANSIENT_RETRIES", "ADMIN_TOKEN",
 	"SESSION_PERSIST", "SESSION_STATE_FILE",
+	"STABLE_EGRESS", "HTTP2_UPSTREAM", "PROXY_HEALTH_INTERVAL", "PROXY_HEALTH_MAX_FAILURES",
 }
 
 // TestMain strips ambient freebuff-proxy config env vars for the whole test
@@ -187,6 +188,83 @@ func TestTransientRetries(t *testing.T) {
 		t.Fatalf("Load (negative): err = %v, want error mentioning TRANSIENT_RETRIES", err)
 	}
 	t.Setenv("TRANSIENT_RETRIES", "")
+}
+
+func TestEgressStabilityKnobs(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+
+	// Defaults: STABLE_EGRESS and HTTP2_UPSTREAM on, health 1m/3 failures.
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load (default): %v", err)
+	}
+	if !cfg.StableEgress {
+		t.Error("StableEgress = false, want true (default)")
+	}
+	if !cfg.HTTP2Upstream {
+		t.Error("HTTP2Upstream = false, want true (default)")
+	}
+	if cfg.ProxyHealthInterval != time.Minute {
+		t.Errorf("ProxyHealthInterval = %v, want 1m", cfg.ProxyHealthInterval)
+	}
+	if cfg.ProxyHealthMaxFailures != 3 {
+		t.Errorf("ProxyHealthMaxFailures = %d, want 3", cfg.ProxyHealthMaxFailures)
+	}
+
+	// Env overrides win.
+	t.Setenv("STABLE_EGRESS", "false")
+	t.Setenv("HTTP2_UPSTREAM", "0")
+	t.Setenv("PROXY_HEALTH_INTERVAL", "5s")
+	t.Setenv("PROXY_HEALTH_MAX_FAILURES", "7")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load (overrides): %v", err)
+	}
+	if cfg.StableEgress {
+		t.Error("StableEgress = true after STABLE_EGRESS=false")
+	}
+	if cfg.HTTP2Upstream {
+		t.Error("HTTP2Upstream = true after HTTP2_UPSTREAM=0")
+	}
+	if cfg.ProxyHealthInterval != 5*time.Second {
+		t.Errorf("ProxyHealthInterval = %v, want 5s", cfg.ProxyHealthInterval)
+	}
+	if cfg.ProxyHealthMaxFailures != 7 {
+		t.Errorf("ProxyHealthMaxFailures = %d, want 7", cfg.ProxyHealthMaxFailures)
+	}
+
+	// Invalid health interval falls back to the 1m default (graceful).
+	t.Setenv("PROXY_HEALTH_INTERVAL", "-5s")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load (negative interval): %v", err)
+	}
+	if cfg.ProxyHealthInterval != time.Minute {
+		t.Errorf("ProxyHealthInterval = %v after -5s, want 1m default", cfg.ProxyHealthInterval)
+	}
+	t.Setenv("PROXY_HEALTH_INTERVAL", "1m")
+
+	// A garbage duration fails parse.
+	t.Setenv("PROXY_HEALTH_INTERVAL", "banana")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "PROXY_HEALTH_INTERVAL") {
+		t.Fatalf("Load (garbage interval): err = %v, want error mentioning PROXY_HEALTH_INTERVAL", err)
+	}
+	t.Setenv("PROXY_HEALTH_INTERVAL", "")
+
+	// A negative max-failures value fails validation.
+	t.Setenv("PROXY_HEALTH_MAX_FAILURES", "-1")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "PROXY_HEALTH_MAX_FAILURES") {
+		t.Fatalf("Load (-1 failures): err = %v, want error mentioning PROXY_HEALTH_MAX_FAILURES", err)
+	}
+	// 0 is accepted (the checker falls back to the 3-failure default).
+	t.Setenv("PROXY_HEALTH_MAX_FAILURES", "0")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (0 failures): %v", err)
+	} else if cfg.ProxyHealthMaxFailures != 0 {
+		t.Errorf("ProxyHealthMaxFailures = %d, want 0 (explicit zero passes through)", cfg.ProxyHealthMaxFailures)
+	}
+	t.Setenv("PROXY_HEALTH_MAX_FAILURES", "")
 }
 
 func TestSafeMode(t *testing.T) {
@@ -1842,4 +1920,60 @@ func TestReadDotenvQuotingAndComments(t *testing.T) {
 	if len(got) != len(want) {
 		t.Errorf("readDotenv returned %d keys, want %d", len(got), len(want))
 	}
+}
+
+// ── Wave 1 issue tests (#79: USER_ID) ────────────────────────────────────
+
+// TestUserID verifies USER_ID resolves from the environment, the .env file,
+// and the JSON config (optional key; empty default), issue #79.
+func TestUserID(t *testing.T) {
+	t.Run("default empty", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.UserID != "" {
+			t.Errorf("UserID = %q, want empty default", cfg.UserID)
+		}
+	})
+	t.Run("env override", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		t.Setenv("USER_ID", "user-abc")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.UserID != "user-abc" {
+			t.Errorf("UserID = %q, want user-abc", cfg.UserID)
+		}
+	})
+	t.Run("dotenv", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok-1\nUSER_ID=user-dotenv\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.UserID != "user-dotenv" {
+			t.Errorf("UserID = %q, want user-dotenv (from .env)", cfg.UserID)
+		}
+	})
+	t.Run("JSON config", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.WriteFile("cfg.json", []byte(`{"AUTH_TOKENS":["tok-1"],"USER_ID":"user-json"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("cfg.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.UserID != "user-json" {
+			t.Errorf("UserID = %q, want user-json (from JSON config)", cfg.UserID)
+		}
+	})
 }

@@ -23,37 +23,42 @@ import (
 
 // Config is the fully-resolved, validated runtime configuration.
 type Config struct {
-	ListenAddr            string
-	UpstreamBaseURL       string
-	AuthTokens            []string
-	RotationInterval      time.Duration
-	RequestTimeout        time.Duration
-	SessionCallTimeout    time.Duration
-	APIKeys               []string
-	AdminToken            string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
-	HTTPProxy             string
-	SOCKS5Proxy           string
-	SOCKS5Proxies         []string // comma-separated list of SOCKS5 proxies (#23)
-	ProxyRotation         string   // "per-token" (default), "round-robin", "random" (#23)
-	CostMode              string   // "" (omit) or "free"; A/B pending, PRD §8
-	TLSFingerprint        string   // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
-	RegistryRefresh       time.Duration
-	DebugDump             bool
-	LogFile               string
-	LogLevel              string            // "" (use -v/default) or debug|info|warn|error
-	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
-	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
-	SafeMode              bool              // true = apply recommended anti-ban safe defaults
-	HybridMode            bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
-	ModelsHideUnavailable bool              // true = /v1/models prunes models marked unavailable (region/tier/quota)
-	RequestJitter         time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
-	CLIVersion            string            // upstream CLI version string (default: 0.10.7)
-	ModelAliases          map[string]string // map model alias -> real model ID (#25)
-	TransientRetries      int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
-	SessionPersist        bool              // true = persist session state to disk so restart resumes unexpired sessions (SESSION_PERSIST)
-	SessionStateFile      string            // path to the session state file (SESSION_STATE_FILE; default .freebuff-session-state.json)
-	DiscoveredSource      string            // auto-discovered credentials file path (if any)
-	DiscoveredEmail       string            // auto-discovered account email (if any)
+	ListenAddr             string
+	UpstreamBaseURL        string
+	AuthTokens             []string
+	RotationInterval       time.Duration
+	RequestTimeout         time.Duration
+	SessionCallTimeout     time.Duration
+	APIKeys                []string
+	AdminToken             string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
+	HTTPProxy              string
+	SOCKS5Proxy            string
+	SOCKS5Proxies          []string // comma-separated list of SOCKS5 proxies (#23)
+	ProxyRotation          string   // "per-token" (default), "round-robin", "random" (#23)
+	CostMode               string   // "" (omit) or "free"; A/B pending, PRD §8
+	UserID                 string   // optional FreeBuff account id sent as x-freebuff-acting-user-id (CLI parity; empty = omitted)
+	TLSFingerprint         string   // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
+	RegistryRefresh        time.Duration
+	DebugDump              bool
+	LogFile                string
+	LogLevel               string            // "" (use -v/default) or debug|info|warn|error
+	MaxMessagesPerDay      int               // 0 = unlimited: per-token cap on successful chats per 24h
+	IdleRotationTimeout    time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
+	SafeMode               bool              // true = apply recommended anti-ban safe defaults
+	HybridMode             bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
+	ModelsHideUnavailable  bool              // true = /v1/models prunes models marked unavailable (region/tier/quota)
+	RequestJitter          time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
+	CLIVersion             string            // upstream CLI version string (default: 0.10.7)
+	ModelAliases           map[string]string // map model alias -> real model ID (#25)
+	TransientRetries       int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
+	SessionPersist         bool              // true = persist session state to disk so restart resumes unexpired sessions (SESSION_PERSIST)
+	SessionStateFile       string            // path to the session state file (SESSION_STATE_FILE; default .freebuff-session-state.json)
+	StableEgress           bool              // true = pin a token's egress to one hash-stable proxy for the session lifetime (STABLE_EGRESS); false = legacy per-token binding (#98)
+	HTTP2Upstream          bool              // true = negotiate HTTP/2 with the upstream so the ALPN matches real browsers (HTTP2_UPSTREAM); false forces HTTP/1.1 (#51)
+	ProxyHealthInterval    time.Duration     // per-proxy health probe interval (PROXY_HEALTH_INTERVAL; default 1m; <= 0 falls back to the default)
+	ProxyHealthMaxFailures int               // consecutive failures before a proxy is marked out-of-rotation (PROXY_HEALTH_MAX_FAILURES; default 3)
+	DiscoveredSource       string            // auto-discovered credentials file path (if any)
+	DiscoveredEmail        string            // auto-discovered account email (if any)
 }
 
 // BridgeMode reports whether the proxy runs without any AUTH_TOKENS: every
@@ -87,55 +92,67 @@ type rawConfig struct {
 	// explicitly-empty AUTH_TOKENS means the operator chose bridge mode, so
 	// CLI auto-discovery must not refill it (runtime mode switch persists
 	// "AUTH_TOKENS=" to .env and relies on this).
-	AuthTokensSet         bool     `json:"-"`
-	RotationInterval      string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout        string   `json:"REQUEST_TIMEOUT"`
-	SessionCallTimeout    string   `json:"SESSION_CALL_TIMEOUT"`
-	APIKeys               []string `json:"API_KEYS"`
-	AdminToken            string   `json:"ADMIN_TOKEN"`
-	HTTPProxy             string   `json:"HTTP_PROXY"`
-	SOCKS5Proxy           string   `json:"SOCKS5_PROXY"`
-	SOCKS5Proxies         []string `json:"SOCKS5_PROXIES"`
-	ProxyRotation         string   `json:"PROXY_ROTATION"`
-	CostMode              string   `json:"COST_MODE"`
-	TLSFingerprint        string   `json:"TLS_FINGERPRINT"`
-	RegistryRefresh       string   `json:"REGISTRY_REFRESH"`
-	DebugDump             bool     `json:"DEBUG_DUMP"`
-	LogFile               string   `json:"LOG_FILE"`
-	LogLevel              string   `json:"LOG_LEVEL"`
-	MaxMessagesPerDay     *int     `json:"MAX_MESSAGES_PER_DAY"`
-	IdleRotationTimeout   string   `json:"IDLE_ROTATION_TIMEOUT"`
-	SafeMode              bool     `json:"SAFE_MODE"`
-	HybridMode            bool     `json:"HYBRID_MODE"`
-	ModelsHideUnavailable bool     `json:"MODELS_HIDE_UNAVAILABLE"`
-	RequestJitter         string   `json:"REQUEST_JITTER"`
-	CLIVersion            string   `json:"CLI_VERSION"`
-	ModelAliases          string   `json:"MODEL_ALIASES"`
-	TransientRetries      *int     `json:"TRANSIENT_RETRIES"`
-	SessionPersist        bool     `json:"SESSION_PERSIST"`
-	SessionStateFile      string   `json:"SESSION_STATE_FILE"`
+	AuthTokensSet          bool     `json:"-"`
+	RotationInterval       string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout         string   `json:"REQUEST_TIMEOUT"`
+	SessionCallTimeout     string   `json:"SESSION_CALL_TIMEOUT"`
+	APIKeys                []string `json:"API_KEYS"`
+	AdminToken             string   `json:"ADMIN_TOKEN"`
+	HTTPProxy              string   `json:"HTTP_PROXY"`
+	SOCKS5Proxy            string   `json:"SOCKS5_PROXY"`
+	SOCKS5Proxies          []string `json:"SOCKS5_PROXIES"`
+	ProxyRotation          string   `json:"PROXY_ROTATION"`
+	CostMode               string   `json:"COST_MODE"`
+	UserID                 string   `json:"USER_ID"`
+	TLSFingerprint         string   `json:"TLS_FINGERPRINT"`
+	RegistryRefresh        string   `json:"REGISTRY_REFRESH"`
+	DebugDump              bool     `json:"DEBUG_DUMP"`
+	LogFile                string   `json:"LOG_FILE"`
+	LogLevel               string   `json:"LOG_LEVEL"`
+	MaxMessagesPerDay      *int     `json:"MAX_MESSAGES_PER_DAY"`
+	IdleRotationTimeout    string   `json:"IDLE_ROTATION_TIMEOUT"`
+	SafeMode               bool     `json:"SAFE_MODE"`
+	HybridMode             bool     `json:"HYBRID_MODE"`
+	ModelsHideUnavailable  bool     `json:"MODELS_HIDE_UNAVAILABLE"`
+	RequestJitter          string   `json:"REQUEST_JITTER"`
+	CLIVersion             string   `json:"CLI_VERSION"`
+	ModelAliases           string   `json:"MODEL_ALIASES"`
+	TransientRetries       *int     `json:"TRANSIENT_RETRIES"`
+	SessionPersist         bool     `json:"SESSION_PERSIST"`
+	SessionStateFile       string   `json:"SESSION_STATE_FILE"`
+	StableEgress           bool     `json:"STABLE_EGRESS"`
+	HTTP2Upstream          bool     `json:"HTTP2_UPSTREAM"`
+	ProxyHealthInterval    string   `json:"PROXY_HEALTH_INTERVAL"`
+	ProxyHealthMaxFailures *int     `json:"PROXY_HEALTH_MAX_FAILURES"`
 }
 
 func defaultRawConfig() rawConfig {
 	return rawConfig{
-		ListenAddr:          "127.0.0.1:3457",       // loopback by default (PRD §3); containers set LISTEN_ADDR=:3457
-		UpstreamBaseURL:     "https://codebuff.com", // normalized to www.
-		RotationInterval:    "6h",
-		RequestTimeout:      "15m",
-		SessionCallTimeout:  "30s",
-		RegistryRefresh:     "6h",
-		CostMode:            "free", // free-tier mode; omission routes requests as PAID and fresh free accounts get 402 "Out of credits" (upstream check: cost_mode !== 'free' → billing)
-		MaxMessagesPerDay:   nil,
-		IdleRotationTimeout: "",    // "" = disabled (unset → SAFE_MODE preset may fill)
-		SafeMode:            true,  // anti-ban presets on by default; set SAFE_MODE=false to disable
-		HybridMode:          false, // relay client tokens AND serve the pool (off by default)
-		RequestJitter:       "",    // "" = disabled (unset → SAFE_MODE preset may fill)
-		CLIVersion:          "0.10.7",
-		TransientRetries:    nil,   // nil = 1 (one retry after a transient transport failure; 0 disables)
-		SessionPersist:      false, // opt-in: persist session state across restarts
-		SessionStateFile:    ".freebuff-session-state.json",
+		ListenAddr:             "127.0.0.1:3457",       // loopback by default (PRD §3); containers set LISTEN_ADDR=:3457
+		UpstreamBaseURL:        "https://codebuff.com", // normalized to www.
+		RotationInterval:       "6h",
+		RequestTimeout:         "15m",
+		SessionCallTimeout:     "30s",
+		RegistryRefresh:        "6h",
+		CostMode:               "free", // free-tier mode; omission routes requests as PAID and fresh free accounts get 402 "Out of credits" (upstream check: cost_mode !== 'free' → billing)
+		MaxMessagesPerDay:      nil,
+		IdleRotationTimeout:    "",    // "" = disabled (unset → SAFE_MODE preset may fill)
+		SafeMode:               true,  // anti-ban presets on by default; set SAFE_MODE=false to disable
+		HybridMode:             false, // relay client tokens AND serve the pool (off by default)
+		RequestJitter:          "",    // "" = disabled (unset → SAFE_MODE preset may fill)
+		CLIVersion:             "0.10.7",
+		TransientRetries:       nil,   // nil = 1 (one retry after a transient transport failure; 0 disables)
+		SessionPersist:         false, // opt-in: persist session state across restarts
+		SessionStateFile:       ".freebuff-session-state.json",
+		StableEgress:           true, // session IP stability (anti-ban) on by default (#98); PROXY_ROTATION explicitly set still wins
+		HTTP2Upstream:          true, // h2 ALPN matches real browsers (reference proxy-freebuff USE_HTTP2 default '1'); HTTP2_UPSTREAM=false forces h1 (#51)
+		ProxyHealthInterval:    "1m",
+		ProxyHealthMaxFailures: ptrInt(3), // nil default: resolved to 3 in Load
 	}
 }
+
+// ptrInt returns a pointer to n for *int raw fields with a non-nil default.
+func ptrInt(n int) *int { return &n }
 
 // Load resolves configuration from the optional JSON file at configPath
 // ("" skips the file), the optional ./.env file (when present), and
@@ -175,6 +192,7 @@ func Load(configPath string) (Config, error) {
 	overrideCSV(&raw.SOCKS5Proxies, "SOCKS5_PROXIES")
 	overrideString(&raw.ProxyRotation, "PROXY_ROTATION")
 	overrideString(&raw.CostMode, "COST_MODE")
+	overrideString(&raw.UserID, "USER_ID")
 	overrideString(&raw.TLSFingerprint, "TLS_FINGERPRINT")
 	overrideString(&raw.RegistryRefresh, "REGISTRY_REFRESH")
 	overrideBool(&raw.DebugDump, "DEBUG_DUMP")
@@ -191,6 +209,10 @@ func Load(configPath string) (Config, error) {
 	overrideInt(&raw.TransientRetries, "TRANSIENT_RETRIES")
 	overrideBool(&raw.SessionPersist, "SESSION_PERSIST")
 	overrideString(&raw.SessionStateFile, "SESSION_STATE_FILE")
+	overrideBool(&raw.StableEgress, "STABLE_EGRESS")
+	overrideBool(&raw.HTTP2Upstream, "HTTP2_UPSTREAM")
+	overrideString(&raw.ProxyHealthInterval, "PROXY_HEALTH_INTERVAL")
+	overrideInt(&raw.ProxyHealthMaxFailures, "PROXY_HEALTH_MAX_FAILURES")
 
 	parseDuration := func(raw, name string) (time.Duration, error) {
 		d, err := time.ParseDuration(strings.TrimSpace(raw))
@@ -215,6 +237,16 @@ func Load(configPath string) (Config, error) {
 	registryRefresh, err := parseDuration(raw.RegistryRefresh, "REGISTRY_REFRESH")
 	if err != nil {
 		return Config{}, err
+	}
+	proxyHealthInterval, err := parseDuration(raw.ProxyHealthInterval, "PROXY_HEALTH_INTERVAL")
+	if err != nil {
+		return Config{}, err
+	}
+	if proxyHealthInterval <= 0 {
+		// A zero/negative interval would spin the health ticker pointlessly;
+		// fall back to the 1m default so a misconfigured value degrades
+		// gracefully instead of erroring at startup.
+		proxyHealthInterval = time.Minute
 	}
 	// IDLE_ROTATION_TIMEOUT is zero-tolerant: "" or "0" both mean disabled.
 	// idleRotationSet distinguishes "explicitly disabled" from "not
@@ -256,36 +288,48 @@ func Load(configPath string) (Config, error) {
 		transientRetries = *raw.TransientRetries
 	}
 
+	// PROXY_HEALTH_MAX_FAILURES: nil defaults to 3 consecutive failures
+	// before a proxy is marked out-of-rotation.
+	proxyHealthMaxFailures := 3
+	if raw.ProxyHealthMaxFailures != nil {
+		proxyHealthMaxFailures = *raw.ProxyHealthMaxFailures
+	}
+
 	cfg := Config{
-		ListenAddr:            strings.TrimSpace(raw.ListenAddr),
-		UpstreamBaseURL:       upstreamBaseURL,
-		AuthTokens:            dedupeStrings(raw.AuthTokens),
-		RotationInterval:      rotationInterval,
-		RequestTimeout:        requestTimeout,
-		SessionCallTimeout:    sessionCallTimeout,
-		APIKeys:               dedupeStrings(raw.APIKeys),
-		AdminToken:            strings.TrimSpace(raw.AdminToken),
-		HTTPProxy:             strings.TrimSpace(raw.HTTPProxy),
-		SOCKS5Proxy:           strings.TrimSpace(raw.SOCKS5Proxy),
-		SOCKS5Proxies:         dedupeStrings(raw.SOCKS5Proxies),
-		ProxyRotation:         strings.TrimSpace(raw.ProxyRotation),
-		CostMode:              strings.TrimSpace(raw.CostMode),
-		TLSFingerprint:        strings.TrimSpace(raw.TLSFingerprint),
-		RegistryRefresh:       registryRefresh,
-		DebugDump:             raw.DebugDump,
-		LogFile:               strings.TrimSpace(raw.LogFile),
-		LogLevel:              strings.TrimSpace(raw.LogLevel),
-		MaxMessagesPerDay:     maxMessagesPerDay,
-		IdleRotationTimeout:   idleRotationTimeout,
-		SafeMode:              raw.SafeMode,
-		HybridMode:            raw.HybridMode,
-		ModelsHideUnavailable: raw.ModelsHideUnavailable,
-		RequestJitter:         requestJitter,
-		CLIVersion:            strings.TrimSpace(raw.CLIVersion),
-		ModelAliases:          parseMap(raw.ModelAliases),
-		TransientRetries:      transientRetries,
-		SessionPersist:        raw.SessionPersist,
-		SessionStateFile:      strings.TrimSpace(raw.SessionStateFile),
+		ListenAddr:             strings.TrimSpace(raw.ListenAddr),
+		UpstreamBaseURL:        upstreamBaseURL,
+		AuthTokens:             dedupeStrings(raw.AuthTokens),
+		RotationInterval:       rotationInterval,
+		RequestTimeout:         requestTimeout,
+		SessionCallTimeout:     sessionCallTimeout,
+		APIKeys:                dedupeStrings(raw.APIKeys),
+		AdminToken:             strings.TrimSpace(raw.AdminToken),
+		HTTPProxy:              strings.TrimSpace(raw.HTTPProxy),
+		SOCKS5Proxy:            strings.TrimSpace(raw.SOCKS5Proxy),
+		SOCKS5Proxies:          dedupeStrings(raw.SOCKS5Proxies),
+		ProxyRotation:          strings.TrimSpace(raw.ProxyRotation),
+		CostMode:               strings.TrimSpace(raw.CostMode),
+		UserID:                 strings.TrimSpace(raw.UserID),
+		TLSFingerprint:         strings.TrimSpace(raw.TLSFingerprint),
+		RegistryRefresh:        registryRefresh,
+		DebugDump:              raw.DebugDump,
+		LogFile:                strings.TrimSpace(raw.LogFile),
+		LogLevel:               strings.TrimSpace(raw.LogLevel),
+		MaxMessagesPerDay:      maxMessagesPerDay,
+		IdleRotationTimeout:    idleRotationTimeout,
+		SafeMode:               raw.SafeMode,
+		HybridMode:             raw.HybridMode,
+		ModelsHideUnavailable:  raw.ModelsHideUnavailable,
+		RequestJitter:          requestJitter,
+		CLIVersion:             strings.TrimSpace(raw.CLIVersion),
+		ModelAliases:           parseMap(raw.ModelAliases),
+		TransientRetries:       transientRetries,
+		SessionPersist:         raw.SessionPersist,
+		SessionStateFile:       strings.TrimSpace(raw.SessionStateFile),
+		StableEgress:           raw.StableEgress,
+		HTTP2Upstream:          raw.HTTP2Upstream,
+		ProxyHealthInterval:    proxyHealthInterval,
+		ProxyHealthMaxFailures: proxyHealthMaxFailures,
 	}
 
 	// Auto-discover CLI token if no AUTH_TOKENS were explicitly configured
@@ -398,6 +442,8 @@ func (c Config) Validate() error {
 		return errors.New("REQUEST_JITTER cannot be negative")
 	case c.TransientRetries < 0:
 		return errors.New("TRANSIENT_RETRIES cannot be negative")
+	case c.ProxyHealthMaxFailures < 0:
+		return errors.New("PROXY_HEALTH_MAX_FAILURES cannot be negative (0 falls back to the 3-failure default in the checker)")
 	case c.SessionPersist && strings.TrimSpace(c.SessionStateFile) == "":
 		return errors.New("SESSION_STATE_FILE cannot be empty when SESSION_PERSIST is enabled")
 	case c.CostMode != "" && c.CostMode != "free":
@@ -596,6 +642,7 @@ func applyDotenv(raw *rawConfig) error {
 	overrideStringFrom(&raw.SOCKS5Proxy, get, "SOCKS5_PROXY")
 	overrideCSVFrom(&raw.SOCKS5Proxies, get, "SOCKS5_PROXIES")
 	overrideStringFrom(&raw.CostMode, get, "COST_MODE")
+	overrideStringFrom(&raw.UserID, get, "USER_ID")
 	overrideStringFrom(&raw.TLSFingerprint, get, "TLS_FINGERPRINT")
 	overrideStringFrom(&raw.RegistryRefresh, get, "REGISTRY_REFRESH")
 	overrideBoolFrom(&raw.DebugDump, get, "DEBUG_DUMP")

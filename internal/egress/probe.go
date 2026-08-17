@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
+
+	"freebuff-proxy/internal/stealth"
 )
 
 // ProbeURL is the Cloudflare trace endpoint that reports the caller's
@@ -110,6 +112,13 @@ func DirectDialer(timeout time.Duration) func(ctx context.Context, network, addr
 // authenticate (previously it was dropped and the handshake failed —
 // Audit B2). The returned dialer supports context cancellation via
 // proxy.ContextDialer.
+//
+// Remote-DNS guarantee (issue #56): the dialer passes the RAW hostname to
+// the proxy — golang.org/x/net/proxy's SOCKS5 encodes non-IP addresses as
+// RFC 1928 domain names (ATYP=3) and never resolves them locally — so the
+// DNS query happens at the proxy, never on the ISP-visible local network.
+// This is a security property, not an accident: callers MUST NOT pre-resolve
+// the hostname before handing it to this dialer.
 func Socks5Dialer(addr string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
 	host, auth, err := parseSocks5(addr)
 	if err != nil {
@@ -209,6 +218,14 @@ func RunLoop(ctx context.Context, logger *slog.Logger, cache *Cache, paths []Pat
 				logger.Warn("egress probe failed", "path", key, "err", r.Err)
 			} else {
 				logger.Debug("egress probe", "path", key, "ip", r.IP, "country", r.Country)
+				// Passive ban-risk feed (#64): every successful probe
+				// contributes an egress-geo sample to the shared risk
+				// engine. Read-only; the engine only warns.
+				stealth.DefaultRiskEngine.Observe(stealth.RiskSample{
+					At:       time.Now(),
+					EgressIP: r.IP,
+					Country:  r.Country,
+				})
 			}
 		}
 	}

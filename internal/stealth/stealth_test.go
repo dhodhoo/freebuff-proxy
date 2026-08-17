@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -202,7 +203,7 @@ func TestDialerTLS(t *testing.T) {
 
 	addr := ln.Addr().String()
 
-	dialFN := Dialer(ProfileChrome120, nil, true)
+	dialFN := Dialer(ProfileChrome120, nil, true, nil)
 	tr := &http.Transport{
 		DialTLSContext: dialFN,
 	}
@@ -349,7 +350,7 @@ func TestDialerSafariCustomSpec(t *testing.T) {
 	addr := startTLSStub(t)
 	for _, prof := range []*Profile{freshSafariProfile(ProfileIDSafari17), freshSafariProfile(ProfileIDSafari18)} {
 		t.Run(string(prof.ID), func(t *testing.T) {
-			dialFN := Dialer(prof, nil, true)
+			dialFN := Dialer(prof, nil, true, nil)
 			conn, err := dialFN(context.Background(), "tcp", addr)
 			if err != nil {
 				t.Fatalf("handshake with custom spec failed: %v", err)
@@ -369,7 +370,7 @@ func TestDialerDoesNotMutateSharedSpec(t *testing.T) {
 	specBefore := cloneSpec(ProfileSafari18.CustomSpec)
 
 	addr := startTLSStub(t)
-	dialFN := Dialer(ProfileSafari18, nil, true) // REAL shared singleton, not a fresh copy
+	dialFN := Dialer(ProfileSafari18, nil, true, nil) // REAL shared singleton, not a fresh copy
 	for range 5 {
 		conn, err := dialFN(context.Background(), "tcp", addr)
 		if err != nil {
@@ -561,7 +562,7 @@ func TestDialerInvalidAddr(t *testing.T) {
 	baseDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return &closingConn{closed: closed}, nil
 	}
-	dialFN := Dialer(ProfileChrome120, baseDial, true)
+	dialFN := Dialer(ProfileChrome120, baseDial, true, nil)
 	_, err := dialFN(context.Background(), "tcp", "missing-port")
 	if err == nil {
 		t.Fatal("dial with an invalid address succeeded")
@@ -667,7 +668,7 @@ func TestDialerProfileSwapChangesClientHello(t *testing.T) {
 			}
 			return &writeCaptureConn{Conn: c, first: &first}, nil
 		}
-		conn, err := Dialer(prof, baseDial, true)(context.Background(), "tcp", addr)
+		conn, err := Dialer(prof, baseDial, true, nil)(context.Background(), "tcp", addr)
 		if err != nil {
 			t.Fatalf("%s handshake failed: %v", prof.ID, err)
 		}
@@ -684,5 +685,46 @@ func TestDialerProfileSwapChangesClientHello(t *testing.T) {
 	safari := capture(freshSafariProfile(ProfileIDSafari18))
 	if bytes.Equal(chrome, safari) {
 		t.Error("rotated profile emitted an identical ClientHello")
+	}
+}
+
+// TestDialerALPNNegotiation guards the ALPN knob (issue #51): with
+// ["h2","http/1.1"] (a real browser's ALPN) the dialer negotiates h2
+// against an h2-capable server; with ["http/1.1"] it stays h1. The
+// negotiated protocol MUST match the transport the caller wires up — h2
+// ALPN with Go's h1 transport chokes on server SETTINGS frames.
+func TestDialerALPNNegotiation(t *testing.T) {
+	// A TLS server advertising h2 + http/1.1 (like a Cloudflare front).
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	ts.TLS = &tls.Config{NextProtos: []string{"h2", "http/1.1"}}
+	ts.StartTLS()
+	defer ts.Close()
+
+	negotiated := func(alpn []string) string {
+		t.Helper()
+		dialFN := Dialer(ProfileChrome120, nil, true, alpn)
+		conn, err := dialFN(context.Background(), "tcp", ts.Listener.Addr().String())
+		if err != nil {
+			t.Fatalf("dial with ALPN %v failed: %v", alpn, err)
+		}
+		defer func() { _ = conn.Close() }()
+		u, ok := conn.(*utls.UConn)
+		if !ok {
+			t.Fatalf("dial returned %T, want *utls.UConn", conn)
+		}
+		return u.ConnectionState().NegotiatedProtocol
+	}
+
+	if got := negotiated([]string{"h2", "http/1.1"}); got != "h2" {
+		t.Errorf("h2 ALPN negotiated %q, want h2", got)
+	}
+	if got := negotiated([]string{"http/1.1"}); got != "http/1.1" {
+		t.Errorf("h1 ALPN negotiated %q, want http/1.1", got)
+	}
+	// nil falls back to the h1 default (pre-#51 behavior).
+	if got := negotiated(nil); got != "http/1.1" {
+		t.Errorf("nil ALPN negotiated %q, want http/1.1 (default)", got)
 	}
 }
