@@ -50,6 +50,7 @@ import (
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
 	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/tokenestimate"
 	"freebuff-proxy/internal/updatecheck"
 	"freebuff-proxy/internal/upstream"
 )
@@ -93,6 +94,9 @@ type Server struct {
 	// token-less upstream client whose transport/stealth wiring matches the
 	// pooled clients. nil disables the wizard endpoints with 503.
 	authClient *upstream.Client
+	// tokenEstimator counts tokens locally for /v1/messages/count_tokens
+	// (nil only if the embedded codec failed to initialize at startup).
+	tokenEstimator *tokenestimate.Estimator
 	// loginFlows is the in-flight login-flow registry keyed by flow id
 	// (fingerprint): start POSTs /api/auth/cli/code, status polls it until
 	// the authToken lands (then AddToken + persist).
@@ -149,6 +153,13 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 	}
 	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath, loginFlows: make(map[string]*loginFlow)}
 	s.cfg.Store(cfg)
+	// The token estimator shares one o200k_base codec process-wide, so
+	// count_tokens requests never rebuild the vocabulary.
+	est, err := tokenestimate.New()
+	if err != nil {
+		logger.Error("token estimator unavailable; /v1/messages/count_tokens will fail", "err", err)
+	}
+	s.tokenEstimator = est
 	for _, opt := range opts {
 		opt(s)
 	}

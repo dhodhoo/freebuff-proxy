@@ -611,15 +611,115 @@ func TestMessagesStreamToolUse(t *testing.T) {
 	}
 }
 
-func TestMessagesCountTokensUnsupported(t *testing.T) {
+// countTokensResult is the success envelope of /v1/messages/count_tokens.
+type countTokensResult struct {
+	InputTokens int `json:"input_tokens"`
+}
+
+// TestMessagesCountTokens pins the count_tokens contract: a local 200 with
+// an Anthropic-shaped {input_tokens} estimate and zero upstream contact.
+// The estimate is computed by the golden-reference table in the
+// tokenestimate package; here we assert the handler contract end-to-end.
+func TestMessagesCountTokens(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	ts, _ := newTestServer(t, nil, mock)
 
-	body := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}]}`
+	body := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hello"}]}`
 	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", []byte(body), nil)
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501: %s", resp.StatusCode, truncate(string(data), 200))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	var out countTokensResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	// 8 per-message overhead + 1 for "hello" (o200k_base reference).
+	if out.InputTokens != 9 {
+		t.Errorf("input_tokens = %d, want 9", out.InputTokens)
+	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0 (local estimate only)", mock.Requests)
+	}
+}
+
+// TestMessagesCountTokensComplexRequest exercises a mixed request (system,
+// thinking, tool_use, tool_result, tools) against the golden total 93 from
+// the Python tiktoken reference — proving the estimator's composition, not
+// just the trivial one-message case.
+func TestMessagesCountTokensComplexRequest(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	body := `{
+		"model":"` + modelA + `",
+		"system":"You are a helpful assistant.",
+		"messages":[
+			{"role":"user","content":"hello"},
+			{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think about this."}]},
+			{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"get_weather","input":{"city":"Jakarta"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"3 files"}]}]}
+		],
+		"tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}]
+	}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", []byte(body), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	var out countTokensResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if out.InputTokens != 93 {
+		t.Errorf("input_tokens = %d, want 93 (golden reference)", out.InputTokens)
+	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0", mock.Requests)
+	}
+}
+
+// TestMessagesCountTokensDeterministic sends the same request twice: the
+// estimator must be byte-stable (no random hashing, no cache-dependent
+// drift), so repeated calls return identical counts.
+func TestMessagesCountTokensDeterministic(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"hello world"}]}`)
+	var first int
+	for i := 0; i < 5; i++ {
+		resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", body, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("iteration %d status = %d: %s", i, resp.StatusCode, truncate(string(data), 200))
+		}
+		var out countTokensResult
+		if err := json.Unmarshal(data, &out); err != nil {
+			t.Fatalf("iteration %d body not JSON: %v", i, err)
+		}
+		if i == 0 {
+			first = out.InputTokens
+			continue
+		}
+		if out.InputTokens != first {
+			t.Fatalf("iteration %d input_tokens = %d, want %d (deterministic)", i, out.InputTokens, first)
+		}
+	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0", mock.Requests)
+	}
+}
+
+func TestMessagesCountTokensMissingModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	body := `{"messages":[{"role":"user","content":"hi"}]}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", []byte(body), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, truncate(string(data), 200))
 	}
 	var out struct {
 		Error struct {
@@ -630,9 +730,146 @@ func TestMessagesCountTokensUnsupported(t *testing.T) {
 	if err := json.Unmarshal(data, &out); err != nil {
 		t.Fatalf("error body not JSON: %v", err)
 	}
-	if out.Error.Type != "unsupported_endpoint" || out.Error.Code != "count_tokens_unsupported" {
-		t.Errorf("type/code = %q/%q, want unsupported_endpoint/count_tokens_unsupported", out.Error.Type, out.Error.Code)
+	if out.Error.Type != "invalid_request_error" || out.Error.Code != "model_not_found" {
+		t.Errorf("type/code = %q/%q, want invalid_request_error/model_not_found", out.Error.Type, out.Error.Code)
 	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0", mock.Requests)
+	}
+}
+
+func TestMessagesCountTokensUnknownModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	body := `{"model":"no-such-model","messages":[{"role":"user","content":"hi"}]}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", []byte(body), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	var out struct {
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("error body not JSON: %v", err)
+	}
+	if out.Error.Type != "invalid_request_error" || out.Error.Code != "model_not_found" {
+		t.Errorf("type/code = %q/%q, want invalid_request_error/model_not_found", out.Error.Type, out.Error.Code)
+	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0", mock.Requests)
+	}
+}
+
+func TestMessagesCountTokensInvalidJSON(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	for _, body := range []string{`{not json`, `[]`, `"x"`, ``} {
+		resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", []byte(body), nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("body %q status = %d, want 400: %s", body, resp.StatusCode, truncate(string(data), 200))
+		}
+		var out struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(data, &out); err != nil {
+			t.Fatalf("body %q error not JSON: %v", body, err)
+		}
+		if out.Error.Code != "invalid_json" {
+			t.Errorf("body %q code = %q, want invalid_json", body, out.Error.Code)
+		}
+	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0", mock.Requests)
+	}
+}
+
+// TestMessagesCountTokensOversizedBody pins the 32MiB body cap on
+// count_tokens: an oversized payload is rejected with 413 content_too_large
+// before any counting or upstream contact.
+func TestMessagesCountTokensOversizedBody(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	oversized := bytes.Repeat([]byte("a"), 32<<20+1)
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", oversized, nil)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	if !strings.Contains(string(data), "content_too_large") {
+		t.Errorf("body missing content_too_large: %s", truncate(string(data), 200))
+	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0 (oversized body rejected before counting)", mock.Requests)
+	}
+}
+
+// TestMessagesCountTokensDocumentRejected verifies the estimator refuses to
+// guess a token count for PDF/document blocks: the proxy's /v1/messages
+// conversion does not consume documents, so the request is rejected with
+// 400 instead of faking accuracy with a base64 character count.
+func TestMessagesCountTokensDocumentRejected(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	body := `{"model":"` + modelA + `","messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0="}}]}]}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", []byte(body), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	var out struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("error body not JSON: %v", err)
+	}
+	if out.Error.Code != "invalid_json" {
+		t.Errorf("code = %q, want invalid_json", out.Error.Code)
+	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0", mock.Requests)
+	}
+}
+
+// TestMessagesCountTokensAuth pins that count_tokens sits behind the same
+// requireAuth gate as the rest of the API surface (no key → 401, key → 200).
+func TestMessagesCountTokensAuth(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, []string{"sk-test"}, mock)
+	url := ts.URL + "/v1/messages/count_tokens"
+	body := []byte(`{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}]}`)
+
+	resp, data := doJSON(t, http.MethodPost, url, body, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no key status = %d, want 401: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	if !strings.Contains(string(data), "invalid_api_key") {
+		t.Errorf("body missing invalid_api_key: %s", data)
+	}
+
+	resp, data = doJSON(t, http.MethodPost, url, body, map[string]string{"x-api-key": "sk-test"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("x-api-key status = %d, want 200: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+
+	resp, data = doJSON(t, http.MethodPost, url, body, map[string]string{"Authorization": "Bearer sk-test"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Bearer status = %d, want 200: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+
 	if mock.Requests != 0 {
 		t.Errorf("upstream requests = %d, want 0", mock.Requests)
 	}
