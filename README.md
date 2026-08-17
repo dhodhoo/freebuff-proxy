@@ -389,6 +389,7 @@ See [Dashboard Guide](docs/guides/dashboard.md) for access, Docker caveats, and 
 - [Client Integration](docs/guides/client-integration.md): OpenCode, pi, 9router, LiteLLM, OpenAI SDKs
 - [9router Integration](docs/guides/9router-integration.md): router dashboard setup in bridge mode
 - [Dashboard Guide](docs/guides/dashboard.md): the admin web UI: access, pages, Docker caveats, hardening
+- [Manual Testing](docs/guides/testing.md): verify the proxy on Linux or Windows by hand, step by step
 
 ---
 

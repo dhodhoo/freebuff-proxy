@@ -1,0 +1,372 @@
+# Testing freebuff-proxy by Hand (Linux and Windows)
+
+A runbook for humans. It walks the same checks the CI suite automates, one
+command at a time, and tells you what a healthy proxy looks like at each
+step. Use it after installing, after upgrading, or when something feels
+off and you want to isolate whether the proxy or the upstream is the
+problem.
+
+Two ground rules before you start.
+
+- `127.0.0.1:3457` is the default listen address, loopback only. If your
+  `.env` sets `LISTEN_ADDR=:3457` (containers do), substitute your machine's
+  address where the commands say `127.0.0.1`.
+- Every command below is safe. Nothing here consumes a paid session or
+  modifies `.env`. The only exceptions are the two places that say so:
+  the real chat test (which uses your daily quota) and the service
+  install/uninstall section.
+
+## 0. The binary, the version, the config
+
+Start by confirming you have a real build and it can see its config.
+
+```
+./freebuff-proxy -version
+./freebuff-proxy -v -doctor
+```
+
+What you want to see:
+
+- `-version` prints a version string. `dev` means a build without release
+  metadata, which is normal for `go run` or a hand-built binary; a tagged
+  release prints `v0.9.8` style. If you built from a release archive and
+  it says `dev`, that is cosmetic, not a fault.
+- `-doctor` prints a line per check, `[ok]` or `[FAIL]`, then exits. It
+  probes every configured token with a zero-cost GET request (no session
+  slot consumed) and reports each as `[ok]` or `[FAIL]`. A clean
+  environment shows `[ok]` everywhere; see section 4 for what the token
+  lines mean.
+
+On Linux, if you run `docker compose up -d --build` instead of the bare
+binary, the container listens on `:3457` inside the network. Check it with
+`docker compose ps` (should show `Up` and `healthy`) and `docker logs
+freebuff-proxy --tail 20` (should show the startup banner with
+`version=`, `listen_addr=`, and `auth_tokens=` counts, and nothing at
+`level=ERROR`).
+
+## 1. Is the HTTP server actually serving?
+
+The proxy has one endpoint that requires no auth at all.
+
+```
+curl -s http://127.0.0.1:3457/healthz
+```
+
+Linux without curl? `wget -qO- http://127.0.0.1:3457/healthz`. PowerShell:
+
+```powershell
+(Invoke-RestMethod http://127.0.0.1:3457/healthz) | ConvertTo-Json -Depth 4
+```
+
+A healthy response is JSON with a `tokens` array. Each entry carries the
+per-token state. The fields you care about:
+
+| Field | Healthy value | What it means |
+|---|---|---|
+| `SessionStatus` | `active` (pooled) | Session up, ready to run |
+| `ActiveRuns` | 0 or a small number | Runs currently executing |
+| `Messages24h` | below `DailyLimit` | Rolling 24h usage |
+| `UsagePct` | under 100 | Fraction of the daily budget spent |
+| `RiskLevel` | `low` or `medium` | Account trust standing |
+| `tier`, `country` | any | Account tier and region |
+
+In bridge mode (`AUTH_TOKENS=` empty) the response instead shows a
+`bridge_tokens` count and `mode: "bridge"`. Both are healthy; the shape
+just differs.
+
+Anything else here, like a connection refused, means the process is not
+listening. Check three things in order: the process is running, the
+`LISTEN_ADDR` in `.env` matches the address you curled, and nothing else
+already owns the port (`netstat -ano | findstr :3457` on Windows,
+`ss -ltnp | grep 3457` on Linux).
+
+## 2. The models endpoint
+
+```
+curl -s http://127.0.0.1:3457/v1/models
+```
+
+The `requireAuth` gate only bites when you configured `API_KEYS` (and are
+not in bridge mode). With the default loopback bind and no `API_KEYS`,
+every `/v1/*` endpoint answers unauthenticated — the loopback binding is
+the security boundary, so anything exposed this way is only reachable
+from the machine itself. If you set `API_KEYS`, the same curl needs a
+header:
+
+```
+curl -s -H "x-api-key: <one of your API_KEYS>" http://127.0.0.1:3457/v1/models
+```
+
+You expect a `data` array of objects each with an `id` and a model name,
+plus `available` / `status` / `current_access_tier` per model so clients
+can see quota and lock signals without probing. That list is the registry
+the proxy routes on, refreshed on `REGISTRY_REFRESH` (default 6h). If it
+is empty, the registry fetch failed; check the logs for a registry error
+before blaming anything else.
+
+## 3. The real test: one chat completion, then a stream
+
+This is the check that proves the whole chain: your token, the session
+manager, the upstream, and the SSE path. It uses your daily quota, so run
+it once, not in a loop.
+
+```
+curl -s http://127.0.0.1:3457/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"say hi"}],"stream":false}'
+```
+
+In bridge mode this request must carry your FreeBuff token, because the
+proxy has none of its own: add `-H "Authorization: Bearer cb_..."`. In
+pooled mode (tokens in `AUTH_TOKENS`) the header is optional unless you
+set `API_KEYS`. The proxy answers `missing_bearer_token` (401) exactly
+when a bridge-mode request arrives without one, so a 401 here means you
+forgot the header, not that the proxy is broken.
+
+Healthy: HTTP 200 and a JSON body with `choices[0].message.content` that
+contains an actual reply, plus a `usage` object with `total_tokens` over
+zero. If the model id in the request is not in `/v1/models`, the proxy
+answers `model_not_found`; pick one from the list.
+
+Now the stream, because streaming is the default for every coding agent
+and it fails in different ways than non-streaming does.
+
+```
+curl -N -s http://127.0.0.1:3457/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"count to 5"}],"stream":true}'
+```
+
+Same header rule as above: add `Authorization: Bearer cb_...` in bridge
+mode.
+
+Healthy: lines of `data: {"id":"chatcmpl-...","choices":[{"delta":{...}}]}` arriving over time, ending with `data: [DONE]`. If you get one big blob
+at the end, streaming is broken. If you get `data: ..."error":` inside
+the stream instead of `[DONE]`, the failure happened mid-generation and
+the proxy forwarded the upstream error as an `upstream_error` event;
+that is the proxy working correctly, not a bug in it.
+
+### Responses API and Anthropic messages
+
+Same idea, different shapes, all on the same server.
+
+```
+curl -s http://127.0.0.1:3457/v1/responses \
+  -H "Authorization: Bearer cb_..." -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","input":"say hi"}'
+```
+
+```
+curl -s http://127.0.0.1:3457/v1/messages \
+  -H "Authorization: Bearer cb_..." -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"deepseek/deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"say hi"}]}'
+```
+
+Healthy: HTTP 200, a content block array. A 404 here means you are
+running an older binary; these routes landed in the v0.9.8 cycle.
+
+## 4. Token and account checks
+
+### The zero-cost probe
+
+`-test-token` verifies the first configured token without consuming a
+session slot. It is the fastest health signal for "is my account even
+alive".
+
+```
+./freebuff-proxy -test-token
+```
+
+Exit 0 with `token OK` means the token authenticates. Non-zero with a
+message means the config failed to load (fix `.env`) or the upstream
+rejected the token. A `429` here is quota exhaustion, which is expected
+late in a day; it is not a ban and resets at Pacific midnight. A `403`
+with `status: banned` is the terminal case: that account is gone, use
+another.
+
+### The full diagnostics
+
+`-doctor` checks local state (config validity, environment, port
+bindings, TLS fingerprint selection) and then probes every configured
+token with a zero-cost GET request. Those probes do not claim a session
+and do not consume a daily slot, which is why they always run: the old
+session-handshake probes cost a slot per run, so they were gated behind a
+flag; the GET probe removed that cost entirely. The only case that skips
+probing is bridge mode, where the proxy holds no tokens to check.
+
+```
+./freebuff-proxy -doctor
+```
+
+Watch for `[FAIL]` lines and read them; they are self-explanatory. A
+`[!!]` line is a warning, not an error. A `Token #N validity probe
+failed` means the token itself is expired or revoked; re-run the upstream
+CLI to refresh it.
+
+## 5. The dashboard
+
+Open the browser UI at `http://127.0.0.1:3457/admin`. Set `ADMIN_TOKEN`
+in `.env` if you want the login page; without it, the read-only pages
+(overview, tokens, models, traces) stay open and the secret-bearing pages
+(config, logs) require a loopback client.
+
+What a healthy dashboard shows:
+
+- **Overview**: uptime, a token risk card per token. `low` risk is
+  healthy; `high` is worth a look at what changed (new egress, new
+  device).
+- **Tokens**: per-model session quota tables.
+- **Logs**: a rolling ring of recent log lines, no `level=ERROR` spam.
+- **Metrics**: live SVG sparklines of requests, runs, and usage.
+- **Playground**: a chat box that hits your own proxy through the
+  browser. Same result as the section 3 curl, but without the terminal.
+
+The dashboard auto-polls every 5 seconds. If the overview numbers freeze
+while the proxy still answers curl, the dashboard is stale and a restart
+clears it.
+
+## 6. Service mode (run forever)
+
+If you want the proxy to survive logout and reboot, install it as a
+service. This is the one section that modifies your system, and it needs
+the binary at a stable path first (a temp download location will break
+the service on next boot).
+
+Windows:
+
+```
+.\freebuff-proxy.exe -install-service
+.\freebuff-proxy.exe -service-status
+```
+
+The status command exits 0 when registered and running. Registration uses
+Task Scheduler at logon with limited privileges; you see the task under
+`schtasks /query /tn "freebuff-proxy"` if you want to inspect it.
+`-uninstall-service` reverses it.
+
+Linux:
+
+```
+./freebuff-proxy -install-service
+./freebuff-proxy -service-status
+```
+
+This registers a systemd `--user` unit in `~/.config/systemd/user`.
+Status comes from `systemctl --user is-active freebuff-proxy`, logs from
+`journalctl --user -u freebuff-proxy -n 50 -e`. The unit sets its working
+directory to the binary's location, so `.env` must live next to the
+binary, not in your shell's home.
+
+## 7. The restart and the upgrade
+
+Two behaviors worth knowing before they surprise you.
+
+A restart ends in-flight streams. That is by design: the container or
+process re-creates its sessions, and a streamed response mid-generation
+is cut. Clients retry. With `SESSION_PERSIST=true`, active sessions are
+resumed on restart instead of recreated, which avoids burning a fresh
+session slot; that is the knob to test if you run long sessions.
+
+The config page in the dashboard and `POST /admin/reload` reload `.env`
+without restarting. After a reload, the overview should show the new
+token count. If you changed `AUTH_TOKENS`, the pool is construction-fixed
+for the session: token add/remove takes a full restart, and the UI says
+so.
+
+Self-update is `./freebuff-proxy -update`, which checks GitHub and
+replaces the binary with the latest release. It skips the swap if the
+checksum does not match. On Windows the swap defers until the current
+process exits, so do not be surprised if the command exits before the
+file changes.
+
+## 8. Reading failures: the error taxonomy
+
+When a test fails, the error body tells you which layer is at fault. The
+proxy classifies upstream responses deliberately.
+
+| Status | Code | Meaning | Your move |
+|---|---|---|---|
+| 401 | `missing_bearer_token` | Bridge mode: you sent no token | Add `Authorization: Bearer cb_...` |
+| 402 | `out of credits` | `COST_MODE` is not `free` (or upstream billing) | Set `COST_MODE=free`; fresh accounts 402 when routed as paid |
+| 403 | `status: banned` | Account banned, terminal | Stop using that account; check egress for VPN/proxy signals |
+| 429 | quota / rate limit | Daily quota spent, resets Pacific midnight | Wait, or add a token |
+| 429 | `ip_capped` | Too many distinct users on one egress IP | Rotate the account or the IP |
+| 5xx | upstream error | FreeBuff side, transient | Retry later; check `TRANSIENT_RETRIES` behavior in logs |
+
+The distinction that matters most: **429 is a quota, not a ban**. A
+banned account is 403 and terminal. Panicking over a 429 and rotating
+egress aggressively is how accounts get flagged; the proxy's job is to
+sit still on quota days.
+
+## 9. The "is it running perfectly" checklist
+
+Run through this in order when you are unsure. Each line is one command
+or one glance.
+
+1. `./freebuff-proxy -doctor` → no `[FAIL]` (token probe lines all `[ok]`).
+2. `curl http://127.0.0.1:3457/healthz` → JSON, `SessionStatus: active`,
+   `UsagePct` under 100.
+3. `curl /v1/models` → non-empty model list.
+4. One non-streaming chat → 200, real content, `usage.total_tokens` > 0.
+5. One streaming chat → `data:` lines, ends `[DONE]`, no mid-stream error.
+6. Dashboard overview → tokens listed, risk cards render, no ERROR spam
+   in logs.
+7. Logs show startup banner with `auth_tokens=N` matching your `.env`.
+8. `-test-token` exits 0 with `token OK` (or a quota 429, which is
+   expected and not a failure).
+
+If all eight pass, the proxy is doing its job. Remaining weirdness is
+upstream or account-side: a quota day, a regional model pick that got
+silently coerced to `deepseek/deepseek-v4-flash`, or a client misconfig.
+
+## 10. Platform-specific gotchas
+
+Windows:
+
+- PowerShell 5.1 reads UTF-8 `.env` files as ANSI by default. If the
+  config page shows mojibake in comments or a token with non-ASCII
+  neighbors breaks, re-save `.env` as UTF-8 with BOM or edit with a
+  tool that writes UTF-8 explicitly.
+- Loopback-only binding means other machines on your LAN cannot reach
+  the proxy. That is intentional. To serve your LAN, set
+  `LISTEN_ADDR=:3457` and, if you set `ADMIN_TOKEN`, the dashboard cookie
+  gets the Secure flag automatically.
+- Windows Defender SmartScreen may flag the unsigned binary. Allow it
+  once; the release carries SLSA provenance if you want to verify it
+  instead of trusting the popup.
+
+Linux:
+
+- The binary needs execute permission after download
+  (`chmod +x freebuff-proxy`). If you get `Permission denied` on a fresh
+  download, that is the cause.
+- If you run the systemd user service, `.env` goes next to the binary,
+  not in `$HOME`. The unit sets `WorkingDirectory` to the binary path.
+- The container build needs network access to the Go module proxy. On
+  constrained hosts, build with `docker build --network=host`.
+
+Both platforms:
+
+- Never commit or paste `.env` contents, including into this runbook.
+  Token check commands above take the token in the header; use a shell
+  variable so it does not land in your shell history if that matters to
+  you: `TOK=$(grep AUTH_TOKENS .env | cut -d= -f2)` then
+  `-H "Authorization: Bearer $TOK"`.
+
+## 11. When to file a bug versus when it is you
+
+File an issue when: a `[FAIL]` in doctor contradicts a working setup,
+`/v1/models` is empty while logs show no registry error, a stream ends
+without `[DONE]` and without an `upstream_error` event, or the dashboard
+freezes while curl works.
+
+It is you, not the proxy, when: the token is wrong or quota-spent (429),
+the model id is not in `/v1/models`, `LISTEN_ADDR` mismatches the address
+you curl, or the client sends a shape the endpoint does not accept.
+
+---
+
+This guide covers the whole surface in the current release. If a command
+here 404s or errors, you are likely on an older binary; upgrade and
+re-run, because the routes and flags listed are the ones `v0.9.8` ships.
