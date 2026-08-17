@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"log/slog"
 	"os"
@@ -12,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/egress"
 )
 
@@ -164,72 +162,16 @@ func TestEgressCacheTTL(t *testing.T) {
 }
 
 // TestEgressPaths pins the probe-path construction (the cmd package's
-// highest-value pure function): index 0 is ALWAYS the direct connection,
-// each parseable SOCKS5_PROXIES entry gets a "proxy-<index>" key with its
-// ORIGINAL index (gaps after skipped entries stay visible), and
-// unparseable proxies are skipped with a warning (fail-open) — never
-// killing the direct probe.
+// highest-value pure function): the direct connection is the only outbound
+// route (proxy routes were removed — the upstream hard-blocks proxy egress).
 func TestEgressPaths(t *testing.T) {
-	newLogger := func() (*bytes.Buffer, *slog.Logger) {
-		var buf bytes.Buffer
-		h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-		return &buf, slog.New(h)
+	paths := egressPaths()
+	if len(paths) != 1 {
+		t.Fatalf("paths = %d, want 1 (direct only)", len(paths))
 	}
-
-	t.Run("no proxies: direct only", func(t *testing.T) {
-		_, logger := newLogger()
-		paths := egressPaths(&config.Config{}, logger)
-		if len(paths) != 1 {
-			t.Fatalf("paths = %d, want 1 (direct only)", len(paths))
-		}
-		if paths[0].Key != "direct" {
-			t.Errorf("paths[0].Key = %q, want direct", paths[0].Key)
-		}
-	})
-
-	t.Run("direct always first, proxies in order", func(t *testing.T) {
-		_, logger := newLogger()
-		cfg := &config.Config{SOCKS5Proxies: []string{"127.0.0.1:9050", "127.0.0.1:9051"}}
-		paths := egressPaths(cfg, logger)
-		if len(paths) != 3 {
-			t.Fatalf("paths = %d, want 3 (direct + 2 proxies)", len(paths))
-		}
-		for i, want := range []string{"direct", "proxy-0", "proxy-1"} {
-			if paths[i].Key != want {
-				t.Errorf("paths[%d].Key = %q, want %q", i, paths[i].Key, want)
-			}
-		}
-	})
-
-	t.Run("invalid SOCKS5 skipped with warning, direct survives", func(t *testing.T) {
-		buf, logger := newLogger()
-		cfg := &config.Config{SOCKS5Proxies: []string{"", "socks5://", "127.0.0.1:9050"}}
-		paths := egressPaths(cfg, logger)
-		if len(paths) != 2 {
-			t.Fatalf("paths = %d, want 2 (direct + one valid proxy)", len(paths))
-		}
-		if paths[0].Key != "direct" || paths[1].Key != "proxy-2" {
-			t.Errorf("keys = [%q, %q], want [direct proxy-2] (original index kept)", paths[0].Key, paths[1].Key)
-		}
-		out := buf.String()
-		if !strings.Contains(out, "skipping invalid SOCKS5 proxy") {
-			t.Errorf("no skip warning logged: %q", out)
-		}
-		for _, idx := range []string{"index=0", "index=1"} {
-			if !strings.Contains(out, idx) {
-				t.Errorf("warning missing %s: %q", idx, out)
-			}
-		}
-	})
-
-	t.Run("valid socks5:// URL accepted", func(t *testing.T) {
-		_, logger := newLogger()
-		cfg := &config.Config{SOCKS5Proxies: []string{"socks5://user:pass@127.0.0.1:1080"}}
-		paths := egressPaths(cfg, logger)
-		if len(paths) != 2 || paths[1].Key != "proxy-0" {
-			t.Fatalf("paths = %+v, want direct + proxy-0", paths)
-		}
-	})
+	if paths[0].Key != "direct" {
+		t.Errorf("paths[0].Key = %q, want direct", paths[0].Key)
+	}
 }
 
 // TestVersionFlagPrintsVersion re-executes the test binary with -version

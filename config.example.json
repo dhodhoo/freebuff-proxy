@@ -8,8 +8,6 @@
   "REGISTRY_REFRESH": "6h",
   "API_KEYS": [],
   "ADMIN_TOKEN": "",
-  "HTTP_PROXY": "",
-  "SOCKS5_PROXY": "",
   "COST_MODE": "free",
   "DEBUG_DUMP": false,
   "LOG_FILE": "",

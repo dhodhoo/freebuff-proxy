@@ -1,25 +1,20 @@
-// Package egress probes the proxy's outbound network path — the public IP
-// and country code seen by a remote service — per egress route (direct or
-// per configured SOCKS5 proxy). Results back the doctor's region row and
-// give operators a fast ban-avoidance signal (requests unexpectedly
-// appearing to originate from another country).
+// Package egress probes the gateway's outbound network path — the public IP
+// and country code seen by a remote service — over the direct egress route.
+// Results back the doctor's region row and give operators a fast
+// ban-avoidance signal (requests unexpectedly appearing to originate from
+// another country).
 package egress
 
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/proxy"
 
 	"freebuff-proxy/internal/stealth"
 )
@@ -105,91 +100,8 @@ func DirectDialer(timeout time.Duration) func(ctx context.Context, network, addr
 	return (&net.Dialer{Timeout: timeout}).DialContext
 }
 
-// Socks5Dialer builds a SOCKS5 proxy dialer for addr, which may be a bare
-// host:port or a socks5:// URL (userinfo allowed). The returned dial
-// function routes every connection through the proxy. The userinfo is
-// carried through to the SOCKS5 handshake so authenticated proxies actually
-// authenticate (previously it was dropped and the handshake failed —
-// Audit B2). The returned dialer supports context cancellation via
-// proxy.ContextDialer.
-//
-// Remote-DNS guarantee (issue #56): the dialer passes the RAW hostname to
-// the proxy — golang.org/x/net/proxy's SOCKS5 encodes non-IP addresses as
-// RFC 1928 domain names (ATYP=3) and never resolves them locally — so the
-// DNS query happens at the proxy, never on the ISP-visible local network.
-// This is a security property, not an accident: callers MUST NOT pre-resolve
-// the hostname before handing it to this dialer.
-func Socks5Dialer(addr string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
-	host, auth, err := parseSocks5(addr)
-	if err != nil {
-		return nil, err
-	}
-	d, err := proxy.SOCKS5("tcp", host, auth, proxy.Direct)
-	if err != nil {
-		return nil, fmt.Errorf("egress: SOCKS5 dialer for %s: %w", host, err)
-	}
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if cd, ok := d.(proxy.ContextDialer); ok {
-			return cd.DialContext(ctx, network, addr)
-		}
-		return d.Dial(network, addr)
-	}, nil
-}
-
-// proxyUserinfoRe matches the userinfo portion of a (possibly malformed)
-// proxy URL so the password can be masked even when url.Parse rejects it.
-var proxyUserinfoRe = regexp.MustCompile(`^(.*?://[^:]*:)[^@]*@`)
-
-// redactProxyURL returns raw with any userinfo password masked, so proxy
-// URLs never leak credentials through error messages (probe failures are
-// logged verbatim by the egress loop). Unparseable URLs fall back to a
-// regex mask.
-func redactProxyURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return proxyUserinfoRe.ReplaceAllString(raw, `${1}***@`)
-	}
-	// Slice the raw string instead of url.UserPassword("***"): the latter
-	// percent-escapes the asterisks (%2A%2A%2A).
-	rest := raw[strings.Index(raw, "://")+3:]
-	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
-		userinfo := rest[:at]
-		if colon := strings.IndexByte(userinfo, ':'); colon >= 0 {
-			return raw[:len(raw)-len(rest)+colon+1] + "***" + rest[at:]
-		}
-	}
-	return raw
-}
-
-// parseSocks5 normalizes a configured proxy address to host:port plus its
-// credentials. A bare host:port or a socks5:// URL (with optional userinfo)
-// are accepted; the userinfo becomes the SOCKS5 auth.
-func parseSocks5(raw string) (addr string, auth *proxy.Auth, err error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", nil, errors.New("egress: empty proxy address")
-	}
-	if !strings.Contains(raw, "://") {
-		return raw, nil, nil
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		// url.Parse's own error text embeds the raw URL (password included);
-		// drop it and keep the redacted form.
-		return "", nil, fmt.Errorf("egress: invalid proxy URL %s", redactProxyURL(raw))
-	}
-	if u.Host == "" {
-		return "", nil, fmt.Errorf("egress: proxy address %s has no host", redactProxyURL(raw))
-	}
-	if u.User != nil {
-		pass, _ := u.User.Password()
-		auth = &proxy.Auth{User: u.User.Username(), Password: pass}
-	}
-	return u.Host, auth, nil
-}
-
-// Path identifies one egress path to probe: the cache key ("direct",
-// "proxy-0", ...) and the dialer that routes the probe connection.
+// Path identifies one egress path to probe: the cache key ("direct") and
+// the dialer that routes the probe connection.
 type Path struct {
 	Key    string
 	Dialer func(ctx context.Context, network, addr string) (net.Conn, error)

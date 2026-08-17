@@ -2725,7 +2725,7 @@ func defaultHintForCode(code, message string) string {
 	case code == "account_banned" || strings.Contains(lowerMsg, "banned"):
 		return "Account suspended upstream. Token is dead; create a fresh account with an established GitHub login."
 	case code == "country_blocked" || strings.Contains(lowerMsg, "country blocked") || strings.Contains(lowerMsg, "country_blocked"):
-		return "Your egress IP is in an unsupported region. Route traffic through an allowed country (e.g. US/EU/ID/SG) or configure SOCKS5_PROXY in .env."
+		return "Your egress IP is in an unsupported region. Route traffic through an allowed country (e.g. US/EU/ID/SG)."
 	case code == "out_of_credits" || strings.Contains(lowerMsg, "out of credits"):
 		return "Upstream free-tier credits exhausted. Check COST_MODE=free in .env — a typo routes requests as PAID and fresh free accounts get 402."
 	case code == "upstream_timeout":

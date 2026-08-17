@@ -241,35 +241,6 @@ func runDoctor(configPath string) {
 		ok(line)
 	}
 
-	// Per-proxy health readout (#88): one health-check round over the
-	// configured SOCKS5 proxies — exit geo, latency, and degrade state.
-	// A probe failure warns but does not fail the doctor (the runtime
-	// checker keeps retrying on its own interval).
-	if len(cfg.SOCKS5Proxies) > 0 {
-		health := egress.NewProxyHealth(cfg.ProxyHealthMaxFailures)
-		probeCtx, probeCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		snap := health.CheckOnce(probeCtx, nil, cfg.SOCKS5Proxies, 8*time.Second, 5)
-		probeCancel()
-		for _, rec := range snap {
-			row := fmt.Sprintf("Proxy %s", rec.Addr)
-			if rec.Degraded {
-				warn(fmt.Sprintf("%s: DEGRADED (%d consecutive failures, %s)", row, rec.FailureCount, rec.LastError))
-				continue
-			}
-			geo := rec.Country
-			if rec.Region != "" {
-				geo += "/" + rec.Region
-			}
-			if rec.City != "" {
-				geo += "/" + rec.City
-			}
-			if geo == "" {
-				geo = "unknown"
-			}
-			ok(fmt.Sprintf("%s: exit %s (%s), %dms", row, rec.ExitIP, geo, rec.LatencyMS))
-		}
-	}
-
 	// Registry test
 	reg := registry.New(&cfg, &http.Client{Timeout: 10 * time.Second})
 	reg.LoadFallback()

@@ -24,41 +24,34 @@ import (
 
 // Config is the fully-resolved, validated runtime configuration.
 type Config struct {
-	ListenAddr             string
-	UpstreamBaseURL        string
-	AuthTokens             []string
-	RotationInterval       time.Duration
-	RequestTimeout         time.Duration
-	SessionCallTimeout     time.Duration
-	APIKeys                []string
-	AdminToken             string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
-	HTTPProxy              string
-	SOCKS5Proxy            string
-	SOCKS5Proxies          []string // comma-separated list of SOCKS5 proxies (#23)
-	ProxyRotation          string   // "per-token" (default), "round-robin", "random" (#23)
-	CostMode               string   // "" (omit) or "free"; A/B pending, PRD §8
-	UserID                 string   // optional FreeBuff account id sent as x-freebuff-acting-user-id (CLI parity; empty = omitted)
-	TLSFingerprint         string   // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
-	RegistryRefresh        time.Duration
-	DebugDump              bool
-	LogFile                string
-	LogLevel               string            // "" (use -v/default) or debug|info|warn|error
-	MaxMessagesPerDay      int               // 0 = unlimited: per-token cap on successful chats per 24h
-	IdleRotationTimeout    time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
-	SafeMode               bool              // true = apply recommended anti-ban safe defaults
-	HybridMode             bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
-	ModelsHideUnavailable  bool              // true = /v1/models prunes models marked unavailable (region/tier/quota)
-	CORSAllowedOrigin      string            // Access-Control-Allow-Origin for /v1/* responses (CORS_ALLOWED_ORIGIN; default "*")
-	RequestJitter          time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
-	CLIVersion             string            // upstream CLI version string (default: 0.10.7)
-	ModelAliases           map[string]string // map model alias -> real model ID (#25)
-	TransientRetries       int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
-	SessionPersist         bool              // true = persist session state to disk so restart resumes unexpired sessions (SESSION_PERSIST)
-	SessionStateFile       string            // path to the session state file (SESSION_STATE_FILE; default .freebuff-session-state.json)
-	StableEgress           bool              // true = pin a token's egress to one hash-stable proxy for the session lifetime (STABLE_EGRESS); false = legacy per-token binding (#98)
-	HTTP2Upstream          bool              // true = negotiate HTTP/2 with the upstream so the ALPN matches real browsers (HTTP2_UPSTREAM); false forces HTTP/1.1 (#51)
-	ProxyHealthInterval    time.Duration     // per-proxy health probe interval (PROXY_HEALTH_INTERVAL; default 1m; <= 0 falls back to the default)
-	ProxyHealthMaxFailures int               // consecutive failures before a proxy is marked out-of-rotation (PROXY_HEALTH_MAX_FAILURES; default 3)
+	ListenAddr            string
+	UpstreamBaseURL       string
+	AuthTokens            []string
+	RotationInterval      time.Duration
+	RequestTimeout        time.Duration
+	SessionCallTimeout    time.Duration
+	APIKeys               []string
+	AdminToken            string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
+	HTTP2Upstream         bool   // true = negotiate HTTP/2 with the upstream so the ALPN matches real browsers (HTTP2_UPSTREAM); false forces HTTP/1.1 (#51)
+	CostMode              string // "" (omit) or "free"; A/B pending, PRD §8
+	UserID                string // optional FreeBuff account id sent as x-freebuff-acting-user-id (CLI parity; empty = omitted)
+	TLSFingerprint        string // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
+	RegistryRefresh       time.Duration
+	DebugDump             bool
+	LogFile               string
+	LogLevel              string            // "" (use -v/default) or debug|info|warn|error
+	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
+	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
+	SafeMode              bool              // true = apply recommended anti-ban safe defaults
+	HybridMode            bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
+	ModelsHideUnavailable bool              // true = /v1/models prunes models marked unavailable (region/tier/quota)
+	CORSAllowedOrigin     string            // Access-Control-Allow-Origin for /v1/* responses (CORS_ALLOWED_ORIGIN; default "*")
+	RequestJitter         time.Duration     // random delay range [0, RequestJitter) before upstream chat calls
+	CLIVersion            string            // upstream CLI version string (default: 0.10.7)
+	ModelAliases          map[string]string // map model alias -> real model ID (#25)
+	TransientRetries      int               // max additional attempts after a transient transport failure (0 = disabled; default 1)
+	SessionPersist        bool              // true = persist session state to disk so restart resumes unexpired sessions (SESSION_PERSIST)
+	SessionStateFile      string            // path to the session state file (SESSION_STATE_FILE; default .freebuff-session-state.json)
 	// SessionCreateMaxParallelGlobal / SessionCreateMaxParallelPerModel cap
 	// concurrent in-flight session admissions (issue #86): the pool's create
 	// gate returns 503 when a cap is hit instead of hammering upstream.
@@ -170,10 +163,6 @@ type rawConfig struct {
 	SessionCallTimeout               string   `json:"SESSION_CALL_TIMEOUT"`
 	APIKeys                          []string `json:"API_KEYS"`
 	AdminToken                       string   `json:"ADMIN_TOKEN"`
-	HTTPProxy                        string   `json:"HTTP_PROXY"`
-	SOCKS5Proxy                      string   `json:"SOCKS5_PROXY"`
-	SOCKS5Proxies                    []string `json:"SOCKS5_PROXIES"`
-	ProxyRotation                    string   `json:"PROXY_ROTATION"`
 	CostMode                         string   `json:"COST_MODE"`
 	UserID                           string   `json:"USER_ID"`
 	TLSFingerprint                   string   `json:"TLS_FINGERPRINT"`
@@ -193,10 +182,7 @@ type rawConfig struct {
 	TransientRetries                 *int     `json:"TRANSIENT_RETRIES"`
 	SessionPersist                   bool     `json:"SESSION_PERSIST"`
 	SessionStateFile                 string   `json:"SESSION_STATE_FILE"`
-	StableEgress                     bool     `json:"STABLE_EGRESS"`
 	HTTP2Upstream                    bool     `json:"HTTP2_UPSTREAM"`
-	ProxyHealthInterval              string   `json:"PROXY_HEALTH_INTERVAL"`
-	ProxyHealthMaxFailures           *int     `json:"PROXY_HEALTH_MAX_FAILURES"`
 	SessionCreateMaxParallelGlobal   *int     `json:"SESSION_CREATE_MAX_PARALLEL_GLOBAL"`
 	SessionCreateMaxParallelPerModel *int     `json:"SESSION_CREATE_MAX_PARALLEL_PER_MODEL"`
 	RunFinishQueueSize               *int     `json:"RUN_FINISH_QUEUE_SIZE"`
@@ -231,10 +217,7 @@ func defaultRawConfig() rawConfig {
 		TransientRetries:                 nil,   // nil = 1 (one retry after a transient transport failure; 0 disables)
 		SessionPersist:                   false, // opt-in: persist session state across restarts
 		SessionStateFile:                 ".freebuff-session-state.json",
-		StableEgress:                     true, // session IP stability (anti-ban) on by default (#98); PROXY_ROTATION explicitly set still wins
-		HTTP2Upstream:                    true, // h2 ALPN matches real browsers (reference proxy-freebuff USE_HTTP2 default '1'); HTTP2_UPSTREAM=false forces h1 (#51)
-		ProxyHealthInterval:              "1m",
-		ProxyHealthMaxFailures:           ptrInt(3),   // nil default: resolved to 3 in Load
+		HTTP2Upstream:                    true,        // h2 ALPN matches real browsers (reference proxy-freebuff USE_HTTP2 default '1'); HTTP2_UPSTREAM=false forces h1 (#51)
 		SessionCreateMaxParallelGlobal:   ptrInt(128), // #86: concurrent session admissions cap
 		SessionCreateMaxParallelPerModel: ptrInt(32),  // #86: per-model concurrent admissions cap
 		RunFinishQueueSize:               ptrInt(64),  // #90: bounded deferred-FINISH queue
@@ -367,10 +350,6 @@ func Load(configPath string) (Config, error) {
 	overrideString(&raw.SessionCallTimeout, "SESSION_CALL_TIMEOUT")
 	overrideCSV(&raw.APIKeys, "API_KEYS")
 	overrideString(&raw.AdminToken, "ADMIN_TOKEN")
-	overrideString(&raw.HTTPProxy, "HTTP_PROXY")
-	overrideString(&raw.SOCKS5Proxy, "SOCKS5_PROXY")
-	overrideCSV(&raw.SOCKS5Proxies, "SOCKS5_PROXIES")
-	overrideString(&raw.ProxyRotation, "PROXY_ROTATION")
 	overrideString(&raw.CostMode, "COST_MODE")
 	overrideString(&raw.UserID, "USER_ID")
 	overrideString(&raw.TLSFingerprint, "TLS_FINGERPRINT")
@@ -390,10 +369,7 @@ func Load(configPath string) (Config, error) {
 	overrideInt(&raw.TransientRetries, "TRANSIENT_RETRIES")
 	overrideBool(&raw.SessionPersist, "SESSION_PERSIST")
 	overrideString(&raw.SessionStateFile, "SESSION_STATE_FILE")
-	overrideBool(&raw.StableEgress, "STABLE_EGRESS")
 	overrideBool(&raw.HTTP2Upstream, "HTTP2_UPSTREAM")
-	overrideString(&raw.ProxyHealthInterval, "PROXY_HEALTH_INTERVAL")
-	overrideInt(&raw.ProxyHealthMaxFailures, "PROXY_HEALTH_MAX_FAILURES")
 	overrideInt(&raw.SessionCreateMaxParallelGlobal, "SESSION_CREATE_MAX_PARALLEL_GLOBAL")
 	overrideInt(&raw.SessionCreateMaxParallelPerModel, "SESSION_CREATE_MAX_PARALLEL_PER_MODEL")
 	overrideInt(&raw.RunFinishQueueSize, "RUN_FINISH_QUEUE_SIZE")
@@ -431,16 +407,6 @@ func Load(configPath string) (Config, error) {
 	registryRefresh, err := parseDuration(raw.RegistryRefresh, "REGISTRY_REFRESH")
 	if err != nil {
 		return Config{}, err
-	}
-	proxyHealthInterval, err := parseDuration(raw.ProxyHealthInterval, "PROXY_HEALTH_INTERVAL")
-	if err != nil {
-		return Config{}, err
-	}
-	if proxyHealthInterval <= 0 {
-		// A zero/negative interval would spin the health ticker pointlessly;
-		// fall back to the 1m default so a misconfigured value degrades
-		// gracefully instead of erroring at startup.
-		proxyHealthInterval = time.Minute
 	}
 	// RUN_FINISH_INLINE_TIMEOUT / RUNS_DRAIN_TTL / SESSION_RE_ADMIT_LEAD /
 	// SESSION_PROBE_CACHE_TTL are zero-tolerant durations: "" or "0" fall
@@ -543,13 +509,6 @@ func Load(configPath string) (Config, error) {
 		transientRetries = *raw.TransientRetries
 	}
 
-	// PROXY_HEALTH_MAX_FAILURES: nil defaults to 3 consecutive failures
-	// before a proxy is marked out-of-rotation.
-	proxyHealthMaxFailures := 3
-	if raw.ProxyHealthMaxFailures != nil {
-		proxyHealthMaxFailures = *raw.ProxyHealthMaxFailures
-	}
-
 	// FALLBACK_AFTER_MS (issue #100): milliseconds, ""/0 = disabled. Any
 	// parse failure fails the load — a typo silently disabling model
 	// fallback would be worse than surfacing it.
@@ -597,10 +556,7 @@ func Load(configPath string) (Config, error) {
 		SessionCallTimeout:               sessionCallTimeout,
 		APIKeys:                          dedupeStrings(raw.APIKeys),
 		AdminToken:                       strings.TrimSpace(raw.AdminToken),
-		HTTPProxy:                        strings.TrimSpace(raw.HTTPProxy),
-		SOCKS5Proxy:                      strings.TrimSpace(raw.SOCKS5Proxy),
-		SOCKS5Proxies:                    dedupeStrings(raw.SOCKS5Proxies),
-		ProxyRotation:                    strings.TrimSpace(raw.ProxyRotation),
+		HTTP2Upstream:                    raw.HTTP2Upstream,
 		CostMode:                         strings.TrimSpace(raw.CostMode),
 		UserID:                           strings.TrimSpace(raw.UserID),
 		TLSFingerprint:                   strings.TrimSpace(raw.TLSFingerprint),
@@ -620,10 +576,6 @@ func Load(configPath string) (Config, error) {
 		TransientRetries:                 transientRetries,
 		SessionPersist:                   raw.SessionPersist,
 		SessionStateFile:                 strings.TrimSpace(raw.SessionStateFile),
-		StableEgress:                     raw.StableEgress,
-		HTTP2Upstream:                    raw.HTTP2Upstream,
-		ProxyHealthInterval:              proxyHealthInterval,
-		ProxyHealthMaxFailures:           proxyHealthMaxFailures,
 		SessionCreateMaxParallelGlobal:   sessionCreateMaxGlobal,
 		SessionCreateMaxParallelPerModel: sessionCreateMaxPerModel,
 		RunFinishQueueSize:               runFinishQueueSize,
@@ -753,8 +705,6 @@ func (c Config) Validate() error {
 		return errors.New("REQUEST_JITTER cannot be negative")
 	case c.TransientRetries < 0:
 		return errors.New("TRANSIENT_RETRIES cannot be negative")
-	case c.ProxyHealthMaxFailures < 0:
-		return errors.New("PROXY_HEALTH_MAX_FAILURES cannot be negative (0 falls back to the 3-failure default in the checker)")
 	case c.SessionCreateMaxParallelGlobal < 0 || c.SessionCreateMaxParallelPerModel < 0:
 		return errors.New("SESSION_CREATE_MAX_PARALLEL_GLOBAL/PER_MODEL cannot be negative (0 = unlimited)")
 	case c.RunFinishQueueSize < 0 || c.RunsDrainQueueCap < 0:
@@ -763,8 +713,6 @@ func (c Config) Validate() error {
 		return errors.New("SESSION_STATE_FILE cannot be empty when SESSION_PERSIST is enabled")
 	case c.CostMode != "" && c.CostMode != "free":
 		return errors.New(`COST_MODE must be "free" or unset -- any other value (e.g. a typo) routes requests as PAID and fresh free accounts get 402 "Out of credits"`)
-	case c.ProxyRotation != "" && c.ProxyRotation != "per-token" && c.ProxyRotation != "round-robin" && c.ProxyRotation != "random":
-		return fmt.Errorf("PROXY_ROTATION %q must be one of: per-token, round-robin, random", c.ProxyRotation)
 	case c.MaxMessagesPerDay < 0:
 		return errors.New("MAX_MESSAGES_PER_DAY cannot be negative")
 	}
@@ -789,57 +737,6 @@ func (c Config) Validate() error {
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {
 		return fmt.Errorf("LISTEN_ADDR %q has invalid port %q (must be an integer in 1-65535)", c.ListenAddr, portStr)
-	}
-
-	if c.HTTPProxy != "" {
-		u, err := url.Parse(c.HTTPProxy)
-		if err != nil {
-			return fmt.Errorf("HTTP_PROXY %q is not a valid URL: %w", c.HTTPProxy, err)
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("HTTP_PROXY %q must be an http(s) URL", c.HTTPProxy)
-		}
-		if u.Host == "" {
-			return fmt.Errorf("HTTP_PROXY %q has no host", c.HTTPProxy)
-		}
-	}
-
-	if c.SOCKS5Proxy != "" {
-		if strings.Contains(c.SOCKS5Proxy, "://") {
-			u, err := url.Parse(c.SOCKS5Proxy)
-			if err != nil {
-				return fmt.Errorf("SOCKS5_PROXY %q is not a valid URL: %w", c.SOCKS5Proxy, err)
-			}
-			if u.Scheme != "socks5" {
-				return fmt.Errorf("SOCKS5_PROXY %q must use socks5:// scheme", c.SOCKS5Proxy)
-			}
-			if u.Host == "" {
-				return fmt.Errorf("SOCKS5_PROXY %q has no host", c.SOCKS5Proxy)
-			}
-		} else {
-			if _, _, err := net.SplitHostPort(c.SOCKS5Proxy); err != nil {
-				return fmt.Errorf("SOCKS5_PROXY %q is invalid host:port: %w", c.SOCKS5Proxy, err)
-			}
-		}
-	}
-
-	for i, sp := range c.SOCKS5Proxies {
-		if strings.Contains(sp, "://") {
-			u, err := url.Parse(sp)
-			if err != nil {
-				return fmt.Errorf("SOCKS5_PROXIES proxy #%d (%q) is not a valid URL: %w", i+1, sp, err)
-			}
-			if u.Scheme != "socks5" {
-				return fmt.Errorf("SOCKS5_PROXIES proxy #%d (%q) must use socks5:// scheme", i+1, sp)
-			}
-			if u.Host == "" {
-				return fmt.Errorf("SOCKS5_PROXIES proxy #%d (%q) has no host", i+1, sp)
-			}
-		} else {
-			if _, _, err := net.SplitHostPort(sp); err != nil {
-				return fmt.Errorf("SOCKS5_PROXIES proxy #%d (%q) is invalid host:port: %w", i+1, sp, err)
-			}
-		}
 	}
 
 	// HYBRID_MODE deliberately has no constraint: hybrid with zero
@@ -970,9 +867,6 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideStringFrom(&raw.SessionCallTimeout, get, "SESSION_CALL_TIMEOUT")
 	overrideCSVFrom(&raw.APIKeys, get, "API_KEYS")
 	overrideStringFrom(&raw.AdminToken, get, "ADMIN_TOKEN")
-	overrideStringFrom(&raw.HTTPProxy, get, "HTTP_PROXY")
-	overrideStringFrom(&raw.SOCKS5Proxy, get, "SOCKS5_PROXY")
-	overrideCSVFrom(&raw.SOCKS5Proxies, get, "SOCKS5_PROXIES")
 	overrideStringFrom(&raw.CostMode, get, "COST_MODE")
 	overrideStringFrom(&raw.UserID, get, "USER_ID")
 	overrideStringFrom(&raw.TLSFingerprint, get, "TLS_FINGERPRINT")
@@ -992,13 +886,9 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideStringFrom(&raw.CLIVersion, get, "CLI_VERSION")
 	overrideStringFrom(&raw.ModelAliases, get, "MODEL_ALIASES")
 	overrideIntFrom(&raw.TransientRetries, get, "TRANSIENT_RETRIES")
-	overrideStringFrom(&raw.ProxyRotation, get, "PROXY_ROTATION")
 	overrideBoolFrom(&raw.SessionPersist, get, "SESSION_PERSIST")
 	overrideStringFrom(&raw.SessionStateFile, get, "SESSION_STATE_FILE")
-	overrideBoolFrom(&raw.StableEgress, get, "STABLE_EGRESS")
 	overrideBoolFrom(&raw.HTTP2Upstream, get, "HTTP2_UPSTREAM")
-	overrideStringFrom(&raw.ProxyHealthInterval, get, "PROXY_HEALTH_INTERVAL")
-	overrideIntFrom(&raw.ProxyHealthMaxFailures, get, "PROXY_HEALTH_MAX_FAILURES")
 	overrideIntFrom(&raw.SessionCreateMaxParallelGlobal, get, "SESSION_CREATE_MAX_PARALLEL_GLOBAL")
 	overrideIntFrom(&raw.SessionCreateMaxParallelPerModel, get, "SESSION_CREATE_MAX_PARALLEL_PER_MODEL")
 	overrideIntFrom(&raw.RunFinishQueueSize, get, "RUN_FINISH_QUEUE_SIZE")

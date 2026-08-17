@@ -188,14 +188,6 @@ func main() {
 			}
 		}
 	}
-	// Per-proxy health (#88): one registry shared by the health checker
-	// loop and every pooled client's SOCKS5 dialer (degraded proxies are
-	// skipped by the fallback). nil when no SOCKS5_PROXIES are configured.
-	var proxyHealth *egress.ProxyHealth
-	if len(cfg.SOCKS5Proxies) > 0 {
-		proxyHealth = egress.NewProxyHealth(cfg.ProxyHealthMaxFailures)
-	}
-
 	clients := make([]*upstream.Client, 0, len(cfg.AuthTokens))
 	sessions := make([]*session.Manager, 0, len(cfg.AuthTokens))
 	for i, token := range cfg.AuthTokens {
@@ -204,9 +196,6 @@ func main() {
 			logger.Error("failed to build upstream client", "err", err)
 			holdForExitIfConsole()
 			os.Exit(1)
-		}
-		if proxyHealth != nil {
-			client.SetProxyHealth(proxyHealth)
 		}
 		clients = append(clients, client)
 		sessions = append(sessions, session.NewManagerWithStore(client, store))
@@ -248,26 +237,15 @@ func main() {
 	// Prewarm + the 60s maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)
 
-	// Egress probing: report the country/IP each outbound path appears to
-	// come from (ban-avoidance diagnostics). The direct path is always
-	// probed; SOCKS5_PROXIES entries are probed through their own dialer.
+	// Egress probing: report the country/IP the direct outbound path appears
+	// to come from (ban-avoidance diagnostics; the upstream hard-blocks
+	// proxy/VPN egress, so the direct route is the only outbound path).
 	// Results are cached and refreshed every 10 minutes; failures are
 	// logged and cached with Err set (fail-open).
 	egressCache := egress.NewCache()
-	if paths := egressPaths(&cfg, logger); len(paths) > 0 {
+	if paths := egressPaths(); len(paths) > 0 {
 		go egress.RunLoop(ctx, logger, egressCache, paths, egress.ProbeTimeout, egress.DefaultTTL)
 		logger.Info("egress probes started", "paths", len(paths))
-	}
-
-	// Per-proxy health checking (#88): probes every configured SOCKS5 proxy
-	// on PROXY_HEALTH_INTERVAL and marks it out-of-rotation after
-	// PROXY_HEALTH_MAX_FAILURES consecutive failures; the pooled clients'
-	// dialers skip degraded proxies. Stops with ctx (shutdown).
-	if proxyHealth != nil && len(cfg.SOCKS5Proxies) > 0 {
-		go egress.RunHealthLoop(ctx, logger, proxyHealth, cfg.SOCKS5Proxies,
-			cfg.ProxyHealthInterval, egress.ProbeTimeout, 0)
-		logger.Info("proxy health checks started", "proxies", len(cfg.SOCKS5Proxies),
-			"interval", cfg.ProxyHealthInterval.String(), "max_failures", cfg.ProxyHealthMaxFailures)
 	}
 
 	// Issue #62: the dashboard login wizard drives the same headless OAuth
@@ -473,21 +451,12 @@ func ignoredExeAdjacentEnv(cwd, exePath string) string {
 	return p
 }
 
-// egressPaths returns the probe paths for the configured outbound routes:
-// index 0 is always the direct connection; each SOCKS5_PROXIES entry is
-// probed through its own SOCKS5 dialer. Unparseable proxy addresses are
-// skipped with a warning (fail-open); the direct probe always survives.
-func egressPaths(cfg *config.Config, logger *slog.Logger) []egress.Path {
-	paths := []egress.Path{{Key: "direct", Dialer: egress.DirectDialer(egress.ProbeTimeout)}}
-	for i, raw := range cfg.SOCKS5Proxies {
-		dialer, err := egress.Socks5Dialer(raw)
-		if err != nil {
-			logger.Warn("egress probe: skipping invalid SOCKS5 proxy", "index", i, "err", err)
-			continue
-		}
-		paths = append(paths, egress.Path{Key: fmt.Sprintf("proxy-%d", i), Dialer: dialer})
-	}
-	return paths
+// egressPaths returns the outbound probe paths: the direct connection only
+// (proxy routes were removed — the upstream hard-blocks proxy/VPN egress,
+// so any proxied path is pure ban risk). The risk engine's geo feed and the
+// doctor's "Egress region" row read results back from the shared cache.
+func egressPaths() []egress.Path {
+	return []egress.Path{{Key: "direct", Dialer: egress.DirectDialer(egress.ProbeTimeout)}}
 }
 
 // refreshLoop refreshes the registry immediately, then every interval.

@@ -91,7 +91,7 @@ For a guided walkthrough, read [Getting Started](docs/guides/getting-started.md)
 - **Session & Run Lifecycle**: Upstream session handshakes, model-lock recovery (`DELETE` → re-`POST`), grace draining, and idle-run finishing, all automatic.
 - **Token Pooling & Bridge Mode**: Hot-session-first pooling with round-robin start and failover across `AUTH_TOKENS`, or zero-storage relay when clients bring their own token. See [Key Concepts](#key-concepts).
 - **Token Auto-Discovery**: With empty `AUTH_TOKENS`, credentials are read from the official CLI login files (`~/.config/manicode/credentials.json`, `~/.config/codebuff/credentials.json`). Disable with `AUTO_DISCOVER_TOKEN=false`.
-- **TLS Stealth & Egress Proxies**: `HTTP_PROXY` / `SOCKS5_PROXY`, per-token SOCKS5 routing (`SOCKS5_PROXIES`, bound by token index), and browser TLS fingerprinting via uTLS (Chrome, Firefox, Safari, Edge).
+- **TLS Stealth**: browser TLS fingerprinting via uTLS (Chrome, Firefox, Safari, Edge) plus sanitized request headers so upstream traffic reads as a browser client.
 - **Subagent-Ready Concurrency**: Single-flight session refresh prevents race conditions during high-volume tool-calling loops.
 - **Safe Mode**: On by default: anti-ban presets (TLS stealth, header sanitization, jitter, idle rotation).
 - **Operational Tooling**: `-doctor` diagnostics (config, port, DNS/TLS, registry; zero-cost per-token validity probes run by default), `-test-token` (zero-cost probe on the first token, prints live quota, exit 0/1 for installers and scripts), `-setup` interactive client configuration, and a SHA-256-verified `-update` self-updater.
@@ -104,7 +104,7 @@ One chat request, end to end:
 1. **Your tool calls the proxy.** It POSTs a standard OpenAI request to `http://127.0.0.1:3457/v1/chat/completions`, same shape it would send to any OpenAI-compatible endpoint.
 2. **A token is chosen.** The proxy prefers the token that already holds a live session (hot-session-first), starting from a round-robin index and skipping tokens in cooldown or locked by a rate limit; in bridge mode it uses the token your client sent in its `Authorization` header.
 3. **The request is translated.** The model id is resolved through the catalog to the upstream agent that runs it, the message list is sanitized and re-wrapped in the CLI request envelope, and OpenAI extras (`reasoning_effort`, tool schemas, etc.) are mapped to what upstream expects.
-4. **It goes out stealthily.** The upstream call uses a browser-like TLS handshake and sanitized headers, through `HTTP_PROXY` / `SOCKS5_PROXY` if configured.
+4. **It goes out stealthily.** The upstream call uses a browser-like TLS handshake and sanitized headers.
 5. **The stream comes back translated.** The upstream SSE stream is converted into OpenAI `chat.completion.chunk` events and relayed to your client in real time.
 6. **State is cleaned up.** When the request finishes, the run is drained; once a run or token ages out (rotation interval, idle timeout), it is rotated or finished so the next request starts clean. A token that hit a quota limit (`429`) is locked locally until its reset time. The proxy answers `429` + `Retry-After` itself, with no traffic sent upstream.
 
@@ -233,7 +233,7 @@ curl http://127.0.0.1:3457/healthz
 
 ## Configuration Reference
 
-All keys can be set via environment variables or the JSON config file passed to `-config` (`AUTO_DISCOVER_TOKEN` is environment-only); a local `.env` file (if present) is also read, and for the keys it covers it behaves like the environment. Precedence, lowest to highest: **built-in defaults < JSON `-config` < `./.env` < environment**. List values (`AUTH_TOKENS`, `API_KEYS`, `SOCKS5_PROXIES`) are comma-separated in env and arrays in JSON.
+All keys can be set via environment variables or the JSON config file passed to `-config` (`AUTO_DISCOVER_TOKEN` is environment-only); a local `.env` file (if present) is also read, and for the keys it covers it behaves like the environment. Precedence, lowest to highest: **built-in defaults < JSON `-config` < `./.env` < environment**. List values (`AUTH_TOKENS`, `API_KEYS`) are comma-separated in env and arrays in JSON.
 
 | Environment Variable | Default | Description |
 |---|---|---|
@@ -252,10 +252,6 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `COST_MODE` | `free` | `free` (free-tier) or paid billing mode |
 | `USER_ID` | `""` | Optional FreeBuff account id; sent on every chat call as `x-freebuff-acting-user-id` (the real CLI sends it and the free-mode gate expects it). Empty = header omitted |
 | `TLS_FINGERPRINT` | `auto` | `auto`, `chrome120`, `chrome126`, `safari17`, `safari18`, `firefox120`, `firefox128`, `edge126`, `random` |
-| `HTTP_PROXY` | `""` | Outbound HTTP proxy for upstream requests |
-| `SOCKS5_PROXY` | `""` | Outbound SOCKS5 proxy for upstream requests |
-| `SOCKS5_PROXIES` | `""` | Per-token SOCKS5 proxies (comma-separated) |
-| `PROXY_ROTATION` | `per-token` | SOCKS5 binding mode: `per-token` (bind by token index), `round-robin`, or `random` per request |
 | `DEBUG_DUMP` | `false` | Persist redacted traffic dumps to `./dump/` (mode 0600) |
 | `LOG_FILE` | `""` | Append log lines to a file (e.g. `./logs/proxy.log`) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
@@ -276,10 +272,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `RUN_FINISH_INLINE_TIMEOUT` | `250ms` | Synchronous inline FINISH fallback bound when the finish queue is full |
 | `RUNS_DRAIN_QUEUE_CAP` | `64` | Draining-runs list cap; older entries are force-dropped (FINISH is best-effort) |
 | `RUNS_DRAIN_TTL` | `10m` | Draining-runs TTL eviction window |
-| `STABLE_EGRESS` | `true` | Pin each token+model to one hash-stable proxy for the session lifetime (`false` = legacy per-token binding; an explicit `PROXY_ROTATION` still wins) |
 | `HTTP2_UPSTREAM` | `true` | Negotiate HTTP/2 with the upstream so the ALPN matches real browsers; `false` forces HTTP/1.1 |
-| `PROXY_HEALTH_INTERVAL` | `1m` | Probe configured SOCKS5 proxies on this interval |
-| `PROXY_HEALTH_MAX_FAILURES` | `3` | Mark a proxy out-of-rotation after this many consecutive failures |
 | `FALLBACK_MODEL` | `""` | Model to use once the requested premium model's queue wait passes `FALLBACK_AFTER_MS` |
 | `FALLBACK_AFTER_MS` | `10000` | Queue-wait threshold (ms) before falling back to `FALLBACK_MODEL` |
 | `CORS_ALLOWED_ORIGIN` | `*` | `Access-Control-Allow-Origin` for `/v1/*` responses |

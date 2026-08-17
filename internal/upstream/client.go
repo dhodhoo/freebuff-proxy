@@ -16,22 +16,18 @@ import (
 	cryptoRand "crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -42,10 +38,8 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/proxy"
 
 	"freebuff-proxy/internal/config"
-	"freebuff-proxy/internal/egress"
 	"freebuff-proxy/internal/stealth"
 )
 
@@ -490,39 +484,10 @@ type Client struct {
 	profileMu      sync.Mutex
 	stealthProfile *stealth.Profile
 
-	// socksProxies is the normalized SOCKS5 proxy list when SOCKS5_PROXIES
-	// is configured (host:port each), with one prebuilt SOCKS5 dialer per
-	// entry in socksDialers. The proxy for a request is chosen per request
-	// by proxyIndex() and stashed in the request context; the transport
-	// dialer reads the stash so the chosen proxy is the one actually dialed
-	// (PROXY_ROTATION: per-token | round-robin | random). Empty when the
-	// legacy single SOCKS5_PROXY or no proxy is configured.
-	socksProxies  []string
-	socksDialers  []proxy.Dialer
-	proxyRotation string
-	proxyCounter  atomic.Uint64 // round-robin cursor (per token)
-
-	// stableEgress pins a token's egress to one hash-stable proxy per
-	// (token, model) for the session's lifetime (#98): a mid-session IP
-	// change is correlatable churn. An explicitly configured PROXY_ROTATION
-	// (round-robin/random) takes precedence, matching the reference priority
-	// "explicit config > defaults".
-	stableEgress bool
-	// lastModel is the most recent model a request was built for, so
-	// model-less calls (session polls) reuse the same stable egress proxy as
-	// the session they belong to.
-	lastModel atomic.Value // string
-
 	// http2Upstream negotiates HTTP/2 with the upstream so the TLS ALPN list
 	// matches real browsers ("h2,http/1.1") instead of the h1-only list that
 	// is itself a JA4 ALPN mismatch (#51). false forces HTTP/1.1.
 	http2Upstream bool
-
-	// health is the egress proxy-health registry consulted by the SOCKS5
-	// dialer: degraded (out-of-rotation) proxies are skipped by the
-	// fallback (#88). nil = not wired (every proxy eligible). Set via
-	// SetProxyHealth by main.go; pool/bridge clients keep it nil.
-	health *egress.ProxyHealth
 
 	// risk is the passive ban-risk engine fed from session/probe responses
 	// (#64). Production always uses stealth.DefaultRiskEngine; nil disables
@@ -572,11 +537,11 @@ func New(token string, cfg *config.Config) (*Client, error) {
 	return NewWithIndex(token, 0, cfg)
 }
 
-// NewWithIndex builds the client for token at tokenIndex. SOCKS5Proxies
-// (plural) selects the outbound proxy per request per ProxyRotation: the
-// legacy per-token binding pins token tokenIndex to proxy
-// tokenIndex % len(proxies); round-robin advances a per-token atomic
-// cursor; random draws via crypto/rand (#23).
+// NewWithIndex builds the client for token at tokenIndex (the token's
+// 0-based position in the pool's token list). Egress is always DIRECT: this
+// gateway spoofs the official FreeBuff CLI, which has no outbound proxy
+// machinery anywhere, and the upstream server hard-blocks proxy/VPN/Tor
+// egress — a proxy would only add ban risk.
 func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, error) {
 	if token == "" {
 		return nil, errors.New("upstream: empty token")
@@ -602,8 +567,6 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		userID:                cfg.UserID,
 		debugDump:             cfg.DebugDump,
 		transientRetriesLimit: cfg.TransientRetries,
-		proxyRotation:         cfg.ProxyRotation,
-		stableEgress:          cfg.StableEgress,
 		http2Upstream:         cfg.HTTP2Upstream,
 		risk:                  stealth.DefaultRiskEngine,
 	}
@@ -620,98 +583,13 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		stealthProf = profile
 	}
 
-	switch {
-	case len(cfg.SOCKS5Proxies) > 0:
-		// PROXY_ROTATION: the proxy is chosen per request (newRequest stashes
-		// the selected index) and this dialer reads the stash, so round-robin
-		// and random actually rotate the outbound connection. per-token is
-		// the default binding (token tokenIndex → proxy tokenIndex % n).
-		// The DefaultTransport clone inherits http.ProxyFromEnvironment;
-		// disable it so an operator HTTP_PROXY/HTTPS_PROXY env var never
-		// double-routes SOCKS5 traffic through a second proxy.
-		transport.Proxy = nil
-		for _, raw := range cfg.SOCKS5Proxies {
-			addr, auth, err := parseSocks5(raw)
-			if err != nil {
-				return nil, fmt.Errorf("upstream: SOCKS5_PROXIES: %w", err)
-			}
-			dialer, err := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
-			if err != nil {
-				return nil, fmt.Errorf("upstream: SOCKS5 dialer: %w", err)
-			}
-			c.socksProxies = append(c.socksProxies, addr)
-			c.socksDialers = append(c.socksDialers, dialer)
-		}
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return c.dialSocks5(ctx, c.proxyIndexFor(ctx), network, addr)
-		}
-		if len(c.socksProxies) > 1 {
-			// Rotation is defeated by connection reuse: Go's transport serves
-			// pooled idle connections (keyed on origin only) without re-invoking
-			// DialContext, so the per-request proxy choice would never be
-			// re-dialed on the typical single-stream workload. Disable
-			// keep-alives so every request dials through its assigned proxy;
-			// the single-proxy path keeps pooled connections.
-			transport.DisableKeepAlives = true
-		}
-		baseDial = transport.DialContext
-	case cfg.SOCKS5Proxy != "":
-		socksAddr, auth, err := parseSocks5(cfg.SOCKS5Proxy)
-		if err != nil {
-			return nil, fmt.Errorf("upstream: SOCKS5_PROXY: %w", err)
-		}
-		dialer, err := proxy.SOCKS5("tcp", socksAddr, auth, proxy.Direct)
-		if err != nil {
-			return nil, fmt.Errorf("upstream: SOCKS5 dialer: %w", err)
-		}
-		transport.Proxy = nil // same env-proxy isolation as SOCKS5_PROXIES
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.Dial(network, addr)
-		}
-		baseDial = transport.DialContext
-	case cfg.HTTPProxy != "":
-		proxyURL, err := url.Parse(cfg.HTTPProxy)
-		if err != nil {
-			// url.Parse's error text embeds the raw URL (password included).
-			return nil, fmt.Errorf("upstream: HTTP_PROXY %s is invalid", redactProxyURL(cfg.HTTPProxy))
-		}
-		if stealthProf != nil {
-			// Go's transport ignores DialTLSContext for proxied HTTPS requests:
-			// it invokes the TLS dialer with the PROXY's address (not the
-			// origin), so transport.Proxy + DialTLSContext would hand the
-			// stealth ClientHello to the plain CONNECT proxy and break the
-			// tunnel. Instead, dial the proxy ourselves with CONNECT and let
-			// the stealth dialer wrap the origin TLS over the tunnel. Plain-HTTP
-			// upstreams in this combination go direct — a TLS fingerprint is
-			// meaningless without TLS, and the default upstream is HTTPS.
-			transport.Proxy = nil
-			baseDial = httpConnectDial(proxyURL)
-		} else {
-			transport.Proxy = http.ProxyURL(proxyURL)
-		}
-	}
-
-	// Per-request rotation (round-robin/random) with multiple proxies is
-	// incompatible with h2: the http2 transport reuses one connection per
-	// origin, so the per-request proxy choice would be dialed once and then
-	// ignored. Keep h1, which redials per request via DisableKeepAlives.
-	// Stable bindings (STABLE_EGRESS hash pinning and the legacy per-token
-	// binding) reuse the same proxy anyway, so h2 is safe there.
-	multiProxy := len(c.socksProxies) > 1
-	if c.http2Upstream && multiProxy &&
-		(c.proxyRotation == "round-robin" || c.proxyRotation == "random") {
-		slog.Warn("HTTP2_UPSTREAM ignored: PROXY_ROTATION round-robin/random with multiple SOCKS5 proxies — h2 connection reuse would defeat per-request rotation; using HTTP/1.1")
-		c.http2Upstream = false
-	}
-	// STABLE_EGRESS deliberately spreads MODELS across proxies (hash
-	// pinning), so the per-origin h2 connection would collapse all of a
-	// multi-model token's egress onto whichever proxy the FIRST request
-	// dialed (review P2). The legacy per-token binding pins one proxy for
-	// the whole client, where h2 reuse is safe; only that case keeps h2.
-	if c.http2Upstream && multiProxy && c.stableEgress {
-		slog.Warn("HTTP2_UPSTREAM ignored: STABLE_EGRESS with multiple SOCKS5 proxies — h2 connection reuse would defeat per-model egress pinning; using HTTP/1.1")
-		c.http2Upstream = false
-	}
+	// Direct egress only (no proxy support): this gateway spoofs the
+	// official FreeBuff CLI, which has no proxy machinery, and the upstream
+	// server hard-blocks proxy/VPN/Tor egress. The DefaultTransport clone
+	// inherits http.ProxyFromEnvironment; disable it so an operator
+	// HTTP_PROXY/HTTPS_PROXY env var never routes upstream traffic through a
+	// proxy either (full egress control).
+	transport.Proxy = nil
 
 	if stealthProf != nil {
 		// Resolve the profile per request (instead of capturing it) so a
@@ -720,8 +598,8 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		// and the next dial picks it up. For auto/random, newRequest resolves
 		// a concrete profile and stashes it so the browser headers and the
 		// ClientHello always match; dialProfileFor prefers that stash.
-		// baseDial is the configured outbound path (SOCKS5 dialer or HTTP
-		// CONNECT tunnel); nil falls back to the default net.Dialer.
+		// baseDial is nil on the direct-only path, so the stealth dialer
+		// falls back to the default net.Dialer.
 		// The ALPN list must match the transport that will speak next: h2
 		// when the http2 transport below is registered, h1 otherwise.
 		alpn := []string{"http/1.1"}
@@ -750,10 +628,7 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 	// per-profile SETTINGS-frame fingerprinting is not feasible with the
 	// stdlib transport.
 	//
-	// HTTP2_UPSTREAM=false restores the previous h1-only behavior. h2 is
-	// also skipped when per-request proxy rotation is configured (h2
-	// connection reuse would silently defeat round-robin/random) and when
-	// the plain (non-stealth) transport routes through an HTTP(S) proxy.
+	// HTTP2_UPSTREAM=false restores the previous h1-only behavior.
 	if c.http2Upstream {
 		if stealthProf != nil {
 			h2t := &http2.Transport{
@@ -769,13 +644,9 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 			// default (the DefaultTransport clone carries
 			// ForceAttemptHTTP2=true, and its bundled h2 transport handles
 			// the ALPN dispatch because the TLS handshake is the stdlib's
-			// own). Two cases force HTTP/1.1 instead — an empty TLSNextProto
-			// map is the documented way to disable h2:
-			//   - HTTP2_UPSTREAM=false (the escape hatch), and
-			//   - an effective HTTP(S) proxy (explicit HTTP_PROXY or an env
-			//     proxy): this client does not negotiate h2 over a CONNECT
-			//     tunnel on the plain path, so those keep h1.
-			if !c.http2Upstream || effectiveHTTPProxy(transport, c.baseURL) {
+			// own). HTTP2_UPSTREAM=false forces HTTP/1.1 instead — an empty
+			// TLSNextProto map is the documented way to disable h2.
+			if !c.http2Upstream {
 				transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 			}
 		}
@@ -845,7 +716,7 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 	// (review P1 — the client-lifetime atomic only tracks the metric).
 	capacityDeferredAttempts := 0
 	for {
-		req, err := c.newRequest(withModel(ctx, opts.Model), http.MethodPost, "/api/v1/chat/completions", enveloped)
+		req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/chat/completions", enveloped)
 		if err != nil {
 			return nil, err
 		}
@@ -898,7 +769,7 @@ func (c *Client) CreateSession(ctx context.Context) (*SessionState, error) {
 
 // CreateSessionForModel POSTs /api/v1/freebuff/session with the requested model header.
 func (c *Client) CreateSessionForModel(ctx context.Context, model string) (*SessionState, error) {
-	req, err := c.newRequest(withModel(ctx, model), http.MethodPost, "/api/v1/freebuff/session", []byte("{}"))
+	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/freebuff/session", []byte("{}"))
 	if err != nil {
 		return nil, err
 	}
@@ -1314,11 +1185,6 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 // must not draw twice — headers and TLS fingerprint would mismatch).
 type requestProfileKey struct{}
 
-// proxyIndexKey stashes the per-request SOCKS5 proxy choice (PROXY_ROTATION)
-// in the request context, so the transport dialer uses the proxy selected
-// for this request.
-type proxyIndexKey struct{}
-
 func withStealthProfile(ctx context.Context, p *stealth.Profile) context.Context {
 	return context.WithValue(ctx, requestProfileKey{}, p)
 }
@@ -1364,14 +1230,6 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 			ver = "0.10.7"
 		}
 		req.Header.Set("User-Agent", fmt.Sprintf("ai-sdk/openai-compatible/%s/codebuff", ver))
-	}
-	if len(c.socksProxies) > 0 {
-		// Remember the model so model-less calls (session polls) reuse the
-		// same stable egress proxy as the session they belong to (#98).
-		if m := modelFrom(ctx); m != "" {
-			c.lastModel.Store(m)
-		}
-		ctx = context.WithValue(ctx, proxyIndexKey{}, c.proxyIndex(ctx))
 	}
 	if ctx != req.Context() {
 		req = req.WithContext(ctx)
@@ -1498,162 +1356,9 @@ func (c *Client) dialProfileFor(ctx context.Context) *stealth.Profile {
 	return profile
 }
 
-// proxyIndexFor returns the SOCKS5 proxy index to dial for a request. The
-// per-request choice stashed by newRequest wins; a bare context (e.g. a dial
-// not preceded by newRequest) falls back to the per-token binding.
-func (c *Client) proxyIndexFor(ctx context.Context) int {
-	if idx, ok := ctx.Value(proxyIndexKey{}).(int); ok && idx >= 0 && idx < len(c.socksProxies) {
-		return idx
-	}
-	if n := len(c.socksProxies); n > 0 {
-		return c.tokenIndex % n
-	}
-	// No SOCKS5 proxies configured: a bare-context dial must not divide by
-	// zero. The transport only installs the SOCKS5 DialContext when proxies
-	// exist, so this guards direct callers (tests, future paths). (Audit B4.)
-	return 0
-}
-
-// proxyIndex selects the SOCKS5 proxy index for a new request according to
-// PROXY_ROTATION: per-token (default) pins the token to its index,
-// round-robin advances a per-token atomic cursor, random draws via
-// crypto/rand. Unknown rotation values behave as per-token.
-// proxyIndex selects the SOCKS5 proxy index for a new request according to
-// PROXY_ROTATION: round-robin advances a per-token atomic cursor, random
-// draws via crypto/rand. With no explicit rotation, STABLE_EGRESS (default
-// on) pins the token to a hash-stable proxy per (token, model) so the
-// session keeps one egress IP; STABLE_EGRESS=false falls back to the legacy
-// per-token binding (token tokenIndex → proxy tokenIndex % n).
-//
-// The model comes from the request context (withModel); model-less calls
-// (session polls) reuse the last model seen so the poll travels the same
-// egress as the session it belongs to.
-func (c *Client) proxyIndex(ctx context.Context) int {
-	n := len(c.socksProxies)
-	if n == 0 {
-		return 0
-	}
-	switch c.proxyRotation {
-	case "round-robin":
-		return int((c.proxyCounter.Add(1) - 1) % uint64(n))
-	case "random":
-		return cryptoRandN(n)
-	}
-	if c.stableEgress {
-		model := modelFrom(ctx)
-		if model == "" {
-			if m, ok := c.lastModel.Load().(string); ok {
-				model = m
-			}
-		}
-		return stableProxyIndex(c.token, model, n)
-	}
-	return c.tokenIndex % n
-}
-
-// stableProxyIndex returns the hash-stable proxy index for (token, model):
-// FNV-1a over "token\x00model" mod n. Deterministic across restarts (same
-// proxy list order → same egress IP), spread across the pool, and stable
-// for the lifetime of a (token, model) session (#98).
-func stableProxyIndex(token, model string, n int) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(token))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(model))
-	return int(h.Sum32() % uint32(n))
-}
-
-// modelKey stashes the model a request is being built for in its context,
-// so stable-egress selection can pin hash(token+model) (#98).
-type modelKey struct{}
-
-func withModel(ctx context.Context, model string) context.Context {
-	return context.WithValue(ctx, modelKey{}, model)
-}
-
-func modelFrom(ctx context.Context) string {
-	if m, ok := ctx.Value(modelKey{}).(string); ok {
-		return m
-	}
-	return ""
-}
-
 // h2ALPN is the ALPN list a real browser advertises — the JA4-correct
 // fingerprint for HTTP/2 upstreams (#51).
 var h2ALPN = []string{"h2", "http/1.1"}
-
-// effectiveHTTPProxy reports whether transport's Proxy function resolves an
-// HTTP(S) proxy for baseURL (an explicit HTTP_PROXY config or an env proxy).
-// Used to decide whether the plain transport may negotiate HTTP/2: this
-// client does not speak h2 over a CONNECT tunnel, so proxied paths force h1.
-func effectiveHTTPProxy(transport *http.Transport, baseURL string) bool {
-	if transport == nil || transport.Proxy == nil {
-		return false
-	}
-	req, err := http.NewRequest(http.MethodGet, baseURL, nil)
-	if err != nil {
-		return false
-	}
-	u, err := transport.Proxy(req)
-	return err == nil && u != nil
-}
-
-// dialSocks5 dials addr through the SOCKS5 proxy at start, falling back to
-// the next proxy in the pool when the dial fails (#98: a connect failure
-// must not kill the session — the request just rides the next proxy) and
-// skipping proxies the health registry has degraded (#88). At most
-// len(socksDialers) attempts; the first failure is returned when every
-// proxy fails (or the pool is entirely out of rotation). Context-aware when
-// the underlying proxy dialer supports it.
-func (c *Client) dialSocks5(ctx context.Context, start int, network, addr string) (net.Conn, error) {
-	n := len(c.socksDialers)
-	if n == 0 {
-		return nil, errors.New("upstream: no SOCKS5 dialers configured")
-	}
-	var firstErr error
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
-		if c.health != nil && !c.health.IsHealthy(c.socksProxies[idx]) {
-			continue
-		}
-		var (
-			conn net.Conn
-			err  error
-		)
-		if cd, ok := c.socksDialers[idx].(proxy.ContextDialer); ok {
-			conn, err = cd.DialContext(ctx, network, addr)
-		} else {
-			conn, err = c.socksDialers[idx].Dial(network, addr)
-		}
-		if err == nil {
-			return conn, nil
-		}
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr == nil {
-		firstErr = errors.New("upstream: all SOCKS5 proxies are degraded (out of rotation)")
-	}
-	return nil, firstErr
-}
-
-// SetProxyHealth wires the egress proxy-health registry into the SOCKS5
-// dialer (#88): degraded (out-of-rotation) proxies are skipped by the
-// fallback. Exported as the wiring seam for main.go and tests; nil clears
-// the registry (every proxy eligible again).
-func (c *Client) SetProxyHealth(h *egress.ProxyHealth) { c.health = h }
-
-// cryptoRandN returns a crypto-random integer in [0, n).
-func cryptoRandN(n int) int {
-	if n <= 0 {
-		return 0
-	}
-	var b [8]byte
-	_, _ = cryptoRand.Read(b[:])
-	u := binary.BigEndian.Uint64(b[:])
-	return int(u % uint64(n))
-}
 
 // TransientRetries returns how many transient transport failures were
 // retried by this client (pool snapshot /metrics aggregation).
@@ -2490,141 +2195,6 @@ func padBase36(id string) string {
 	}
 	return id
 }
-
-// proxyUserinfoRe matches the userinfo portion of a (possibly malformed)
-// proxy URL so the password can be masked even when url.Parse rejects it.
-var proxyUserinfoRe = regexp.MustCompile(`^(.*?://[^:]*:)[^@]*@`)
-
-// redactProxyURL returns raw with any userinfo password masked, so proxy
-// URLs never leak credentials through error messages (parse errors are
-// logged verbatim at startup and in the egress probe). Unparseable URLs
-// fall back to a regex mask.
-func redactProxyURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return proxyUserinfoRe.ReplaceAllString(raw, `${1}***@`)
-	}
-	// Slice the raw string instead of url.UserPassword("***"): the latter
-	// percent-escapes the asterisks (%2A%2A%2A).
-	rest := raw[strings.Index(raw, "://")+3:]
-	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
-		userinfo := rest[:at]
-		if colon := strings.IndexByte(userinfo, ':'); colon >= 0 {
-			return raw[:len(raw)-len(rest)+colon+1] + "***" + rest[at:]
-		}
-	}
-	return raw
-}
-
-// parseSocks5 normalizes a SOCKS5 proxy URL to host:port plus its
-// credentials. A bare host:port or a socks5:// URL (with optional userinfo)
-// are accepted; the userinfo becomes the SOCKS5 auth so authenticated
-// proxies actually authenticate (previously userinfo was silently stripped
-// and the client connected unauthenticated, failing the handshake — Audit
-// B2).
-func parseSocks5(raw string) (addr string, auth *proxy.Auth, err error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", nil, errors.New("empty proxy URL")
-	}
-	if !strings.Contains(raw, "://") {
-		return raw, nil, nil
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		// url.Parse's own error text embeds the raw URL (password included);
-		// drop it and keep the redacted form.
-		return "", nil, errors.New("proxy URL " + redactProxyURL(raw) + " is invalid")
-	}
-	if u.Host == "" {
-		return "", nil, fmt.Errorf("proxy URL %s has no host", redactProxyURL(raw))
-	}
-	if u.User != nil {
-		pass, _ := u.User.Password()
-		auth = &proxy.Auth{User: u.User.Username(), Password: pass}
-	}
-	return u.Host, auth, nil
-}
-
-// httpConnectTimeout bounds the CONNECT request/response exchange with the
-// proxy (mirroring the stdlib's 1-minute connect timeout). Var so tests can
-// shrink it; production never changes it.
-var httpConnectTimeout = time.Minute
-
-// httpConnectDial returns a dial function that reaches addr through an HTTP
-// CONNECT proxy: it dials the proxy, issues "CONNECT addr", and returns the
-// tunneled connection. Used when TLS_FINGERPRINT is pinned: Go's transport
-// ignores DialTLSContext for proxied HTTPS requests (it invokes the TLS
-// dialer with the proxy's address), so routing the origin TLS through
-// transport.Proxy would hand the stealth ClientHello to the plain CONNECT
-// proxy instead of the origin.
-func httpConnectDial(proxyURL *url.URL) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		var d net.Dialer
-		conn, err := d.DialContext(ctx, network, proxyURL.Host)
-		if err != nil {
-			return nil, fmt.Errorf("upstream: dial HTTP proxy %s: %w", proxyURL.Host, err)
-		}
-		req := &http.Request{
-			Method: http.MethodConnect,
-			URL:    &url.URL{Opaque: addr},
-			Host:   addr,
-			Header: make(http.Header),
-		}
-		if proxyURL.User != nil {
-			user := proxyURL.User.Username()
-			pass, _ := proxyURL.User.Password()
-			req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
-		}
-		// A proxy that accepts TCP but never answers CONNECT must not leak a
-		// dial goroutine and an open conn per request forever: bound the
-		// write+read of the CONNECT exchange with a deadline (mirroring the
-		// stdlib's 1-minute connect timeout), and clear it once the tunnel is
-		// established so it does not carry into the TLS handshake.
-		if err := conn.SetDeadline(time.Now().Add(httpConnectTimeout)); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("upstream: CONNECT %s: set deadline: %w", addr, err)
-		}
-		if err := req.Write(conn); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("upstream: CONNECT %s: %w", addr, err)
-		}
-		br := bufio.NewReader(conn)
-		resp, err := http.ReadResponse(br, req)
-		if err != nil {
-			_ = conn.Close()
-			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-				return nil, fmt.Errorf("upstream: CONNECT %s: proxy did not answer within 1m: %w", addr, err)
-			}
-			return nil, fmt.Errorf("upstream: CONNECT %s response: %w", addr, err)
-		}
-		_ = conn.SetDeadline(time.Time{})
-		if resp.StatusCode != http.StatusOK {
-			_ = conn.Close()
-			return nil, fmt.Errorf("upstream: CONNECT %s: proxy %s", addr, resp.Status)
-		}
-		// Preserve any bytes the response reader buffered past the headers:
-		// the TLS handshake must see them, not lose them.
-		return &bufConn{conn: conn, r: br}, nil
-	}
-}
-
-// bufConn bridges a buffered reader back to the underlying connection so the
-// stealth TLS handshake reads exactly the bytes the CONNECT response reader
-// left buffered (it would otherwise swallow the first TLS records).
-type bufConn struct {
-	conn net.Conn
-	r    *bufio.Reader
-}
-
-func (b *bufConn) Read(p []byte) (int, error)         { return b.r.Read(p) }
-func (b *bufConn) Write(p []byte) (int, error)        { return b.conn.Write(p) }
-func (b *bufConn) Close() error                       { return b.conn.Close() }
-func (b *bufConn) LocalAddr() net.Addr                { return b.conn.LocalAddr() }
-func (b *bufConn) RemoteAddr() net.Addr               { return b.conn.RemoteAddr() }
-func (b *bufConn) SetDeadline(t time.Time) error      { return b.conn.SetDeadline(t) }
-func (b *bufConn) SetReadDeadline(t time.Time) error  { return b.conn.SetReadDeadline(t) }
-func (b *bufConn) SetWriteDeadline(t time.Time) error { return b.conn.SetWriteDeadline(t) }
 
 func drainBody(r io.Reader) string {
 	data, _ := io.ReadAll(io.LimitReader(r, 51200))

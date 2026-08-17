@@ -298,7 +298,7 @@ proxy classifies upstream responses deliberately.
 | 401 | `missing_bearer_token` | Bridge mode: you sent no token | Add `Authorization: Bearer cb_...` |
 | 402 | `out of credits` | Upstream billing state (paid routing) | A wrong `COST_MODE` in `.env` is a **startup config error**, not a runtime 402: the proxy refuses to start with anything but `free` or unset. A live 402 comes from the upstream account itself |
 | 403 | `account_banned` | Account banned upstream (temporary when a resume time is provided) | Stop using that account; check egress for VPN/proxy signals; wait for the resume time if set |
-| 403 | `country_blocked` | Egress region refused by upstream | Route through an allowed region or configure `SOCKS5_PROXY` |
+| 403 | `country_blocked` | Egress region refused by upstream | Route through an allowed region (the proxy has no proxy support; egress is direct) |
 | 429 | quota / rate limit | Daily quota spent, resets Pacific midnight | Wait, or add a token |
 | 429 | `ip_capped` | Too many distinct users on one egress IP | Rotate the account or the IP |
 | 5xx | upstream error | FreeBuff side, transient | Retry later; check `TRANSIENT_RETRIES` behavior in logs |

@@ -13,25 +13,23 @@ import (
 )
 
 // envKeys lists every environment variable the package reads. Tests clear
-// them all first so machine-level env (e.g. a corporate HTTP_PROXY) can never
-// leak into assertions.
+// them all first so machine-level env can never leak into assertions.
 var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
-	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "HTTP_PROXY",
-	"SOCKS5_PROXY", "SOCKS5_PROXIES", "PROXY_ROTATION", "COST_MODE", "USER_ID",
+	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "COST_MODE", "USER_ID",
 	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
 	"MODELS_HIDE_UNAVAILABLE", "CORS_ALLOWED_ORIGIN", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
 	"AUTO_DISCOVER_TOKEN", "TRANSIENT_RETRIES", "ADMIN_TOKEN",
 	"SESSION_PERSIST", "SESSION_STATE_FILE",
-	"STABLE_EGRESS", "HTTP2_UPSTREAM", "PROXY_HEALTH_INTERVAL", "PROXY_HEALTH_MAX_FAILURES",
+	"HTTP2_UPSTREAM",
 	"WEBHOOK_URL", "FALLBACK_AFTER_MS", "FALLBACK_MODEL", "ADOPT_CLI_SESSION", "WAITING_ROOM_CHAIN",
 }
 
 // TestMain strips ambient freebuff-proxy config env vars for the whole test
 // binary (testutil.UnsetConfigEnvForTestMain). clearEnv in each test covers
 // the per-test isolation, but a developer's exported SESSION_PERSIST /
-// PROXY_ROTATION / MODELS_HIDE_UNAVAILABLE / SESSION_STATE_FILE would
+// MODELS_HIDE_UNAVAILABLE / SESSION_STATE_FILE would
 // otherwise leak into package-level behavior before the first clearEnv runs
 // (e.g. TestDefaults / TestSessionPersist assert on those defaults).
 func TestMain(m *testing.M) {
@@ -109,9 +107,6 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.LogLevel != "" {
 		t.Errorf("LogLevel = %q, want empty", cfg.LogLevel)
-	}
-	if cfg.HTTPProxy != "" || cfg.SOCKS5Proxy != "" {
-		t.Errorf("proxies = %q/%q, want empty", cfg.HTTPProxy, cfg.SOCKS5Proxy)
 	}
 	if cfg.CostMode != "free" {
 		t.Errorf("CostMode = %q, want free (default: omission routes requests as paid -> 402)", cfg.CostMode)
@@ -221,83 +216,6 @@ func TestTransientRetries(t *testing.T) {
 		t.Fatalf("Load (negative): err = %v, want error mentioning TRANSIENT_RETRIES", err)
 	}
 	t.Setenv("TRANSIENT_RETRIES", "")
-}
-
-func TestEgressStabilityKnobs(t *testing.T) {
-	clearEnv(t)
-	t.Setenv("AUTH_TOKENS", "tok-1")
-
-	// Defaults: STABLE_EGRESS and HTTP2_UPSTREAM on, health 1m/3 failures.
-	cfg, err := Load("")
-	if err != nil {
-		t.Fatalf("Load (default): %v", err)
-	}
-	if !cfg.StableEgress {
-		t.Error("StableEgress = false, want true (default)")
-	}
-	if !cfg.HTTP2Upstream {
-		t.Error("HTTP2Upstream = false, want true (default)")
-	}
-	if cfg.ProxyHealthInterval != time.Minute {
-		t.Errorf("ProxyHealthInterval = %v, want 1m", cfg.ProxyHealthInterval)
-	}
-	if cfg.ProxyHealthMaxFailures != 3 {
-		t.Errorf("ProxyHealthMaxFailures = %d, want 3", cfg.ProxyHealthMaxFailures)
-	}
-
-	// Env overrides win.
-	t.Setenv("STABLE_EGRESS", "false")
-	t.Setenv("HTTP2_UPSTREAM", "0")
-	t.Setenv("PROXY_HEALTH_INTERVAL", "5s")
-	t.Setenv("PROXY_HEALTH_MAX_FAILURES", "7")
-	cfg, err = Load("")
-	if err != nil {
-		t.Fatalf("Load (overrides): %v", err)
-	}
-	if cfg.StableEgress {
-		t.Error("StableEgress = true after STABLE_EGRESS=false")
-	}
-	if cfg.HTTP2Upstream {
-		t.Error("HTTP2Upstream = true after HTTP2_UPSTREAM=0")
-	}
-	if cfg.ProxyHealthInterval != 5*time.Second {
-		t.Errorf("ProxyHealthInterval = %v, want 5s", cfg.ProxyHealthInterval)
-	}
-	if cfg.ProxyHealthMaxFailures != 7 {
-		t.Errorf("ProxyHealthMaxFailures = %d, want 7", cfg.ProxyHealthMaxFailures)
-	}
-
-	// Invalid health interval falls back to the 1m default (graceful).
-	t.Setenv("PROXY_HEALTH_INTERVAL", "-5s")
-	cfg, err = Load("")
-	if err != nil {
-		t.Fatalf("Load (negative interval): %v", err)
-	}
-	if cfg.ProxyHealthInterval != time.Minute {
-		t.Errorf("ProxyHealthInterval = %v after -5s, want 1m default", cfg.ProxyHealthInterval)
-	}
-	t.Setenv("PROXY_HEALTH_INTERVAL", "1m")
-
-	// A garbage duration fails parse.
-	t.Setenv("PROXY_HEALTH_INTERVAL", "banana")
-	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "PROXY_HEALTH_INTERVAL") {
-		t.Fatalf("Load (garbage interval): err = %v, want error mentioning PROXY_HEALTH_INTERVAL", err)
-	}
-	t.Setenv("PROXY_HEALTH_INTERVAL", "")
-
-	// A negative max-failures value fails validation.
-	t.Setenv("PROXY_HEALTH_MAX_FAILURES", "-1")
-	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "PROXY_HEALTH_MAX_FAILURES") {
-		t.Fatalf("Load (-1 failures): err = %v, want error mentioning PROXY_HEALTH_MAX_FAILURES", err)
-	}
-	// 0 is accepted (the checker falls back to the 3-failure default).
-	t.Setenv("PROXY_HEALTH_MAX_FAILURES", "0")
-	if cfg, err := Load(""); err != nil {
-		t.Fatalf("Load (0 failures): %v", err)
-	} else if cfg.ProxyHealthMaxFailures != 0 {
-		t.Errorf("ProxyHealthMaxFailures = %d, want 0 (explicit zero passes through)", cfg.ProxyHealthMaxFailures)
-	}
-	t.Setenv("PROXY_HEALTH_MAX_FAILURES", "")
 }
 
 func TestSafeMode(t *testing.T) {
@@ -448,8 +366,6 @@ func TestLoadFromFile(t *testing.T) {
 		"REQUEST_TIMEOUT": "5m",
 		"SESSION_CALL_TIMEOUT": "10s",
 		"API_KEYS": ["k1"],
-		"HTTP_PROXY": "http://proxy.example:3128",
-		"SOCKS5_PROXY": "socks5://socks.example:1080",
 		"COST_MODE": "free",
 		"REGISTRY_REFRESH": "2h",
 		"DEBUG_DUMP": true,
@@ -485,12 +401,6 @@ func TestLoadFromFile(t *testing.T) {
 	}
 	if want := []string{"k1"}; !equalStrings(cfg.APIKeys, want) {
 		t.Errorf("APIKeys = %v, want %v", cfg.APIKeys, want)
-	}
-	if cfg.HTTPProxy != "http://proxy.example:3128" {
-		t.Errorf("HTTPProxy = %q", cfg.HTTPProxy)
-	}
-	if cfg.SOCKS5Proxy != "socks5://socks.example:1080" {
-		t.Errorf("SOCKS5Proxy = %q", cfg.SOCKS5Proxy)
 	}
 	if cfg.CostMode != "free" {
 		t.Errorf("CostMode = %q, want free", cfg.CostMode)
@@ -567,44 +477,6 @@ func TestEnvOnly(t *testing.T) {
 	}
 	if cfg.DebugDump {
 		t.Error("DebugDump = true, want false (off)")
-	}
-}
-
-// TestSOCKS5ProxiesEnv verifies the comma-separated SOCKS5_PROXIES env var
-// lands in cfg.SOCKS5Proxies. Regression: only the JSON config file
-// populated the field, so per-token proxy binding silently fell back to
-// SOCKS5Proxy despite the README documenting SOCKS5_PROXIES as env-settable.
-func TestSOCKS5ProxiesEnv(t *testing.T) {
-	clearEnv(t)
-	t.Setenv("AUTH_TOKENS", "tok-1")
-	t.Setenv("SOCKS5_PROXIES", "host1:9050,host2:9050")
-
-	cfg, err := Load("")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	want := []string{"host1:9050", "host2:9050"}
-	if !equalStrings(cfg.SOCKS5Proxies, want) {
-		t.Errorf("SOCKS5Proxies = %v, want %v (from env)", cfg.SOCKS5Proxies, want)
-	}
-}
-
-// TestDotenvSOCKS5Proxies verifies SOCKS5_PROXIES in ./.env lands in
-// cfg.SOCKS5Proxies, mirroring the env override.
-func TestDotenvSOCKS5Proxies(t *testing.T) {
-	clearEnv(t)
-
-	if err := os.WriteFile(".env", []byte("SOCKS5_PROXIES=host1:9050,host2:9050\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := Load("")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	want := []string{"host1:9050", "host2:9050"}
-	if !equalStrings(cfg.SOCKS5Proxies, want) {
-		t.Errorf("SOCKS5Proxies = %v, want %v (from .env)", cfg.SOCKS5Proxies, want)
 	}
 }
 
@@ -691,18 +563,11 @@ func TestValidate(t *testing.T) {
 		{"zero session timeout", func(c *Config) { c.SessionCallTimeout = 0 }},
 		{"zero registry refresh", func(c *Config) { c.RegistryRefresh = 0 }},
 		{"bad cost mode", func(c *Config) { c.CostMode = "Free" }},
-		{"bad proxy rotation", func(c *Config) { c.ProxyRotation = "round robin" }},
 		{"negative max messages", func(c *Config) { c.MaxMessagesPerDay = -1 }},
 		{"session persist with empty state file", func(c *Config) { c.SessionPersist = true; c.SessionStateFile = "" }},
 		{"invalid listen port non-int", func(c *Config) { c.ListenAddr = "127.0.0.1:abc" }},
 		{"invalid listen port overflow", func(c *Config) { c.ListenAddr = "127.0.0.1:99999" }},
 		{"invalid listen port zero", func(c *Config) { c.ListenAddr = "127.0.0.1:0" }},
-		{"invalid http proxy url", func(c *Config) { c.HTTPProxy = "http://bad url:8080" }},
-		{"invalid http proxy scheme", func(c *Config) { c.HTTPProxy = "ftp://proxy:8080" }},
-		{"invalid http proxy host", func(c *Config) { c.HTTPProxy = "http://" }},
-		{"invalid socks5 proxy scheme", func(c *Config) { c.SOCKS5Proxy = "http://proxy:1080" }},
-		{"invalid socks5 proxy hostless url", func(c *Config) { c.SOCKS5Proxy = "socks5://" }},
-		{"invalid socks5 proxy host:port", func(c *Config) { c.SOCKS5Proxy = "invalid_no_port" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -752,45 +617,9 @@ func TestValidateListenAddr(t *testing.T) {
 	}
 }
 
-// TestValidateProxies verifies syntax validation of HTTP_PROXY, SOCKS5_PROXY, and SOCKS5_PROXIES.
-func TestValidateProxies(t *testing.T) {
-	good := Config{
-		ListenAddr:         "127.0.0.1:3457",
-		UpstreamBaseURL:    "https://www.codebuff.com",
-		AuthTokens:         []string{"tok"},
-		RotationInterval:   6 * time.Hour,
-		RequestTimeout:     15 * time.Minute,
-		SessionCallTimeout: 30 * time.Second,
-		RegistryRefresh:    6 * time.Hour,
-	}
-
-	validProxies := []struct {
-		httpProxy    string
-		socks5Proxy  string
-		socksProxies []string
-	}{
-		{httpProxy: "http://127.0.0.1:8080"},
-		{httpProxy: "https://user:pass@proxy.example:8443"},
-		{socks5Proxy: "127.0.0.1:1080"},
-		{socks5Proxy: "socks5://127.0.0.1:1080"},
-		{socks5Proxy: "socks5://user:pass@127.0.0.1:1080"},
-		{socksProxies: []string{"127.0.0.1:1080", "socks5://user:pass@127.0.0.1:1081"}},
-	}
-
-	for _, vp := range validProxies {
-		c := good
-		c.HTTPProxy = vp.httpProxy
-		c.SOCKS5Proxy = vp.socks5Proxy
-		c.SOCKS5Proxies = vp.socksProxies
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate(proxies=%+v) = %v, want nil", vp, err)
-		}
-	}
-}
-
 // TestValidateModeKnobs pins the accepted values for the routing knobs that
 // otherwise silently change behavior (a COST_MODE typo routes requests as
-// PAID → 402; an unknown PROXY_ROTATION silently falls back).
+// PAID → 402).
 func TestValidateModeKnobs(t *testing.T) {
 	good := Config{
 		ListenAddr:         ":3457",
@@ -802,13 +631,11 @@ func TestValidateModeKnobs(t *testing.T) {
 		RegistryRefresh:    6 * time.Hour,
 	}
 	for _, cost := range []string{"", "free"} {
-		for _, rot := range []string{"", "per-token", "round-robin", "random"} {
-			for _, mmd := range []int{0, 1} {
-				c := good
-				c.CostMode, c.ProxyRotation, c.MaxMessagesPerDay = cost, rot, mmd
-				if err := c.Validate(); err != nil {
-					t.Errorf("Validate(COST_MODE=%q PROXY_ROTATION=%q MAX=%d) = %v, want nil", cost, rot, mmd, err)
-				}
+		for _, mmd := range []int{0, 1} {
+			c := good
+			c.CostMode, c.MaxMessagesPerDay = cost, mmd
+			if err := c.Validate(); err != nil {
+				t.Errorf("Validate(COST_MODE=%q MAX=%d) = %v, want nil", cost, mmd, err)
 			}
 		}
 	}
@@ -1573,14 +1400,13 @@ func TestSessionPersistEmptyStateFileEnv(t *testing.T) {
 	}
 }
 
-// TestDedupeAPIKeysSOCKS5Proxies asserts the dedupeStrings pass for API_KEYS
-// and SOCKS5_PROXIES (only AUTH_TOKENS dedupe was previously asserted) when
-// the same value appears multiple times in one env value.
-func TestDedupeAPIKeysSOCKS5Proxies(t *testing.T) {
+// TestDedupeAPIKeys asserts the dedupeStrings pass for API_KEYS (only
+// AUTH_TOKENS dedupe was previously asserted) when the same value appears
+// multiple times in one env value.
+func TestDedupeAPIKeys(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("AUTH_TOKENS", "tok-1")
 	t.Setenv("API_KEYS", "k1,k2,k1, k1")
-	t.Setenv("SOCKS5_PROXIES", "p1:9050,p2:9050,p1:9050")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -1588,9 +1414,6 @@ func TestDedupeAPIKeysSOCKS5Proxies(t *testing.T) {
 	}
 	if want := []string{"k1", "k2"}; !equalStrings(cfg.APIKeys, want) {
 		t.Errorf("APIKeys = %v, want %v (deduped)", cfg.APIKeys, want)
-	}
-	if want := []string{"p1:9050", "p2:9050"}; !equalStrings(cfg.SOCKS5Proxies, want) {
-		t.Errorf("SOCKS5Proxies = %v, want %v (deduped)", cfg.SOCKS5Proxies, want)
 	}
 }
 
@@ -1721,8 +1544,7 @@ func TestModelAliasesConfig(t *testing.T) {
 
 // TestDotenvFullKeySet verifies every env-overridable key also lands in cfg
 // when set in ./.env. Regression: SAFE_MODE, REQUEST_JITTER, CLI_VERSION,
-// MODEL_ALIASES, TRANSIENT_RETRIES and PROXY_ROTATION were silently ignored
-// in .env (SOCKS5_PROXIES was already covered by TestDotenvSOCKS5Proxies).
+// MODEL_ALIASES and TRANSIENT_RETRIES were silently ignored in .env.
 func TestDotenvFullKeySet(t *testing.T) {
 	clearEnv(t)
 
@@ -1733,7 +1555,6 @@ func TestDotenvFullKeySet(t *testing.T) {
 		"CLI_VERSION=9.9.9",
 		"MODEL_ALIASES=gpt-4o:deepseek/deepseek-v4-flash,glm:z-ai/glm-5.2",
 		"TRANSIENT_RETRIES=2",
-		"PROXY_ROTATION=round-robin",
 	}, "\n")
 	if err := os.WriteFile(".env", []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -1761,9 +1582,6 @@ func TestDotenvFullKeySet(t *testing.T) {
 	if cfg.TransientRetries != 2 {
 		t.Errorf("TransientRetries = %d, want 2 (from .env)", cfg.TransientRetries)
 	}
-	if cfg.ProxyRotation != "round-robin" {
-		t.Errorf("ProxyRotation = %q, want round-robin (from .env)", cfg.ProxyRotation)
-	}
 }
 
 // TestDotenvFullKeySetEnvWins verifies the real environment still beats the
@@ -1771,14 +1589,13 @@ func TestDotenvFullKeySet(t *testing.T) {
 func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	clearEnv(t)
 
-	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nHYBRID_MODE=true\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\nPROXY_ROTATION=round-robin\n"), 0o644); err != nil {
+	if err := os.WriteFile(".env", []byte("SAFE_MODE=false\nHYBRID_MODE=true\nCLI_VERSION=9.9.9\nTRANSIENT_RETRIES=2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SAFE_MODE", "true")
 	t.Setenv("HYBRID_MODE", "false")
 	t.Setenv("CLI_VERSION", "1.2.3")
 	t.Setenv("TRANSIENT_RETRIES", "5")
-	t.Setenv("PROXY_ROTATION", "random")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -1795,9 +1612,6 @@ func TestDotenvFullKeySetEnvWins(t *testing.T) {
 	}
 	if cfg.TransientRetries != 5 {
 		t.Errorf("TransientRetries = %d, want 5 (env wins)", cfg.TransientRetries)
-	}
-	if cfg.ProxyRotation != "random" {
-		t.Errorf("ProxyRotation = %q, want random (env wins)", cfg.ProxyRotation)
 	}
 }
 

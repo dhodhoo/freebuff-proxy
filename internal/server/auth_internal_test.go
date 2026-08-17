@@ -188,7 +188,7 @@ func TestWriteErrorNewMappings(t *testing.T) {
 		if body.Error.Code != "country_blocked" {
 			t.Errorf("code = %q, want country_blocked", body.Error.Code)
 		}
-		if body.Error.Hint == "" || !strings.Contains(body.Error.Hint, "SOCKS5") {
+		if body.Error.Hint == "" || !strings.Contains(body.Error.Hint, "Route traffic through an allowed country") {
 			t.Errorf("hint = %q, want actionable egress hint", body.Error.Hint)
 		}
 	})

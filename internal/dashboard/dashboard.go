@@ -17,7 +17,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -765,7 +764,6 @@ type overviewData struct {
 	Models               []string
 	ModelCount           int
 	Uptime               string
-	Rotation             string
 	SafeMode             bool
 	MaxMessagesPerDay    int
 	TransientRetries     int64
@@ -866,7 +864,6 @@ func (d *Dashboard) configData() configData {
 		{Key: "ROTATION_INTERVAL", Value: cfg.RotationInterval.String()},
 		{Key: "REQUEST_TIMEOUT", Value: cfg.RequestTimeout.String()},
 		{Key: "SESSION_CALL_TIMEOUT", Value: cfg.SessionCallTimeout.String()},
-		{Key: "PROXY_ROTATION", Value: cfg.ProxyRotation},
 		{Key: "COST_MODE", Value: cfg.CostMode},
 		{Key: "TLS_FINGERPRINT", Value: cfg.TLSFingerprint},
 		{Key: "REGISTRY_REFRESH", Value: cfg.RegistryRefresh.String()},
@@ -881,37 +878,8 @@ func (d *Dashboard) configData() configData {
 		{Key: "CLI_VERSION", Value: cfg.CLIVersion},
 		{Key: "MODEL_ALIASES", Value: fmt.Sprintf("%d alias(es)", len(cfg.ModelAliases)), Secret: true},
 		{Key: "TRANSIENT_RETRIES", Value: strconv.Itoa(cfg.TransientRetries)},
-		{Key: "HTTP_PROXY", Value: maskProxyURL(cfg.HTTPProxy)},
-		{Key: "SOCKS5_PROXY", Value: boolWord(cfg.SOCKS5Proxy != ""), Secret: true},
-		{Key: "SOCKS5_PROXIES", Value: fmt.Sprintf("%d proxy(es)", len(cfg.SOCKS5Proxies)), Secret: true},
 	}
 	return cd
-}
-
-// maskProxyURL masks any embedded basic auth password in raw proxy URL.
-func maskProxyURL(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return raw
-	}
-	if _, hasPass := u.User.Password(); hasPass {
-		schemeIdx := strings.Index(raw, "://")
-		if schemeIdx >= 0 {
-			rest := raw[schemeIdx+3:]
-			if at := strings.LastIndexByte(rest, '@'); at >= 0 {
-				userinfo := rest[:at]
-				if colon := strings.IndexByte(userinfo, ':'); colon >= 0 {
-					return raw[:schemeIdx+3+colon+1] + "***" + rest[at:]
-				}
-			}
-		}
-		u.User = url.UserPassword(u.User.Username(), "***")
-		return u.String()
-	}
-	return raw
 }
 
 func boolWord(v bool) string {
@@ -935,7 +903,6 @@ const defaultEnvTemplate = `# freebuff-proxy configuration (.env)
 #ROTATION_INTERVAL=6h
 #REQUEST_TIMEOUT=15m
 #SESSION_CALL_TIMEOUT=30s
-#PROXY_ROTATION=per-token
 #COST_MODE=free
 #TLS_FINGERPRINT=chrome120
 #REGISTRY_REFRESH=6h
@@ -950,9 +917,6 @@ const defaultEnvTemplate = `# freebuff-proxy configuration (.env)
 #CLI_VERSION=0.10.7
 #MODEL_ALIASES=
 #TRANSIENT_RETRIES=1
-#HTTP_PROXY=
-#SOCKS5_PROXY=
-#SOCKS5_PROXIES=
 `
 
 func (d *Dashboard) overviewData() overviewData {
@@ -965,7 +929,6 @@ func (d *Dashboard) overviewData() overviewData {
 		Models:               d.reg.Models(),
 		ModelCount:           d.reg.ModelCount(),
 		Uptime:               time.Since(d.started).Round(time.Second).String(),
-		Rotation:             cfg.ProxyRotation,
 		SafeMode:             cfg.SafeMode,
 		MaxMessagesPerDay:    cfg.MaxMessagesPerDay,
 		TransientRetries:     ps.TransientRetries,

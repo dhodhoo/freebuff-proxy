@@ -110,7 +110,7 @@ to `./.env`, which only survives restarts when bind-mounted.
    proxy; if you expose it, put TLS in front (reverse proxy). The cookie and
    admin traffic would otherwise cross the wire in the clear.
 3. The dashboard never renders token values: `AUTH_TOKENS`, `API_KEYS`,
-   `SOCKS5_PROXY(S)`, and `ADMIN_TOKEN` show only set/unset + counts. The
+   and `ADMIN_TOKEN` show only set/unset + counts. The
    `.env` file is written atomically with mode `0600`.
 4. Saves (and `/admin/reload`) re-apply the JSON config file the proxy was
    started with (`-config`), so JSON overrides survive a dashboard save.
