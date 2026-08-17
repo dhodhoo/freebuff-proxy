@@ -1028,7 +1028,7 @@ func (m *Manager) Poll(ctx context.Context) error {
 		// grace closes; the pool keeps polling. The grace end comes from the
 		// response when present, else expiresAt + graceWindow.
 		graceEnd := st.GracePeriodEndsAt
-		if (graceEnd == time.Time{}) && !st.ExpiresAt.IsZero() {
+		if graceEnd.IsZero() && !st.ExpiresAt.IsZero() {
 			graceEnd = st.ExpiresAt.Add(graceWindow)
 		}
 		if st.InstanceID != "" && !graceEnd.IsZero() && time.Now().Before(graceEnd) {

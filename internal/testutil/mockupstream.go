@@ -19,10 +19,10 @@ import (
 
 // FinishedRun records an agent-run FINISH payload received by the mock.
 type FinishedRun struct {
-	RunID        string         `json:"runId"`
-	Status       string         `json:"status"`
-	TotalSteps   int            `json:"totalSteps"`
-	ErrorMessage string         `json:"errorMessage,omitempty"`
+	RunID        string `json:"runId"`
+	Status       string `json:"status"`
+	TotalSteps   int    `json:"totalSteps"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
 	// Steps mirrors the CLI step wire shape, captured from the FINISH
 	// payload (issue #114): steps are batched and sent WITH FINISH.
 	Steps []RecordedStep `json:"steps,omitempty"`

@@ -2542,10 +2542,10 @@ func TestSessionPollSchedule(t *testing.T) {
 			min      time.Duration
 			max      time.Duration
 		}{
-			{1, 10 * time.Second, 20 * time.Second},      // 20s, lower-half jitter
-			{2, 20 * time.Second, 40 * time.Second},      // 40s
-			{3, 40 * time.Second, 80 * time.Second},      // 80s
-			{6, 150 * time.Second, 300 * time.Second},    // capped at 300s
+			{1, 10 * time.Second, 20 * time.Second},   // 20s, lower-half jitter
+			{2, 20 * time.Second, 40 * time.Second},   // 40s
+			{3, 40 * time.Second, 80 * time.Second},   // 80s
+			{6, 150 * time.Second, 300 * time.Second}, // capped at 300s
 		}
 		for _, tc := range cases {
 			d := sessionPollBackoffDelay(tc.failures, 0)
