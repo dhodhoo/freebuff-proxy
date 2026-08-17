@@ -158,7 +158,7 @@ The bash installer prompts for an install method (easy, manual binary, Docker Co
 
 ```bash
 cp .env.example .env   # then set AUTH_TOKENS
-docker compose up -d --build
+VERSION=$(git describe --tags 2>/dev/null || echo dev) docker compose up -d --build
 ```
 
 **Or** download a release binary from [Releases](https://github.com/trefeon/freebuff-proxy/releases) (Linux/macOS/Windows × amd64/arm64), unzip it, right-click the extracted folder → **Open in Terminal**, and run `./start-proxy.sh` (Windows: `.\start-proxy.cmd`; the `.cmd` wrappers bypass the PowerShell execution policy). The bundled scripts also include a headless token generator (`gen-freebuff-token.sh` / `gen-token.cmd`).

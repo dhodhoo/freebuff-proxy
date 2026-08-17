@@ -8,6 +8,11 @@ services:
       # times out with a TLS handshake error on hosts whose bridge-network
       # egress is flaky (the documented deployment box needs this too).
       network: host
+      # Version stamped into the binary (ldflags -X main.version). The .git
+      # dir is excluded from the build context, so it is resolved here on
+      # the host: the nearest tag, or the short SHA past it.
+      args:
+        VERSION: ${VERSION:-dev}
     image: freebuff-proxy:latest
     container_name: freebuff-proxy
     env_file: .env

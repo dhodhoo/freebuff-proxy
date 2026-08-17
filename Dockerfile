@@ -3,7 +3,11 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/freebuff-proxy ./cmd/freebuff-proxy
+# VERSION is injected from the build host (docker-compose passes
+# `git describe --tags`); the .git dir is excluded from the build context
+# so it cannot be derived here. Matches GoReleaser's -X main.version.
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/freebuff-proxy ./cmd/freebuff-proxy
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata \
