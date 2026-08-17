@@ -3,6 +3,7 @@ package convert
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -2108,5 +2109,30 @@ func BenchmarkNormalizeToolSchema(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		budget := maxSchemaNodes
 		_ = normalizeToolSchemaCached(params, &budget)
+	}
+}
+
+// capHint guards allocation-size hints against int overflow; a negative or
+// wrapped hint panics Go's map/slice runtime (makemap/smakeslice: size out
+// of range). CodeQL: "size computation for allocation may overflow".
+func TestCapHint(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b int
+		want int
+	}{
+		{"zero", 0, 0, 0},
+		{"normal", 3, 5, 8},
+		{"slice cap", 4, 1, 5},
+		{"at max", math.MaxInt, 0, math.MaxInt},
+		{"clamped", math.MaxInt, 1, math.MaxInt},
+		{"clamped both", 1 << 20, math.MaxInt, math.MaxInt},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := capHint(tc.a, tc.b); got != tc.want {
+				t.Fatalf("capHint(%d, %d) = %d, want %d", tc.a, tc.b, got, tc.want)
+			}
+		})
 	}
 }
