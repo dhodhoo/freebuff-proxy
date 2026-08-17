@@ -151,11 +151,14 @@ func TestInvalidateRestarts(t *testing.T) {
 	if next.RunID != "run-0002" {
 		t.Fatalf("run after Invalidate = %q, want run-0002 (re-START)", next.RunID)
 	}
-	if len(mock.StartedRuns) != 2 {
-		t.Errorf("STARTs = %d, want 2", len(mock.StartedRuns))
+	if started := mock.StartedRunsSnapshot(); len(started) != 2 {
+		t.Errorf("STARTs = %d, want 2", len(started))
 	}
-	if len(mock.FinishedRuns) != 0 {
-		t.Errorf("invalidated run must not be FINISHed, got %v", mock.FinishedRuns)
+	// Issue #91: each START also creates+FINISHes a context-pruner child
+	// run asynchronously — filter those out; the parent must never be
+	// FINISHed by Invalidate.
+	if finished := nonChildFinished(mock); len(finished) != 0 {
+		t.Errorf("invalidated run must not be FINISHed, got %v", finished)
 	}
 }
 
@@ -323,14 +326,14 @@ func TestPrewarmStartsAllAgentsOnce(t *testing.T) {
 	mgr, _ := newTestManager(t, mock, time.Hour)
 
 	mgr.Prewarm(context.Background(), []string{agentA, agentB})
-	if len(mock.StartedRuns) != 2 {
-		t.Fatalf("STARTs after prewarm = %d, want 2", len(mock.StartedRuns))
+	if started := mock.StartedRunsSnapshot(); len(started) != 2 {
+		t.Fatalf("STARTs after prewarm = %d, want 2", len(started))
 	}
 
 	// A second prewarm must not restart existing runs.
 	mgr.Prewarm(context.Background(), []string{agentA, agentB})
-	if len(mock.StartedRuns) != 2 {
-		t.Errorf("STARTs after second prewarm = %d, want still 2", len(mock.StartedRuns))
+	if started := mock.StartedRunsSnapshot(); len(started) != 2 {
+		t.Errorf("STARTs after second prewarm = %d, want still 2", len(started))
 	}
 
 	run, err := mgr.Acquire(context.Background(), agentA)

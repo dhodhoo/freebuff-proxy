@@ -1215,7 +1215,9 @@ func TestIdleRotationDisabled(t *testing.T) {
 	p.LeaseRelease(lease)
 
 	p.maintainTick(context.Background())
-	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+	// Issue #91: STARTs create+FINISH context-pruner child runs async; the
+	// assertion is that no PARENT run was finished with idle rotation off.
+	if got := parentFinished(mock); len(got) != 0 {
 		t.Fatalf("finished runs = %v with idle rotation disabled, want none", got)
 	}
 }
