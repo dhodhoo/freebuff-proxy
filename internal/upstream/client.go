@@ -72,6 +72,11 @@ var (
 	// ErrCredits: 402 payment required — the account has no credits / free
 	// quota left to spend.
 	ErrCredits = errors.New("upstream payment required")
+	// ErrNoActiveSession: a token probe (GET /api/v1/freebuff/session with no
+	// instance header) found no active session upstream. The token is still
+	// valid — this is the idle state, not a rejection — so health checks
+	// surface it as "token OK (no active session)".
+	ErrNoActiveSession = errors.New("upstream has no active session")
 )
 
 // WaitingRoomError is the concrete value behind ErrWaitingRoom; callers
@@ -607,6 +612,47 @@ func (c *Client) GetSessionWithOpts(ctx context.Context, instanceID string, comp
 		req.Header.Set("x-freebuff-heartbeat", "1")
 	}
 	return c.sessionCall(req)
+}
+
+// ProbeAccount validates the token with a zero-cost GET /api/v1/freebuff/session
+// that carries NO x-freebuff-instance-id header, so unlike CreateSession it
+// claims no session slot and burns none of the daily session allowance. The
+// response carries the live per-model quota (RateLimitsByModel) plus the
+// account/session state, which callers surface for token checks and doctor
+// diagnostics.
+//
+// A probe 404 maps (via sessionCall) to Status "ended"; that — or a 200 with
+// status "ended" — means the token has no active session, returned as
+// (nil, ErrNoActiveSession). Terminal refusal statuses the upstream returns
+// as session states (403 {"status":"banned"}/{"status":"country_blocked"})
+// are converted to the same typed errors the session manager surfaces
+// (ErrBanned / ErrCountryBlocked), so probe callers can distinguish a dead
+// account from a healthy idle one. All other classifications pass through
+// unchanged: 401 → ErrAuthRejected, 429 → ErrRateLimited, transport
+// failures as-is. A 200 with any other status (active/queued/disabled/…)
+// returns the full *SessionState.
+func (c *Client) ProbeAccount(ctx context.Context) (*SessionState, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/api/v1/freebuff/session", nil)
+	if err != nil {
+		return nil, err
+	}
+	state, err := c.sessionCall(req)
+	if err != nil {
+		return nil, err
+	}
+	switch state.Status {
+	case "ended":
+		return nil, ErrNoActiveSession
+	case "banned":
+		return nil, &BanError{ResumesAt: state.ResumesAt, Body: state.Message}
+	case "country_blocked":
+		return nil, &CountryBlockedError{
+			CountryCode:        state.CountryCode,
+			CountryBlockReason: state.CountryBlockReason,
+			IpPrivacySignals:   state.IpPrivacySignals,
+		}
+	}
+	return state, nil
 }
 
 // EndSession DELETE /api/v1/freebuff/session; 404 is tolerated.

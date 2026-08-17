@@ -557,57 +557,34 @@ func TestE2EDoctorBrokenConfig(t *testing.T) {
 	}
 }
 
-// TestE2EDoctorProbeOptIn pins the -doctor token-probe opt-in: plain
-// -doctor must never touch the upstream session API (zero session creates
-// against the mock, plus the "probes skipped" warning), while
-// -doctor -probe-tokens runs one real handshake per token ("Probing N
-// token(s)" warning, >=1 session create). The mock serves plain HTTP so the
-// doctor's TLS check fails and the process exits 1 in both runs; the
-// assertions target the probe behavior, not the exit code.
-func TestE2EDoctorProbeOptIn(t *testing.T) {
-	t.Run("default skips probes", func(t *testing.T) {
-		mock := testutil.NewMock()
-		defer mock.Close()
-		dir := t.TempDir()
-		writeDotenv(t, dir, map[string]string{
-			"AUTH_TOKENS":       "cb_e2e",
-			"UPSTREAM_BASE_URL": mock.URL(),
-		})
-		bin := proxyInDir(t, dir)
-		_, stdout, stderr := runSimple(t, dir, bin, []string{"-doctor"}, e2eEnv(t, "AUTO_DISCOVER_TOKEN=false"), 60*time.Second)
-		combined := stdout + "\n" + stderr
-		if !strings.Contains(combined, "Per-token session probes skipped") {
-			t.Errorf("plain -doctor missing 'probes skipped' warning:\n%s", combined)
-		}
-		if !strings.Contains(combined, "Re-run with -probe-tokens") {
-			t.Errorf("plain -doctor skipped warning missing the -probe-tokens hint:\n%s", combined)
-		}
-		if got := mock.SessionCreatesSnapshot(); got != 0 {
-			t.Errorf("plain -doctor created %d upstream session(s), want 0", got)
-		}
+// TestE2EDoctorProbesDefault pins that -doctor probes tokens by default: a
+// plain -doctor run (no extra flags) probes every configured token with a
+// zero-cost GET /api/v1/freebuff/session probe ("Probing N token(s)"
+// warning, "validity probe succeeded" row) and never creates an upstream
+// session (SessionCreates stays 0 — the GET probe claims no session slot).
+// The mock serves plain HTTP so the doctor's TLS check fails and the
+// process exits 1; the assertions target the probe behavior, not the exit
+// code.
+func TestE2EDoctorProbesDefault(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	dir := t.TempDir()
+	writeDotenv(t, dir, map[string]string{
+		"AUTH_TOKENS":       "cb_e2e",
+		"UPSTREAM_BASE_URL": mock.URL(),
 	})
-
-	t.Run("opt-in probes tokens", func(t *testing.T) {
-		mock := testutil.NewMock()
-		defer mock.Close()
-		dir := t.TempDir()
-		writeDotenv(t, dir, map[string]string{
-			"AUTH_TOKENS":       "cb_e2e",
-			"UPSTREAM_BASE_URL": mock.URL(),
-		})
-		bin := proxyInDir(t, dir)
-		_, stdout, stderr := runSimple(t, dir, bin, []string{"-doctor", "-probe-tokens"}, e2eEnv(t, "AUTO_DISCOVER_TOKEN=false"), 60*time.Second)
-		combined := stdout + "\n" + stderr
-		if !strings.Contains(combined, "Probing 1 token") {
-			t.Errorf("-doctor -probe-tokens missing 'Probing 1 token' warning:\n%s", combined)
-		}
-		if !strings.Contains(combined, "validity probe succeeded") {
-			t.Errorf("-doctor -probe-tokens missing probe-success row:\n%s", combined)
-		}
-		if got := mock.SessionCreatesSnapshot(); got < 1 {
-			t.Errorf("-doctor -probe-tokens created %d upstream session(s), want >= 1", got)
-		}
-	})
+	bin := proxyInDir(t, dir)
+	_, stdout, stderr := runSimple(t, dir, bin, []string{"-doctor"}, e2eEnv(t, "AUTO_DISCOVER_TOKEN=false"), 60*time.Second)
+	combined := stdout + "\n" + stderr
+	if !strings.Contains(combined, "Probing 1 token") {
+		t.Errorf("plain -doctor missing 'Probing 1 token' warning:\n%s", combined)
+	}
+	if !strings.Contains(combined, "validity probe succeeded") {
+		t.Errorf("plain -doctor missing probe-success row:\n%s", combined)
+	}
+	if got := mock.SessionCreatesSnapshot(); got != 0 {
+		t.Errorf("plain -doctor created %d upstream session(s), want 0 (zero-cost probes)", got)
+	}
 }
 
 // --- 7. -test-token ---
@@ -629,8 +606,8 @@ func TestE2ETestToken(t *testing.T) {
 		if !strings.Contains(stdout, "token OK") {
 			t.Errorf("-test-token stdout missing 'token OK':\n%s", stdout)
 		}
-		if !strings.Contains(stderr, "consuming daily session allowance") {
-			t.Errorf("-test-token stderr missing the session-slot cost warning:\n%s", stderr)
+		if got := mock.SessionCreatesSnapshot(); got != 0 {
+			t.Errorf("-test-token created %d upstream session(s), want 0 (zero-cost GET probe)", got)
 		}
 	})
 

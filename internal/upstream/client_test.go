@@ -414,6 +414,140 @@ func TestSessionControlCalls(t *testing.T) {
 	}
 }
 
+// TestProbeAccount verifies the zero-cost token probe: a GET
+// /api/v1/freebuff/session with NO instance header that claims no session
+// slot, returns the live per-model quota, and classifies
+// auth/ban/region/transport failures through the standard matrix.
+func TestProbeAccount(t *testing.T) {
+	t.Run("200 with quota", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+
+		client, err := New("tok", testConfig(mock.URL(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := client.ProbeAccount(context.Background())
+		if err != nil {
+			t.Fatalf("ProbeAccount: %v", err)
+		}
+		if st.Status != "active" || st.InstanceID != "inst-abc-123" {
+			t.Fatalf("probe state = %+v", st)
+		}
+		q, ok := st.RateLimitsByModel["deepseek/deepseek-v4-flash"]
+		if !ok {
+			t.Fatalf("RateLimitsByModel missing flash quota: %+v", st.RateLimitsByModel)
+		}
+		if q.Limit != 6 || q.RecentCount != 2 {
+			t.Errorf("quota limit/recentCount = %v/%v, want 6/2", q.Limit, q.RecentCount)
+		}
+		if q.Period != "pacific_day" {
+			t.Errorf("period = %q, want pacific_day", q.Period)
+		}
+		if q.ResetAt.IsZero() {
+			t.Error("resetAt not parsed")
+		}
+		// A probe must not claim a session slot (no POST).
+		if got := mock.SessionCreatesSnapshot(); got != 0 {
+			t.Errorf("session creates = %d, want 0 (probe is zero-cost)", got)
+		}
+		if got := mock.SessionProbesSnapshot(); got != 1 {
+			t.Errorf("session probes = %d, want 1", got)
+		}
+	})
+
+	t.Run("404 maps to ErrNoActiveSession", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(404)
+			_, _ = io.WriteString(w, `{"error":"session not found"}`)
+		}
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrNoActiveSession) {
+			t.Fatalf("err = %v, want ErrNoActiveSession", err)
+		}
+	})
+
+	t.Run("200 ended maps to ErrNoActiveSession", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"status":"ended"}`)
+		}
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrNoActiveSession) {
+			t.Fatalf("err = %v, want ErrNoActiveSession", err)
+		}
+	})
+
+	t.Run("401 auth rejected", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.AuthReject = true
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrAuthRejected) {
+			t.Fatalf("err = %v, want ErrAuthRejected", err)
+		}
+	})
+
+	t.Run("403 banned", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.Ban = true
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrBanned) {
+			t.Fatalf("err = %v, want ErrBanned", err)
+		}
+	})
+
+	t.Run("403 country blocked", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(403)
+			_, _ = io.WriteString(w, `{"status":"country_blocked","countryCode":"CN","countryBlockReason":"region_restricted","ipPrivacySignals":["vpn"]}`)
+		}
+
+		client, _ := New("tok", testConfig(mock.URL(), nil))
+		_, err := client.ProbeAccount(context.Background())
+		if !errors.Is(err, ErrCountryBlocked) {
+			t.Fatalf("err = %v, want ErrCountryBlocked", err)
+		}
+		var cbe *CountryBlockedError
+		if !errors.As(err, &cbe) {
+			t.Fatalf("err = %T, want *CountryBlockedError", err)
+		}
+		if cbe.CountryCode != "CN" {
+			t.Errorf("countryCode = %q, want CN", cbe.CountryCode)
+		}
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		mock := testutil.NewMock()
+		url := mock.URL()
+		mock.Close()
+
+		client, _ := New("tok", testConfig(url, nil))
+		_, err := client.ProbeAccount(context.Background())
+		if err == nil {
+			t.Fatal("ProbeAccount returned nil error for closed server")
+		}
+	})
+}
+
 // TestSessionCallParsesRateLimitsByModel verifies the live per-model quota
 // map from an admission response is parsed into SessionState, including the
 // nested entitlement breakdown and flex-time resetAt.

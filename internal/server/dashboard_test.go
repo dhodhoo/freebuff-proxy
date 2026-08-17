@@ -313,9 +313,9 @@ func TestDashboardTokenActions(t *testing.T) {
 		t.Error("finish action did not report success")
 	}
 
-	// Test: real session handshake against the mock upstream.
+	// Test: zero-cost upstream probe against the mock (no session claim).
 	resp = doTokenAction(t, ts.URL, cookie, "/admin/tokens/0/test")
-	if !strings.Contains(bodyOf(t, resp), "session handshake succeeded") {
+	if !strings.Contains(bodyOf(t, resp), "zero-cost probe succeeded") {
 		t.Error("test action did not report success")
 	}
 }

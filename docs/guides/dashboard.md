@@ -32,8 +32,8 @@ restarting the proxy signs everyone out, which is the safe default.
   `reset`, `entitlement`) parsed from the last upstream admission, with
   **usage bars and reset countdowns** ("resets in 4h 12m", amber at ≥80%).
   Refreshes every 30s so countdowns stay honest. Per-token actions:
-  - **Test**: a real upstream session handshake (create + end) through that
-    token, surfacing validity/network errors, the same idea as 9router's
+  - **Test**: a zero-cost upstream GET probe through that token, surfacing
+    validity/network errors and live quota, the same idea as 9router's
     per-connection Test button.
   - **Unlock**: clears a cooldown / rate-limit lock / ban window (only shown
     while a lock is active; `hx-confirm` guards it. Upstream locks are
@@ -43,7 +43,7 @@ restarting the proxy signs everyone out, which is the safe default.
   The pool is **runtime-mutable**: no restart for key changes. An **Add
   token** form (`cb_...`) appends to the live pool, **Remove last token**
   drops the highest-index token, **Test all tokens** probes every pooled
-  token with its own handshake, and **Switch to bridge mode** empties the
+  token with a zero-cost GET probe, and **Switch to bridge mode** empties the
   pool. These map to `POST /admin/tokens/add`, `/admin/tokens/remove`,
   `/admin/tokens/test-all`, and `/admin/mode`. Every mutation is persisted
   to `AUTH_TOKENS` in `.env` and the config is reloaded, so changes survive
@@ -71,7 +71,7 @@ restarting the proxy signs everyone out, which is the safe default.
      bridge mode it needs a client token in the payload) plus a **Full
      diagnostics** button (`POST /admin/diag`) that renders the same checks
      as `-doctor`: config state, DNS + TCP reachability, registry count, and
-     a real session-handshake validity probe per token.
+     a zero-cost validity probe per token.
   3. **Connect your client**: copy-paste snippets generated from the
      effective config (base URL, mode, key hint, first catalog model),
      plus the full model list as chips.

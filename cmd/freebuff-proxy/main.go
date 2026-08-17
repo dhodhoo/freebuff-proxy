@@ -46,10 +46,9 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose (debug) logging")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	showDoctor := flag.Bool("doctor", false, "run environment and configuration diagnostics")
-	probeTokens := flag.Bool("probe-tokens", false, "-doctor: also run per-token session-handshake probes (each creates and ends one upstream session, consuming daily session allowance)")
 	showUpdate := flag.Bool("update", false, "check for and download the latest release update")
 	showSetup := flag.Bool("setup", false, "run interactive client configuration helper")
-	testToken := flag.Bool("test-token", false, "probe the first configured token with a real session handshake and exit 0/1")
+	testToken := flag.Bool("test-token", false, "probe the first configured token with a zero-cost GET probe (no session consumed) and exit 0/1")
 	installService := flag.Bool("install-service", false, "register the current binary as a background service and start it (Task Scheduler / systemd --user / launchd)")
 	uninstallService := flag.Bool("uninstall-service", false, "stop and unregister the background service")
 	serviceStatus := flag.Bool("service-status", false, "check whether the background service is registered and running (exit 0 registered, 1 not)")
@@ -68,7 +67,7 @@ func main() {
 		runTokenTest(*configPath)
 	}
 	if *showDoctor {
-		runDoctor(*configPath, *probeTokens)
+		runDoctor(*configPath)
 	}
 	if *showUpdate {
 		runUpdate()

@@ -800,21 +800,17 @@ func (p *Pool) FinishTokenRuns(ctx context.Context, token int) error {
 	return nil
 }
 
-// TestToken verifies token against upstream with a real session handshake
-// (dashboard test action): creates a session for model through the token's
-// client, then ends it. Returns the created instance id on success.
-func (p *Pool) TestToken(ctx context.Context, token int, model string) (string, error) {
+// ProbeToken validates token against upstream with a zero-cost GET session
+// probe (dashboard test action): no session is created or claimed. Returns
+// the live session state (including RateLimitsByModel quota) on success, or
+// ErrNoActiveSession when the token has no active session (still a valid
+// token), or the classified auth/network error otherwise.
+func (p *Pool) ProbeToken(ctx context.Context, token int) (*upstream.SessionState, error) {
 	toks := p.toks.Load()
 	if token < 0 || token >= len(*toks) {
-		return "", fmt.Errorf("pool: token %d out of range", token)
+		return nil, fmt.Errorf("pool: token %d out of range", token)
 	}
-	c := (*toks)[token].client
-	st, err := c.CreateSessionForModel(ctx, model)
-	if err != nil {
-		return "", err
-	}
-	_ = c.EndSession(ctx, st.InstanceID)
-	return st.InstanceID, nil
+	return (*toks)[token].client.ProbeAccount(ctx)
 }
 
 // CooldownToken puts token in a cooldown window of duration d (auth-reject

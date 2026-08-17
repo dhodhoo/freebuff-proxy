@@ -99,6 +99,7 @@ type MockUpstream struct {
 	RecordedChatBodies  []string
 	SessionCreates      int
 	SessionPolls        int
+	SessionProbes       int // token-level probes: GET session without x-freebuff-instance-id
 	SessionEnds         int
 	StartedRuns         []string
 	FinishedRuns        []FinishedRun
@@ -170,6 +171,16 @@ func (m *MockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 			m.mu.Unlock()
 			m.handleSession(w, r)
 		case http.MethodGet:
+			if r.Header.Get("x-freebuff-instance-id") == "" {
+				// Token-level probe: a GET with no instance header claims no
+				// session slot. Serve a zero-cost account state (status +
+				// rateLimitsByModel) instead of the session poll body.
+				m.mu.Lock()
+				m.SessionProbes++
+				m.mu.Unlock()
+				m.handleProbe(w)
+				return
+			}
 			m.mu.Lock()
 			m.SessionPolls++
 			m.mu.Unlock()
@@ -287,6 +298,41 @@ func (m *MockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, 500, map[string]any{"error": "unknown mock session mode " + mode})
 	}
+}
+
+// defaultProbeQuota is the rateLimitsByModel map served on a token-level
+// probe (GET /api/v1/freebuff/session without x-freebuff-instance-id) when
+// the test configured none. Small, realistic pacific_day quota so probe
+// flows can assert parsed quota without wiring their own map.
+var defaultProbeQuota = map[string]any{
+	"deepseek/deepseek-v4-flash": map[string]any{
+		"model":         "deepseek/deepseek-v4-flash",
+		"limit":         6,
+		"recentCount":   2,
+		"period":        "pacific_day",
+		"resetTimeZone": "America/Los_Angeles",
+		"resetAt":       "2026-08-17T07:00:00.000Z",
+	},
+}
+
+// handleProbe serves a token-level probe: 200 with an active account state,
+// an instanceId, and the configured (or default) rateLimitsByModel. The
+// probe is zero-cost — no session slot is claimed — so a valid token always
+// succeeds regardless of SessionMode; tests needing a different probe
+// response install a custom SessionHandler.
+func (m *MockUpstream) handleProbe(w http.ResponseWriter) {
+	m.mu.Lock()
+	instanceID := m.InstanceID
+	limits := m.RateLimitsByModel
+	m.mu.Unlock()
+	if len(limits) == 0 {
+		limits = defaultProbeQuota
+	}
+	writeJSON(w, 200, map[string]any{
+		"status":            "active",
+		"instanceId":        instanceID,
+		"rateLimitsByModel": limits,
+	})
 }
 
 func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
@@ -457,4 +503,12 @@ func (m *MockUpstream) SessionCreatesSnapshot() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.SessionCreates
+}
+
+// SessionProbesSnapshot returns a locked copy of the token-probe (GET
+// session without x-freebuff-instance-id) counter (see StartedRunsSnapshot).
+func (m *MockUpstream) SessionProbesSnapshot() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.SessionProbes
 }

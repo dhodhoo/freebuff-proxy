@@ -658,31 +658,33 @@ func TestEmptyPoolAcquire(t *testing.T) {
 	}
 }
 
-// TestTestToken pins the dashboard test action: TestToken runs a real
-// session handshake (create + end) against the token's upstream client and
-// returns the created instance id.
-func TestTestToken(t *testing.T) {
+// TestProbeToken pins the dashboard test action: ProbeToken runs a
+// zero-cost GET session probe (no session claimed) against the token's
+// upstream client and returns the live session state with quota.
+func TestProbeToken(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
 
-	id, err := p.TestToken(context.Background(), 0, modelA)
+	st, err := p.ProbeToken(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "inst-abc-123" {
-		t.Errorf("instance id = %q, want inst-abc-123", id)
+	if st == nil {
+		t.Fatal("ProbeToken returned nil state, want live session state")
 	}
-	if mock.SessionCreates != 1 {
-		t.Errorf("session creates = %d, want 1", mock.SessionCreates)
+	// The probe is a GET with no instance header: it claims no session slot.
+	if mock.SessionCreates != 0 {
+		t.Errorf("session creates = %d, want 0 (probe must not claim a session)", mock.SessionCreates)
 	}
-	if mock.SessionEnds != 1 {
-		t.Errorf("session ends = %d, want 1 (test session ended)", mock.SessionEnds)
+	// The probe surfaces the live quota from rateLimitsByModel.
+	if len(st.RateLimitsByModel) == 0 {
+		t.Errorf("RateLimitsByModel = %v, want quota from the probe response", st.RateLimitsByModel)
 	}
 
 	// Out-of-range tokens error without panicking.
-	if _, err := p.TestToken(context.Background(), 99, modelA); err == nil {
-		t.Error("TestToken(99) succeeded, want out-of-range error")
+	if _, err := p.ProbeToken(context.Background(), 99); err == nil {
+		t.Error("ProbeToken(99) succeeded, want out-of-range error")
 	}
 }
 

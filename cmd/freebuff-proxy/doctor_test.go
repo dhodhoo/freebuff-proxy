@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"freebuff-proxy/internal/egress"
-	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/testutil"
+	"freebuff-proxy/internal/upstream"
 )
 
 // TestDoctorEgressProbeParsesTrace guards the doctor's region probe: a
@@ -71,61 +71,6 @@ func TestEgressRegionRow(t *testing.T) {
 	}
 }
 
-// fileSourceURL builds a file:// URL for a local fixture path (no network),
-// the same pattern internal/registry tests use to drive Refresh.
-func fileSourceURL(t *testing.T, path string) string {
-	t.Helper()
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return "file:///" + filepath.ToSlash(abs)
-}
-
-// TestProbeModel pins the token-probe model selection: an empty catalog
-// yields "" (runTokenTest then exits 1), the fallback default
-// deepseek/deepseek-v4-flash wins even when it is NOT the alphabetical
-// first model (capacity-gated offer models would fail most token tests),
-// and a catalog without it falls back to the first model.
-func TestProbeModel(t *testing.T) {
-	t.Run("empty catalog", func(t *testing.T) {
-		reg := registry.New(nil, nil)
-		if got := probeModel(reg); got != "" {
-			t.Errorf("probeModel(empty) = %q, want empty", got)
-		}
-	})
-
-	t.Run("prefers deepseek-v4-flash over sorted-first", func(t *testing.T) {
-		reg := registry.New(nil, nil)
-		reg.LoadFallback()
-		models := reg.Models()
-		if len(models) == 0 {
-			t.Fatal("fallback registry has no models")
-		}
-		if models[0] == "deepseek/deepseek-v4-flash" {
-			t.Skip("fallback already sorts deepseek-v4-flash first; cannot pin the preference")
-		}
-		if got := probeModel(reg); got != "deepseek/deepseek-v4-flash" {
-			t.Errorf("probeModel = %q, want deepseek/deepseek-v4-flash", got)
-		}
-	})
-
-	t.Run("first model when deepseek absent", func(t *testing.T) {
-		reg := registry.New(nil, nil)
-		reg.SetSources([]string{fileSourceURL(t, filepath.Join("testdata", "registry-noflash.ts"))})
-		if err := reg.Refresh(context.Background()); err != nil {
-			t.Fatalf("Refresh: %v", err)
-		}
-		models := reg.Models()
-		if len(models) == 0 {
-			t.Fatal("fixture refresh produced no models")
-		}
-		if got := probeModel(reg); got != models[0] {
-			t.Errorf("probeModel = %q, want first model %q", got, models[0])
-		}
-	})
-}
-
 // TestTokenFormatWarn pins the doctor's per-token format checks: a "Bearer "
 // prefix (the token value must be bare in .env) and the cb_xxx/cb_yyy
 // placeholders are flagged with the 1-based token number; valid tokens warn
@@ -170,6 +115,47 @@ func TestDoctorSummary(t *testing.T) {
 	}
 	if got := doctorSummary(0, 0, 0); got != "\nSummary: 0 passed, 0 warnings, 0 failed" {
 		t.Errorf("doctorSummary = %q", got)
+	}
+}
+
+// TestQuotaSuffix pins the -test-token quota readout: a probe response
+// carrying rateLimitsByModel renders " — quota: <recent>/<limit> <period>,
+// resets <resetAt>" (the account's own model wins; the first entry by
+// sorted model id otherwise), and an absent quota map renders "" so the
+// line degrades to a plain "token OK".
+func TestQuotaSuffix(t *testing.T) {
+	if got := quotaSuffix(nil); got != "" {
+		t.Errorf("quotaSuffix(nil) = %q, want empty", got)
+	}
+	if got := quotaSuffix(&upstream.SessionState{}); got != "" {
+		t.Errorf("quotaSuffix(no quota) = %q, want empty", got)
+	}
+
+	now := time.Date(2026, 8, 16, 7, 0, 0, 0, time.UTC)
+	ownModel := "deepseek/deepseek-v4-flash"
+	otherModel := "z-ai/glm-5.2"
+	st := &upstream.SessionState{
+		Model: ownModel,
+		RateLimitsByModel: map[string]upstream.ModelQuota{
+			ownModel:   {Model: ownModel, RecentCount: 2, Limit: 5, Period: "pacific_day", ResetAt: now},
+			otherModel: {Model: otherModel, RecentCount: 4, Limit: 5, Period: "pacific_day", ResetAt: now},
+		},
+	}
+	if got, want := quotaSuffix(st), " — quota: 2/5 pacific_day, resets 2026-08-16T07:00:00Z"; got != want {
+		t.Errorf("quotaSuffix(own model) = %q, want %q", got, want)
+	}
+
+	// Account model absent from the map → deterministic sorted-first pick;
+	// an absent period and resetAt drop those clauses.
+	st2 := &upstream.SessionState{
+		Model: ownModel,
+		RateLimitsByModel: map[string]upstream.ModelQuota{
+			otherModel: {Model: otherModel, RecentCount: 4, Limit: 5, Period: "pacific_week"},
+			"a-model":  {Model: "a-model", RecentCount: 1, Limit: 3},
+		},
+	}
+	if got, want := quotaSuffix(st2), " — quota: 1/3"; got != want {
+		t.Errorf("quotaSuffix(sorted pick) = %q, want %q", got, want)
 	}
 }
 
@@ -230,7 +216,7 @@ func TestDoctorTargetPort(t *testing.T) {
 func TestRunDoctorBrokenConfigExits1(t *testing.T) {
 	if os.Getenv("GO_WANT_DOCTOR_HELPER") == "1" {
 		testutil.UnsetConfigEnv(t)
-		runDoctor(filepath.Join(t.TempDir(), "missing-config.json"), false)
+		runDoctor(filepath.Join(t.TempDir(), "missing-config.json"))
 		return // unreachable: runDoctor os.Exit(1)s
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestRunDoctorBrokenConfigExits1$")

@@ -86,14 +86,12 @@ docker compose up -d --build
 Run the diagnostic tool or curl:
 
 ```bash
-# Diagnostic doctor check: config, port, DNS/TLS, registry. Per-token
-# session probes are opt-in (-probe-tokens) because each creates and ends
-# one upstream session, consuming daily session allowance:
+# Diagnostic doctor check: config, port, DNS/TLS, registry, plus a
+# zero-cost validity probe per token (no upstream session is claimed):
 ./freebuff-proxy -doctor
-./freebuff-proxy -doctor -probe-tokens
 
-# Standalone token probe: real upstream session handshake (consumes one
-# session slot), exit 0/1 (handy for installers and scripts):
+# Standalone token probe: zero-cost GET probe on the first token (no
+# session claimed), prints live quota, exit 0/1 (handy for installers):
 ./freebuff-proxy -test-token
 
 # Quick health check (JSON: status, uptime, model count, per-token snapshot):
@@ -106,7 +104,7 @@ curl http://localhost:3457/metrics
 curl http://localhost:3457/v1/models
 ```
 
-`/healthz` returning status `200` means the proxy is running and reachable. It does **not** validate your token. Use `./freebuff-proxy -test-token` (or the dashboard smoke test on the Overview page) to prove a token is valid before your first chat; `-doctor` runs the same per-token session probe only when invoked with `-probe-tokens` (each probe consumes a daily session slot).
+`/healthz` returning status `200` means the proxy is running and reachable. It does **not** validate your token. Use `./freebuff-proxy -test-token` (or the dashboard smoke test on the Overview page) to prove a token is valid before your first chat; `-doctor` runs the same zero-cost per-token validity probe by default.
 
 `/healthz` also reports each token's live per-model quota (`quota` map) when the last session admission carried it.
 
@@ -130,7 +128,7 @@ Run `./freebuff-proxy -doctor` to diagnose problems automatically.
 | Error / Symptom | Cause & Fix |
 |---|---|
 | `502` + `403 free_mode_cli_required` | The request was missing the CLI system prompt marker or envelope. The proxy injects this automatically. Update to the latest version. |
-| `502` + `401 Invalid API key` | Token in `.env` is expired or invalid. Catch it before the first chat: `./freebuff-proxy -test-token` (or `-doctor -probe-tokens`) probes with a real session handshake and fails with a clear message. Then re-run `freebuff` to log in and update `AUTH_TOKENS`, or swap the token live on the dashboard Tokens page (no restart). |
+| `502` + `401 Invalid API key` | Token in `.env` is expired or invalid. Catch it before the first chat: `./freebuff-proxy -test-token` (or `-doctor`) probes the token with a zero-cost GET request and fails with a clear message. Then re-run `freebuff` to log in and update `AUTH_TOKENS`, or swap the token live on the dashboard Tokens page (no restart). |
 | Connection refused | Proxy is not running, or in Docker without `LISTEN_ADDR=:3457`. |
 | `403 account_banned` | Account suspended upstream. Token is dead; use a new established account. |
 

@@ -34,6 +34,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -611,11 +612,11 @@ func (s *Server) handleTokenFinish(w http.ResponseWriter, r *http.Request) {
 	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" runs finished.")
 }
 
-// probeModel returns the safest model to probe a token with: the fallback
-// default (deepseek-v4-flash — the model every account gets, incl. limited
-// tier) when it is in the catalog, else the first catalog model. Alphabetical
-// models[0] would otherwise pick anthropic/claude-fable-5, a capacity-gated
-// offer model that makes token tests/smoke fail on most accounts.
+// probeModel returns the safest model to default a smoke test to: the
+// fallback default (deepseek-v4-flash — the model every account gets, incl.
+// limited tier) when it is in the catalog, else the first catalog model.
+// Alphabetical models[0] would otherwise pick anthropic/claude-fable-5, a
+// capacity-gated offer model that makes smoke tests fail on most accounts.
 func probeModel(reg *registry.Registry) string {
 	models := reg.Models()
 	if len(models) == 0 {
@@ -629,52 +630,88 @@ func probeModel(reg *registry.Registry) string {
 	return models[0]
 }
 
-// handleTokenTest probes a token with a real upstream session handshake
-// (create + end) against the fallback model.
-func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
-	id, err := tokenActionID(r)
-	var model string
-	if err == nil {
-		model = probeModel(s.reg)
-		if model == "" {
-			err = errors.New("registry has no models to probe")
+// quotaSummary renders the live per-model session quota from a probe's
+// RateLimitsByModel map (models sorted for determinism), or "" when the
+// upstream response carried no quota data (compact responses omit it).
+func quotaSummary(st *upstream.SessionState) string {
+	if st == nil || len(st.RateLimitsByModel) == 0 {
+		return ""
+	}
+	models := make([]string, 0, len(st.RateLimitsByModel))
+	for id := range st.RateLimitsByModel {
+		models = append(models, id)
+	}
+	sort.Strings(models)
+	var sb strings.Builder
+	for _, id := range models {
+		q := st.RateLimitsByModel[id]
+		if sb.Len() > 0 {
+			sb.WriteString("; ")
+		}
+		fmt.Fprintf(&sb, "%s %s/%s", id, strconv.FormatFloat(q.Limit, 'f', -1, 64), strconv.FormatFloat(q.RecentCount, 'f', -1, 64))
+		if q.Period != "" {
+			sb.WriteString(" " + q.Period)
+		}
+		if !q.ResetAt.IsZero() {
+			fmt.Fprintf(&sb, ", resets %s", q.ResetAt.Format(time.RFC3339))
 		}
 	}
-	var instanceID string
+	return "quota: " + sb.String()
+}
+
+// handleTokenTest probes a token with a zero-cost upstream GET probe (no
+// session claim, no model needed) and renders the result plus the live
+// per-model quota when the upstream response carries it.
+func (s *Server) handleTokenTest(w http.ResponseWriter, r *http.Request) {
+	id, err := tokenActionID(r)
+	var state *upstream.SessionState
 	if err == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-		instanceID, err = s.pool.TestToken(ctx, id, model)
+		state, err = s.pool.ProbeToken(ctx, id)
 	}
 	if err != nil {
-		s.logger.Warn("dashboard token test failed", "token", id, "err", err)
+		if errors.Is(err, upstream.ErrNoActiveSession) {
+			s.logger.Info("dashboard token probe ok (no active session)", "token", id)
+			s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" OK — zero-cost probe succeeded (no active session).")
+			return
+		}
+		s.logger.Warn("dashboard token probe failed", "token", id, "err", err)
 		s.dash.RenderConfigResult(w, r, false, "Token "+strconv.Itoa(id)+" test failed: "+err.Error())
 		return
 	}
-	s.logger.Info("dashboard token test ok", "token", id, "model", model, "instance", instanceID)
-	s.dash.RenderConfigResult(w, r, true, "Token "+strconv.Itoa(id)+" OK — session handshake succeeded ("+model+").")
+	msg := "Token " + strconv.Itoa(id) + " OK — zero-cost probe succeeded"
+	if q := quotaSummary(state); q != "" {
+		msg += " (" + q + ")"
+	}
+	msg += "."
+	s.logger.Info("dashboard token probe ok", "token", id)
+	s.dash.RenderConfigResult(w, r, true, msg)
 }
 
 // handleTokenTestAll probes every pooled token (dashboard "Test all"). Each
-// token gets a real session handshake with its own timeout; per-token results
-// are rendered as a fragment.
+// probe is a zero-cost upstream GET (no session claim, no model needed);
+// per-token results are rendered as a fragment.
 func (s *Server) handleTokenTestAll(w http.ResponseWriter, r *http.Request) {
-	probeModel := probeModel(s.reg)
 	count := 0
 	for _, snap := range s.pool.PoolSnapshot().Tokens {
 		i := snap.Token
-		if probeModel == "" {
-			break
-		}
 		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		instanceID, err := s.pool.TestToken(ctx, i, probeModel)
+		state, err := s.pool.ProbeToken(ctx, i)
 		cancel()
-		ok := err == nil
+		ok := err == nil || errors.Is(err, upstream.ErrNoActiveSession)
 		msg := "ok"
-		if !ok {
+		switch {
+		case errors.Is(err, upstream.ErrNoActiveSession):
+			msg = "ok (no active session)"
+		case err != nil:
 			msg = err.Error()
+		default:
+			if q := quotaSummary(state); q != "" {
+				msg = "ok (" + q + ")"
+			}
 		}
-		s.dash.RenderTestResult(w, r, i, ok, msg, instanceID)
+		s.dash.RenderTestResult(w, r, i, ok, msg, "")
 		count++
 	}
 	if count == 0 {
@@ -1147,10 +1184,9 @@ func dialTarget(host string) string {
 
 // handleDiag runs the dashboard diagnostics: config state, upstream
 // reachability (DNS + TLS), registry health, and per-token validity probes —
-// the same checks -doctor performs, rendered as a fragment. The per-token
-// probes each consume a daily session slot, so they only run when the
-// request opts in with probe_tokens=true; otherwise a skipped warning is
-// rendered.
+// the same checks -doctor performs, rendered as a fragment. The probes are
+// zero-cost upstream GETs (no session claim, no model needed), so they always
+// run for pooled and hybrid modes.
 func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 	checks := []dashboard.DiagCheck{}
 
@@ -1195,32 +1231,26 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 	checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Model registry: %d models", s.reg.ModelCount())})
 
 	// Per-token validity probes (pooled and hybrid-with-tokens modes). Each
-	// probe creates and ends an upstream session, consuming daily session
-	// allowance (restricted cohorts get ~1 session/day), so they are opt-in:
-	// only a probe_tokens=true request runs them (the setup wizard's "Probe
-	// tokens" checkbox). Plain diag requests skip the probes with a warning.
-	probeOptIn := r.FormValue("probe_tokens") == "true" || r.URL.Query().Get("probe_tokens") == "true"
+	// probe is a zero-cost upstream GET /api/v1/freebuff/session (no session
+	// claim, no model needed), so they always run; a token with no active
+	// session still counts as valid.
 	if !cfg.BridgeMode() {
-		if !probeOptIn {
-			if len(s.pool.PoolSnapshot().Tokens) > 0 {
-				checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Per-token validity probes skipped (each consumes a daily session slot). Tick 'Probe tokens' to run them."})
-			}
-		} else {
-			probe := probeModel(s.reg)
-			if probe == "" {
-				checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Cannot probe tokens: registry has no models"})
-			} else {
-				for _, snap := range s.pool.PoolSnapshot().Tokens {
-					idx := snap.Token
-					probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
-					_, err := s.pool.TestToken(probeCtx, idx, probe)
-					probeCancel()
-					if err != nil {
-						checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
-					} else {
-						checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Token #%d validity probe succeeded", idx+1)})
-					}
+		for _, snap := range s.pool.PoolSnapshot().Tokens {
+			idx := snap.Token
+			probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
+			state, err := s.pool.ProbeToken(probeCtx, idx)
+			probeCancel()
+			switch {
+			case errors.Is(err, upstream.ErrNoActiveSession):
+				checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Token #%d validity probe succeeded (no active session)", idx+1)})
+			case err != nil:
+				checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
+			default:
+				msg := fmt.Sprintf("Token #%d validity probe succeeded", idx+1)
+				if q := quotaSummary(state); q != "" {
+					msg += " (" + q + ")"
 				}
+				checks = append(checks, dashboard.DiagCheck{OK: true, Message: msg})
 			}
 		}
 	} else {

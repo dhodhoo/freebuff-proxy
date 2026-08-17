@@ -66,8 +66,8 @@ func TestDashboardTokenTestAllBridgeNoTokens(t *testing.T) {
 	}
 }
 
-// TestDashboardTokenTestAllTwoTokens: every pooled token gets a real session
-// handshake and one appended result fragment.
+// TestDashboardTokenTestAllTwoTokens: every pooled token gets a zero-cost
+// validity probe and one appended result fragment.
 func TestDashboardTokenTestAllTwoTokens(t *testing.T) {
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
@@ -86,9 +86,9 @@ func TestDashboardTokenTestAllTwoTokens(t *testing.T) {
 	}
 }
 
-// TestDashboardTokenTestAllEmptyRegistry: with no registry models there is
-// nothing to probe with — the loop breaks and reports no tokens (the
-// registry-empty branch of handleTokenTestAll).
+// TestDashboardTokenTestAllEmptyRegistry: the zero-cost probe needs no
+// registry models (the upstream GET carries no model), so test-all succeeds
+// even with an empty catalog — the old registry-dependent guard is gone.
 func TestDashboardTokenTestAllEmptyRegistry(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -119,8 +119,8 @@ func TestDashboardTokenTestAllEmptyRegistry(t *testing.T) {
 	cookie := authedCookie(t, ts)
 
 	resp := doTokenAction(t, ts.URL, cookie, "/admin/tokens/test-all")
-	if body := bodyOf(t, resp); !strings.Contains(body, "No tokens to test") {
-		t.Errorf("empty-registry test-all response = %q, want no-tokens message", body)
+	if body := bodyOf(t, resp); !strings.Contains(body, "Token 0: ok") {
+		t.Errorf("empty-registry test-all response = %q, want probe success row", body)
 	}
 }
 
@@ -650,9 +650,8 @@ func TestDashboardSmokeEmptyRegistry(t *testing.T) {
 
 // --- diag ---
 
-// TestDashboardDiagBridgeMode: in bridge mode diag skips the per-token
-// probes and reports the no-pooled-tokens warning — even when the request
-// opts in with probe_tokens=true (there is nothing pooled to probe).
+// TestDashboardDiagBridgeMode: in bridge mode diag has no pooled tokens to
+// probe — it reports the no-pooled-tokens warning instead of running probes.
 func TestDashboardDiagBridgeMode(t *testing.T) {
 	ts := bridgeDashboardServer(t, "secret")
 	cookie := authedCookie(t, ts)
@@ -664,20 +663,14 @@ func TestDashboardDiagBridgeMode(t *testing.T) {
 	if !strings.Contains(body, "Configuration: bridge mode") {
 		t.Errorf("bridge diag missing mode line: %s", body)
 	}
-
-	resp = postForm(t, ts.URL, cookie, "/admin/diag", url.Values{"probe_tokens": {"true"}})
-	body = bodyOf(t, resp)
-	if !strings.Contains(body, "No pooled tokens to probe") {
-		t.Errorf("bridge diag with opt-in response = %q, want no-pooled-tokens warning", body)
-	}
 	if strings.Contains(body, "validity probe") {
-		t.Errorf("bridge diag with opt-in must not run probes:\n%s", body)
+		t.Errorf("bridge diag must not run probes:\n%s", body)
 	}
 }
 
-// TestDashboardDiagTokenProbeFailure: with the probe_tokens opt-in, an
-// auth-rejecting token produces a failed validity-probe row in the diag
-// fragment.
+// TestDashboardDiagTokenProbeFailure: an auth-rejecting token produces a
+// failed validity-probe row in the diag fragment (probes run unconditionally;
+// the old probe_tokens opt-in is gone).
 func TestDashboardDiagTokenProbeFailure(t *testing.T) {
 	bad := testutil.NewMock()
 	defer bad.Close()
@@ -685,19 +678,19 @@ func TestDashboardDiagTokenProbeFailure(t *testing.T) {
 	ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.AdminToken = "secret" }, bad)
 	cookie := authedCookie(t, ts)
 
-	resp := postForm(t, ts.URL, cookie, "/admin/diag", url.Values{"probe_tokens": {"true"}})
+	resp := postJSON(t, ts.URL, cookie, "/admin/diag", "{}")
 	body := bodyOf(t, resp)
 	if !strings.Contains(body, "Token #1 validity probe failed") {
 		t.Errorf("diag response = %q, want probe-failure row", body)
 	}
 }
 
-// TestDashboardDiagProbeOptIn pins the per-token probe opt-in: a diag
-// request without probe_tokens skips the probes (warning row, zero upstream
-// session creates), while probe_tokens=true runs them (success rows, at
-// least one session create against the mock).
-func TestDashboardDiagProbeOptIn(t *testing.T) {
-	t.Run("skipped without opt-in", func(t *testing.T) {
+// TestDashboardDiagProbesRunUnconditionally: per-token validity probes are
+// zero-cost upstream GETs (no session claim), so plain diag runs them by
+// default and the stale probe_tokens opt-in param is ignored. Success is
+// asserted without any upstream session create.
+func TestDashboardDiagProbesRunUnconditionally(t *testing.T) {
+	t.Run("runs by default", func(t *testing.T) {
 		mock := testutil.NewMock()
 		defer mock.Close()
 		ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.AdminToken = "secret" }, mock)
@@ -705,50 +698,35 @@ func TestDashboardDiagProbeOptIn(t *testing.T) {
 
 		resp := postJSON(t, ts.URL, cookie, "/admin/diag", "{}")
 		body := bodyOf(t, resp)
-		if !strings.Contains(body, "Per-token validity probes skipped") {
-			t.Errorf("diag without opt-in missing 'probes skipped' warning:\n%s", body)
+		if !strings.Contains(body, "Token #1 validity probe succeeded") {
+			t.Errorf("diag missing probe-success row:\n%s", body)
 		}
-		if !strings.Contains(body, "Tick ") || !strings.Contains(body, "to run them") {
-			t.Errorf("diag skipped warning missing the opt-in hint:\n%s", body)
+		if strings.Contains(body, "probes skipped") {
+			t.Errorf("diag still reports probes skipped:\n%s", body)
 		}
 		if got := mock.SessionCreatesSnapshot(); got != 0 {
-			t.Errorf("diag without opt-in created %d upstream session(s), want 0", got)
+			t.Errorf("diag created %d upstream session(s), want 0 (zero-cost probe)", got)
 		}
 	})
 
-	t.Run("runs with opt-in", func(t *testing.T) {
+	t.Run("probe_tokens param ignored", func(t *testing.T) {
 		mock := testutil.NewMock()
 		defer mock.Close()
 		ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.AdminToken = "secret" }, mock)
 		cookie := authedCookie(t, ts)
 
+		// The stale probe_tokens=true opt-in must not change behavior: probes
+		// run unconditionally either way.
 		resp := postForm(t, ts.URL, cookie, "/admin/diag", url.Values{"probe_tokens": {"true"}})
 		body := bodyOf(t, resp)
 		if !strings.Contains(body, "Token #1 validity probe succeeded") {
-			t.Errorf("diag with opt-in missing probe-success row:\n%s", body)
+			t.Errorf("diag with probe_tokens=true missing probe-success row:\n%s", body)
 		}
 		if strings.Contains(body, "probes skipped") {
-			t.Errorf("diag with opt-in still reports probes skipped:\n%s", body)
+			t.Errorf("diag with probe_tokens=true still reports probes skipped:\n%s", body)
 		}
-		if got := mock.SessionCreatesSnapshot(); got < 1 {
-			t.Errorf("diag with opt-in created %d upstream session(s), want >= 1", got)
-		}
-	})
-
-	t.Run("query param opt-in", func(t *testing.T) {
-		mock := testutil.NewMock()
-		defer mock.Close()
-		ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.AdminToken = "secret" }, mock)
-		cookie := authedCookie(t, ts)
-
-		// JSON body + probe_tokens=true in the query string must also opt in.
-		resp := postJSON(t, ts.URL, cookie, "/admin/diag?probe_tokens=true", "{}")
-		body := bodyOf(t, resp)
-		if !strings.Contains(body, "Token #1 validity probe succeeded") {
-			t.Errorf("diag with query opt-in missing probe-success row:\n%s", body)
-		}
-		if got := mock.SessionCreatesSnapshot(); got < 1 {
-			t.Errorf("diag with query opt-in created %d upstream session(s), want >= 1", got)
+		if got := mock.SessionCreatesSnapshot(); got != 0 {
+			t.Errorf("diag created %d upstream session(s), want 0 (zero-cost probe)", got)
 		}
 	})
 }
