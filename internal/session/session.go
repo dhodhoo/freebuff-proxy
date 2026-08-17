@@ -186,6 +186,12 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 				err := m.refreshErr
 				m.mu.Unlock()
 				if err != nil {
+					if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() == nil {
+						// Leader goroutine was canceled or timed out, but this waiter's
+						// context is still active. Loop back to become a candidate leader
+						// and refresh rather than propagating the aborted leader's error.
+						continue
+					}
 					m.mu.Lock()
 					s = m.state
 					m.mu.Unlock()
@@ -398,6 +404,9 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 			}
 			m.commit(nil)
 			m.mu.Unlock()
+			if oldInstance == "" && st.InstanceID != "" {
+				oldInstance = st.InstanceID
+			}
 			_ = m.client.EndSession(ctx, oldInstance)
 			slog.Debug("session released on model lock, retrying", "current", st.CurrentModel, "target", targetModel)
 		case "model_unavailable":

@@ -1074,3 +1074,129 @@ func TestHeartbeatStatusErrors(t *testing.T) {
 		}
 	})
 }
+
+func TestLeaderCancellationDecoupling(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	leaderBlockCh := make(chan struct{})
+	leaderStartedCh := make(chan struct{})
+	var createCount atomic.Int32
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			count := createCount.Add(1)
+			if count == 1 {
+				close(leaderStartedCh)
+				<-leaderBlockCh
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"status":"active","instanceId":"leader-inst","model":"model/A"}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"waiter-inst","model":"model/A"}`)
+			return
+		}
+	}
+
+	mgr := newTestManager(t, mock)
+
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := mgr.EnsureSessionForModel(leaderCtx, "model/A")
+		leaderDone <- err
+	}()
+
+	// Wait until leader starts refresh
+	<-leaderStartedCh
+
+	// Waiter starts with active context
+	waiterDone := make(chan struct {
+		inst string
+		err  error
+	}, 1)
+	go func() {
+		inst, err := mgr.EnsureSessionForModel(context.Background(), "model/A")
+		waiterDone <- struct {
+			inst string
+			err  error
+		}{inst, err}
+	}()
+
+	// Give waiter time to park on leader's refreshCh
+	time.Sleep(50 * time.Millisecond)
+
+	// Cancel leader context and unblock mock handler
+	leaderCancel()
+	close(leaderBlockCh)
+
+	leaderErr := <-leaderDone
+	if !errors.Is(leaderErr, context.Canceled) {
+		t.Fatalf("leader err = %v, want context.Canceled", leaderErr)
+	}
+
+	// Waiter should recover, become candidate leader, and succeed
+	select {
+	case res := <-waiterDone:
+		if res.err != nil {
+			t.Fatalf("waiter err = %v, want nil", res.err)
+		}
+		if res.inst != "waiter-inst" {
+			t.Errorf("waiter inst = %q, want waiter-inst", res.inst)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for waiter to complete")
+	}
+}
+
+func TestModelLockedFallbackInstance(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	var deleteInstanceIDs []string
+	var mu sync.Mutex
+	var callCount atomic.Int32
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			count := callCount.Add(1)
+			if count == 1 {
+				// Return model_locked with instanceId
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"status":"model_locked","currentModel":"model/old","instanceId":"locked-inst-123"}`)
+				return
+			}
+			// Second call succeeds
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"active","instanceId":"active-inst-456","model":"model/new"}`)
+		case http.MethodDelete:
+			mu.Lock()
+			deleteInstanceIDs = append(deleteInstanceIDs, r.Header.Get("x-freebuff-instance-id"))
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"status":"ended"}`)
+		}
+	}
+
+	mgr := newTestManager(t, mock)
+
+	// Initial ensure with model/new when mgr has no cached state
+	instance, err := mgr.EnsureSessionForModel(context.Background(), "model/new")
+	if err != nil {
+		t.Fatalf("EnsureSessionForModel failed: %v", err)
+	}
+	if instance != "active-inst-456" {
+		t.Errorf("instance = %q, want active-inst-456", instance)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deleteInstanceIDs) != 1 {
+		t.Fatalf("EndSession calls = %d, want 1", len(deleteInstanceIDs))
+	}
+	if deleteInstanceIDs[0] != "locked-inst-123" {
+		t.Errorf("EndSession instanceID = %q, want locked-inst-123", deleteInstanceIDs[0])
+	}
+}
