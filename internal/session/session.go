@@ -86,6 +86,13 @@ type cachedState struct {
 	accessTier         string
 	countryCode        string
 	countryBlockReason string
+	// ipPrivacySignals / activeUsersForIP / limit are surfaced for the
+	// passive ban-risk view (#64): the upstream's own egress classification
+	// and the ip_capped admission pressure. Kept out of the persisted store
+	// (ephemeral diagnostics; zero after a restart until the next refresh).
+	ipPrivacySignals []string
+	activeUsersForIP int
+	limit            float64
 	// quotaByModel is the live per-model session quota from the last
 	// admission/poll that carried rateLimitsByModel (key = model id);
 	// nil until such a response is seen.
@@ -273,7 +280,7 @@ func statusError(status string, st *upstream.SessionState) error {
 			CountryBlockReason: st.CountryBlockReason,
 			IpPrivacySignals:   st.IpPrivacySignals,
 		}
-	case "rate_limited", "ip_capped", "spend_limited":
+	case "rate_limited", "spend_limited":
 		retryAfter := time.Duration(st.RetryAfterMs) * time.Millisecond
 		if retryAfter <= 0 {
 			retryAfter = time.Minute
@@ -285,6 +292,21 @@ func statusError(status string, st *upstream.SessionState) error {
 			Limit:       st.Limit,
 			RecentCount: st.RecentCount,
 			Body:        st.Message,
+		}
+	case "ip_capped":
+		// Distinct error: ip_capped is admission-only (too many distinct
+		// users on the egress IP) and NOT tied to a quota reset, so the
+		// cooldown is bounded to retryAfterMs only — never the
+		// Pacific-midnight lock (reference/freebuff freebuff-session.ts).
+		retryAfter := time.Duration(st.RetryAfterMs) * time.Millisecond
+		if retryAfter <= 0 {
+			retryAfter = time.Minute
+		}
+		return &upstream.IpCappedError{
+			ActiveUsersForIP: st.ActiveUsersForIP,
+			Limit:            st.Limit,
+			RetryAfter:       retryAfter,
+			Body:             st.Message,
 		}
 	}
 	return nil
@@ -346,6 +368,9 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 				accessTier:         st.AccessTier,
 				countryCode:        st.CountryCode,
 				countryBlockReason: st.CountryBlockReason,
+				activeUsersForIP:   st.ActiveUsersForIP,
+				ipPrivacySignals:   st.IpPrivacySignals,
+				limit:              st.Limit,
 				quotaByModel:       st.RateLimitsByModel,
 			})
 			m.mu.Unlock()
@@ -436,7 +461,15 @@ type SessionSnapshot struct {
 	CountryCode        string
 	TierCountry        string
 	CountryBlockReason string
-	ExpiresAt          time.Time
+	// ActiveUsersForIP is the last known distinct-user count on the token's
+	// egress IP (upstream activeUsersForIp); 0 when absent.
+	ActiveUsersForIP int
+	// IPPrivacySignals is the upstream's own egress-IP classification
+	// (e.g. vpn/proxy/tor/hosting); Limit is the ip_capped ceiling. Both
+	// feed the passive ban-risk view (#64); empty/0 when absent.
+	IPPrivacySignals []string
+	Limit            float64
+	ExpiresAt        time.Time
 	// GracePeriodEndsAt is when the 30-minute drain window after ExpiresAt
 	// closes (previously computed but never surfaced).
 	GracePeriodEndsAt time.Time
@@ -488,6 +521,9 @@ func (m *Manager) Snapshot() SessionSnapshot {
 		CountryCode:        m.state.countryCode,
 		TierCountry:        m.state.countryCode,
 		CountryBlockReason: m.state.countryBlockReason,
+		ActiveUsersForIP:   m.state.activeUsersForIP,
+		IPPrivacySignals:   m.state.ipPrivacySignals,
+		Limit:              m.state.limit,
 		ExpiresAt:          m.state.expiresAt,
 		GracePeriodEndsAt:  m.state.gracePeriodEndsAt,
 		QuotaByModel:       quota,

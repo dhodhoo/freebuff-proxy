@@ -118,6 +118,10 @@ type TokenSnapshot struct {
 	TierAccess         string
 	CountryCode        string
 	CountryBlockReason string
+	// SessionActiveUsersForIP is the last known distinct-user count on the
+	// token's egress IP (upstream activeUsersForIp); zero when the session
+	// response did not carry it.
+	SessionActiveUsersForIP int
 	// QuotaByModel is the live per-model session quota from the last
 	// admission (key = model id); empty until the session reports it.
 	// Entitlement is a top-level per-token view (empty: the upstream wire
@@ -412,6 +416,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	var errs []string
 	var waiting []*session.WaitingRoomError
 	var rateLimited []*upstream.RateLimitError
+	var ipCapped []*upstream.IpCappedError
 	var banned []*upstream.BanError
 	var countryBlocked []*upstream.CountryBlockedError
 	var dailyLimited []*upstream.RateLimitError
@@ -442,6 +447,9 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			if rle := tok.runs.RateLimitError(); rle != nil {
 				rateLimited = append(rateLimited, rle)
 			}
+			if ice := tok.runs.IpCappedError(); ice != nil {
+				ipCapped = append(ipCapped, ice)
+			}
 			continue
 		}
 
@@ -469,6 +477,10 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			if rle := asRateLimit(err); rle != nil {
 				tok.runs.CooldownRateLimit(rle)
 				rateLimited = append(rateLimited, rle)
+			}
+			if ice := asIpCapped(err); ice != nil {
+				tok.runs.CooldownIpCapped(ice)
+				ipCapped = append(ipCapped, ice)
 			}
 			if be := asBan(err); be != nil {
 				tok.runs.CooldownBan(be)
@@ -502,6 +514,10 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 				tok.runs.CooldownRateLimit(rle)
 				rateLimited = append(rateLimited, rle)
 			}
+			if ice := asIpCapped(err); ice != nil {
+				tok.runs.CooldownIpCapped(ice)
+				ipCapped = append(ipCapped, ice)
+			}
 			if be := asBan(err); be != nil {
 				tok.runs.CooldownBan(be)
 				banned = append(banned, be)
@@ -528,10 +544,11 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 
 	// Failover precedence (PRD §6 error matrix): when buckets are mixed the
 	// highest-precedence non-empty bucket wins — ban > country-blocked >
-	// rate-limit > waiting-room > daily cap. Each bucket contributes its
-	// best error (first ban, longest rate window, lowest queue position,
-	// earliest daily reset). Only when every bucket is empty — all tokens
-	// failed with errors outside the matrix — is the generic error surfaced.
+	// rate-limit > ip-capped > waiting-room > daily cap. Each bucket
+	// contributes its best error (first ban, longest rate window, first
+	// ip_capped, lowest queue position, earliest daily reset). Only when
+	// every bucket is empty — all tokens failed with errors outside the
+	// matrix — is the generic error surfaced.
 	if len(banned) > 0 {
 		return nil, banned[0]
 	}
@@ -540,6 +557,9 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	}
 	if len(rateLimited) > 0 {
 		return nil, bestRateLimit(rateLimited)
+	}
+	if len(ipCapped) > 0 {
+		return nil, ipCapped[0]
 	}
 	if len(waiting) > 0 {
 		wr := bestWaitingRoom(waiting)
@@ -670,6 +690,9 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		if rle := entry.runs.RateLimitError(); rle != nil {
 			return nil, rle
 		}
+		if ice := entry.runs.IpCappedError(); ice != nil {
+			return nil, ice
+		}
 		return nil, fmt.Errorf("bridge: token cooling down until %s", until.Format(time.RFC3339))
 	}
 
@@ -688,6 +711,9 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		if rle := asRateLimit(err); rle != nil {
 			entry.runs.CooldownRateLimit(rle)
 		}
+		if ice := asIpCapped(err); ice != nil {
+			entry.runs.CooldownIpCapped(ice)
+		}
 		if be := asBan(err); be != nil {
 			entry.runs.CooldownBan(be)
 		}
@@ -704,6 +730,9 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		}
 		if rle := asRateLimit(err); rle != nil {
 			entry.runs.CooldownRateLimit(rle)
+		}
+		if ice := asIpCapped(err); ice != nil {
+			entry.runs.CooldownIpCapped(ice)
 		}
 		if be := asBan(err); be != nil {
 			entry.runs.CooldownBan(be)
@@ -834,6 +863,17 @@ func (p *Pool) CooldownTokenRateLimit(token int, rle *upstream.RateLimitError) {
 	(*toks)[token].runs.CooldownRateLimit(rle)
 }
 
+// CooldownTokenIpCapped applies an ip_capped cooldown to token, bounded to
+// the error's RetryAfter ONLY (no Pacific-midnight fallback — ip_capped is
+// admission-only, not a quota reset). Out-of-range tokens are ignored.
+func (p *Pool) CooldownTokenIpCapped(token int, ice *upstream.IpCappedError) {
+	toks := p.toks.Load()
+	if token < 0 || token >= len(*toks) || ice == nil {
+		return
+	}
+	(*toks)[token].runs.CooldownIpCapped(ice)
+}
+
 // CooldownTokenBan applies a ban cooldown to token (remembered so
 // Acquire surfaces 403 banned + resumes-at during the window).
 func (p *Pool) CooldownTokenBan(token int, be *upstream.BanError) {
@@ -889,6 +929,15 @@ func (p *Pool) CooldownBridgeRateLimit(lease *Lease, rle *upstream.RateLimitErro
 		return
 	}
 	lease.Bridge.runs.CooldownRateLimit(rle)
+}
+
+// CooldownBridgeIpCapped applies an ip_capped cooldown to the bridge entry,
+// bounded to the error's RetryAfter ONLY (no Pacific-midnight fallback).
+func (p *Pool) CooldownBridgeIpCapped(lease *Lease, ice *upstream.IpCappedError) {
+	if lease == nil || lease.Bridge == nil || ice == nil {
+		return
+	}
+	lease.Bridge.runs.CooldownIpCapped(ice)
 }
 
 // CooldownBridgeBan applies a ban cooldown to the bridge entry (remembered
@@ -1078,25 +1127,26 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 		}
 
 		out = append(out, TokenSnapshot{
-			Token:                i,
-			CooldownUntil:        rs.CooldownUntil,
-			ActiveRuns:           rs.ActiveRuns,
-			Requests:             rs.Requests,
-			Messages24h:          msgs,
-			DailyLimit:           dailyLimit,
-			UsagePct:             usagePct,
-			RiskLevel:            riskLevel,
-			SessionStatus:        ss.Status,
-			SessionInstanceID:    ss.InstanceID,
-			SessionQueuePosition: ss.QueuePosition,
-			SessionQueueDepth:    ss.QueueDepth,
-			TierAccess:           ss.TierAccess,
-			CountryCode:          countryCode,
-			CountryBlockReason:   countryReason,
-			QuotaByModel:         ss.QuotaByModel,
-			Entitlement:          ss.Entitlement,
-			TransientRetries:     tok.client.TransientRetries(),
-			FingerprintRotations: tok.client.FingerprintRotations(),
+			Token:                   i,
+			CooldownUntil:           rs.CooldownUntil,
+			ActiveRuns:              rs.ActiveRuns,
+			Requests:                rs.Requests,
+			Messages24h:             msgs,
+			DailyLimit:              dailyLimit,
+			UsagePct:                usagePct,
+			RiskLevel:               riskLevel,
+			SessionStatus:           ss.Status,
+			SessionInstanceID:       ss.InstanceID,
+			SessionQueuePosition:    ss.QueuePosition,
+			SessionQueueDepth:       ss.QueueDepth,
+			TierAccess:              ss.TierAccess,
+			CountryCode:             countryCode,
+			CountryBlockReason:      countryReason,
+			SessionActiveUsersForIP: ss.ActiveUsersForIP,
+			QuotaByModel:            ss.QuotaByModel,
+			Entitlement:             ss.Entitlement,
+			TransientRetries:        tok.client.TransientRetries(),
+			FingerprintRotations:    tok.client.FingerprintRotations(),
 		})
 	}
 	return out
@@ -1586,16 +1636,24 @@ func (p *Pool) maintainTick(ctx context.Context) {
 		}
 		mCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 		tok.runs.Maintain(mCtx)
-		// Advance queued sessions (GET poll) and send heartbeats for active sessions.
-		snap := tok.session.Snapshot()
-		switch snap.Status {
-		case "queued":
-			if _, err := tok.session.EnsureSession(mCtx); err != nil {
-				p.logger.Debug("pool: maintain session not ready", "token", i+1, "err", err)
-			}
-		case "active":
-			if err := tok.session.Heartbeat(mCtx); err != nil {
-				p.logger.Debug("pool: maintain session heartbeat failed", "token", i+1, "err", err)
+		// Advance queued sessions (GET poll) and send heartbeats for active
+		// sessions. Skipped while a chat is in flight: the upstream allows
+		// one client per account at a time, and a poll/heartbeat GET that
+		// lands mid-chat can kick the active session (428 waiting_room).
+		// Mirror the reference session manager's in-flight gate
+		// (reference/freebuff-proxy-hengxin session-manager.js:37-49,
+		// 259-260).
+		if tok.runs.InflightCount() == 0 {
+			snap := tok.session.Snapshot()
+			switch snap.Status {
+			case "queued":
+				if _, err := tok.session.EnsureSession(mCtx); err != nil {
+					p.logger.Debug("pool: maintain session not ready", "token", i+1, "err", err)
+				}
+			case "active":
+				if err := tok.session.Heartbeat(mCtx); err != nil {
+					p.logger.Debug("pool: maintain session heartbeat failed", "token", i+1, "err", err)
+				}
 			}
 		}
 		cancel()
@@ -1679,15 +1737,21 @@ func (p *Pool) bridgeMaintain(ctx context.Context, idle bool) {
 		}
 		mCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
 		entry.runs.Maintain(mCtx)
-		snap := entry.session.Snapshot()
-		switch snap.Status {
-		case "queued":
-			if _, err := entry.session.EnsureSession(mCtx); err != nil {
-				p.logger.Debug("pool: bridge maintain session not ready", "err", err)
-			}
-		case "active":
-			if err := entry.session.Heartbeat(mCtx); err != nil {
-				p.logger.Debug("pool: bridge maintain session heartbeat failed", "err", err)
+		// Same in-flight gate as the fixed-token loop: skip the session
+		// poll/heartbeat GETs while a chat is in flight so they cannot kick
+		// the active session (reference/freebuff-proxy-hengxin
+		// session-manager.js:37-49, 259-260).
+		if entry.runs.InflightCount() == 0 {
+			snap := entry.session.Snapshot()
+			switch snap.Status {
+			case "queued":
+				if _, err := entry.session.EnsureSession(mCtx); err != nil {
+					p.logger.Debug("pool: bridge maintain session not ready", "err", err)
+				}
+			case "active":
+				if err := entry.session.Heartbeat(mCtx); err != nil {
+					p.logger.Debug("pool: bridge maintain session heartbeat failed", "err", err)
+				}
 			}
 		}
 		cancel()
@@ -1739,6 +1803,15 @@ func asRateLimit(err error) *upstream.RateLimitError {
 	var rle *upstream.RateLimitError
 	if errors.As(err, &rle) {
 		return rle
+	}
+	return nil
+}
+
+// asIpCapped extracts an IpCappedError from err (nil when absent).
+func asIpCapped(err error) *upstream.IpCappedError {
+	var ice *upstream.IpCappedError
+	if errors.As(err, &ice) {
+		return ice
 	}
 	return nil
 }

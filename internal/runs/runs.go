@@ -15,6 +15,7 @@ package runs
 
 import (
 	"context"
+	cryptoRand "crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,6 +41,20 @@ const countryBlockCooldown = 15 * time.Minute
 // deadline (PRD §5: "10s force deadline").
 const shutdownTimeout = 10 * time.Second
 
+// newTraceSessionID mints a UUIDv4 trace session id from crypto/rand,
+// mirroring the CLI's randomUUID per run (run.ts: previousRun?.traceSessionId
+// ?? randomUUID). A crypto/rand failure is unrecoverable in practice; fall
+// back to a time-seeded hex id rather than panicking mid-run.
+func newTraceSessionID() string {
+	var b [16]byte
+	if _, err := cryptoRand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 // Run is one agent run leased to a caller. Requests counts acquires served
 // by this run; it is sent as totalSteps when the run is FINISHed.
 type Run struct {
@@ -47,6 +62,11 @@ type Run struct {
 	RunID     string
 	StartedAt time.Time
 	Requests  int
+	// TraceSessionID is minted once per run (crypto/rand UUID) and reused
+	// across the run's requests as codebuff_metadata["trace_session_id"],
+	// exactly like the CLI (run.ts: previousRun?.traceSessionId ??
+	// randomUUID; reference/proxy-freebuff lib/runs.js:43-46).
+	TraceSessionID string
 
 	inflight  int  // leases outstanding; guarded by the manager mutex
 	finishing bool // FINISH in flight; guarded by the manager mutex
@@ -97,6 +117,12 @@ type RunManager struct {
 	// during the window (mirrors the rate-limit/ban memory).
 	countryBlock *upstream.CountryBlockedError
 	countryUntil time.Time
+	// ipCapped is the last ip_capped admission refusal applied to this
+	// token's cooldown. Surfaced by IpCappedError() during its short window
+	// (mirrors rateLimit) so an IP-capped token keeps returning 429
+	// ip_capped + Retry-After instead of a generic cooldown 502.
+	ipCapped      *upstream.IpCappedError
+	ipCappedUntil time.Time
 	// totalRequests is the cumulative count of Acquire leases handed out.
 	// It is kept separate from the per-run counters because rotated runs
 	// that get FINISHed leave the active+draining sets and would otherwise
@@ -349,11 +375,13 @@ func (m *RunManager) Cooldown(d time.Duration) {
 	m.rateLimit = nil
 	m.ban = nil
 	m.countryBlock = nil
+	m.ipCapped = nil
 	// The ban/country windows die with their remembered errors: leaving the
 	// deadlines set would surface a stale future BannedUntil (healthz risk
 	// gating via Snapshot) with no ban attached. Mirror ClearCooldowns.
 	m.banUntil = time.Time{}
 	m.countryUntil = time.Time{}
+	m.ipCappedUntil = time.Time{}
 	m.mu.Unlock()
 }
 
@@ -367,6 +395,8 @@ func (m *RunManager) ClearCooldowns() {
 	m.banUntil = time.Time{}
 	m.countryBlock = nil
 	m.countryUntil = time.Time{}
+	m.ipCapped = nil
+	m.ipCappedUntil = time.Time{}
 	m.mu.Unlock()
 }
 
@@ -396,6 +426,41 @@ func (m *RunManager) CooldownRateLimit(rle *upstream.RateLimitError) {
 	m.rateLimit = rle
 	m.ban = nil
 	m.countryBlock = nil
+	m.ipCapped = nil
+}
+
+// CooldownIpCapped applies an ip_capped cooldown bounded to the body's
+// retryAfterMs ONLY — never the Pacific-midnight quota lock (ip_capped is
+// admission-only, not tied to a quota reset). Remembered so Acquires keep
+// surfacing 429 ip_capped + Retry-After during the short window instead of
+// re-hitting upstream (mirrors CooldownRateLimit). Errors with
+// RetryAfter <= 0 are ignored.
+func (m *RunManager) CooldownIpCapped(ice *upstream.IpCappedError) {
+	if ice == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ice.RetryAfter <= 0 {
+		return
+	}
+	m.ipCapped = ice
+	m.ipCappedUntil = time.Now().Add(ice.RetryAfter)
+	m.cooldownUntil = m.ipCappedUntil
+	m.rateLimit = nil
+	m.ban = nil
+	m.countryBlock = nil
+}
+
+// IpCappedError returns the remembered ip_capped error while its short
+// cooldown window is active, nil otherwise.
+func (m *RunManager) IpCappedError() *upstream.IpCappedError {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if time.Now().Before(m.ipCappedUntil) && m.ipCapped != nil {
+		return m.ipCapped
+	}
+	return nil
 }
 
 // RateLimitError returns the remembered rate-limit error while its
@@ -428,6 +493,7 @@ func (m *RunManager) CooldownBan(be *upstream.BanError) {
 	m.cooldownUntil = m.banUntil
 	m.rateLimit = nil // a ban supersedes any rate-limit cooldown
 	m.countryBlock = nil
+	m.ipCapped = nil
 	m.mu.Unlock()
 }
 
@@ -466,6 +532,7 @@ func (m *RunManager) CooldownCountryBlocked(cbe *upstream.CountryBlockedError) {
 	m.rateLimit = nil
 	m.ban = nil
 	m.banUntil = time.Time{}
+	m.ipCapped = nil
 }
 
 // CountryBlockedError returns the remembered country-block error while its
@@ -567,7 +634,7 @@ func (m *RunManager) rotate(ctx context.Context, agentID string) error {
 		slog.Debug("runs: run started", "agent_id", agentID, "run_id", runID)
 
 		oldRun := m.runs[agentID]
-		m.runs[agentID] = &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now()}
+		m.runs[agentID] = &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now(), TraceSessionID: newTraceSessionID()}
 		if oldRun != nil {
 			m.draining = append(m.draining, oldRun)
 		}

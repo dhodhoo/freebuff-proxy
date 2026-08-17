@@ -196,8 +196,8 @@ func TestChatCompletionsEnvelope(t *testing.T) {
 		t.Errorf("freebuff_instance_id = %v", md["freebuff_instance_id"])
 	}
 	clientID, _ := md["client_id"].(string)
-	if !regexp.MustCompile(`^[0-9a-z]{13}$`).MatchString(clientID) {
-		t.Errorf("client_id %q not 13-char base36", clientID)
+	if clientID != "run:run-abc" {
+		t.Errorf("client_id = %q, want %q (stable per run, derived from run id)", clientID, "run:run-abc")
 	}
 	provider, ok := sent["provider"].(map[string]any)
 	if !ok || provider["data_collection"] != "deny" {
@@ -3327,32 +3327,45 @@ func TestEndSession404Tolerated(t *testing.T) {
 	})
 }
 
-// TestClassify429ChatLevel guards 429 ip_capped/spend_limited bodies at the
-// chat level (G10): they classify as RateLimitError carrying the status.
+// TestClassify429ChatLevel guards 429 chat-level bodies (G10): ip_capped
+// classifies as the distinct IpCappedError (admission-only, NOT a quota
+// reset — never ErrRateLimited), while spend_limited keeps quota-lock
+// RateLimitError semantics.
 func TestClassify429ChatLevel(t *testing.T) {
-	cases := []struct {
-		name       string
-		body       string
-		wantStatus string
-	}{
-		{"ip_capped", `{"status":"ip_capped","activeUsersForIp":5,"limit":4,"retryAfterMs":30000}`, "ip_capped"},
-		{"spend_limited", `{"status":"spend_limited","message":"Daily budget reached","retryAfterMs":60000}`, "spend_limited"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := classifyError(http.StatusTooManyRequests, tc.body, http.Header{})
-			var rle *RateLimitError
-			if !errors.As(err, &rle) {
-				t.Fatalf("err = %v, want RateLimitError", err)
-			}
-			if !errors.Is(err, ErrRateLimited) {
-				t.Errorf("err = %v, want ErrRateLimited", err)
-			}
-			if rle.Status != tc.wantStatus {
-				t.Errorf("RateLimitError.Status = %q, want %q", rle.Status, tc.wantStatus)
-			}
-		})
-	}
+	t.Run("ip_capped", func(t *testing.T) {
+		err := classifyError(http.StatusTooManyRequests,
+			`{"status":"ip_capped","activeUsersForIp":5,"limit":4,"retryAfterMs":30000}`, http.Header{})
+		if errors.Is(err, ErrRateLimited) {
+			t.Fatal("ip_capped classified as ErrRateLimited, want distinct ErrIpCapped")
+		}
+		var ice *IpCappedError
+		if !errors.As(err, &ice) {
+			t.Fatalf("err = %v, want *IpCappedError", err)
+		}
+		if !errors.Is(err, ErrIpCapped) {
+			t.Errorf("err = %v, want ErrIpCapped", err)
+		}
+		if ice.ActiveUsersForIP != 5 || ice.Limit != 4 {
+			t.Errorf("IpCappedError = %+v, want ActiveUsersForIP 5 limit 4", ice)
+		}
+		if ice.RetryAfter != 30*time.Second {
+			t.Errorf("RetryAfter = %v, want 30s (bounded to retryAfterMs only)", ice.RetryAfter)
+		}
+	})
+	t.Run("spend_limited", func(t *testing.T) {
+		err := classifyError(http.StatusTooManyRequests,
+			`{"status":"spend_limited","message":"Daily budget reached","retryAfterMs":60000}`, http.Header{})
+		var rle *RateLimitError
+		if !errors.As(err, &rle) {
+			t.Fatalf("err = %v, want RateLimitError", err)
+		}
+		if !errors.Is(err, ErrRateLimited) {
+			t.Errorf("err = %v, want ErrRateLimited", err)
+		}
+		if rle.Status != "spend_limited" {
+			t.Errorf("RateLimitError.Status = %q, want spend_limited", rle.Status)
+		}
+	})
 }
 
 // TestChatNonObjectBodyAndGzipError guards G12: a non-object chat body is
@@ -3523,7 +3536,7 @@ func TestRetryRotatesFingerprintAtDialLayer(t *testing.T) {
 		}
 		// Production hard-codes InsecureSkipVerify=false; the local test
 		// server's self-signed cert requires true.
-		return stealth.Dialer(prof, nil, true)(ctx, network, addr)
+		return stealth.Dialer(prof, nil, true, nil)(ctx, network, addr)
 	}
 
 	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`{"model":"m"}`))
@@ -3608,7 +3621,7 @@ func TestConnectTunnelStealthRealSockets(t *testing.T) {
 		prof := client.dialProfileFor(ctx)
 		// InsecureSkipVerify=true only because the local origin is
 		// self-signed; production hard-codes false.
-		return stealth.Dialer(prof, httpConnectDial(pu), true)(ctx, network, addr)
+		return stealth.Dialer(prof, httpConnectDial(pu), true, nil)(ctx, network, addr)
 	}
 
 	rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m"}, []byte(`{"model":"m"}`))
@@ -3737,5 +3750,313 @@ func TestCompactHeartbeatAbsentTolerant(t *testing.T) {
 	}
 	if got := <-gotHeartbeat; got != "1" {
 		t.Errorf("heartbeat header = %q, want 1", got)
+	}
+}
+
+// ── Wave 1 issue tests (#75, #81, #82, #79, #80, #76) ────────────────────
+
+// TestClassifyCapacityDeferred verifies #75: a free_mode_capacity_deferred
+// response classifies as the distinct CapacityDeferredError (retryable
+// same-session condition), never a token cooldown or session invalidation.
+func TestClassifyCapacityDeferred(t *testing.T) {
+	err := classifyError(http.StatusTooManyRequests, `{"error":{"code":"free_mode_capacity_deferred","message":"Free mode is at capacity; your request will be retried automatically"}}`, http.Header{})
+	var cde *CapacityDeferredError
+	if !errors.As(err, &cde) {
+		t.Fatalf("err = %v, want *CapacityDeferredError", err)
+	}
+	if !errors.Is(err, ErrCapacityDeferred) {
+		t.Errorf("err = %v, want ErrCapacityDeferred", err)
+	}
+	// Unwraps to a Retryable UpstreamError so generic server paths surface
+	// 503 upstream_retryable once the client-side budget is exhausted.
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || !ue.Retryable {
+		t.Errorf("err = %v, want unwrap to Retryable UpstreamError", err)
+	}
+	if cde.Status != http.StatusTooManyRequests {
+		t.Errorf("Status = %d, want 429", cde.Status)
+	}
+}
+
+// TestChatCompletionsRetriesCapacityDeferredSameSession verifies #75: a
+// free_mode_capacity_deferred 429 is retried IN PLACE against the same
+// lease/session (byte-identical body, same instance id) up to the
+// TRANSIENT_RETRIES budget, and surfaces the typed retryable error once the
+// budget is exhausted.
+func TestChatCompletionsRetriesCapacityDeferredSameSession(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	deferred := `{"error":{"code":"free_mode_capacity_deferred","message":"Free mode is at capacity; your request will be retried automatically"}}`
+
+	t.Run("retries same session then succeeds", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		var calls atomic.Int32
+		mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, deferred)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`))
+		}
+		client, err := New("tok-a", testConfig(mock.URL(), func(c *config.Config) { c.TransientRetries = 1 }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r", SessionInstanceID: "inst-1"}, body)
+		if err != nil {
+			t.Fatalf("ChatCompletions after capacity-deferred retry: %v", err)
+		}
+		_ = rc.Close()
+
+		if got := calls.Load(); got != 2 {
+			t.Errorf("upstream chat calls = %d, want 2 (original + same-session retry)", got)
+		}
+		if got := client.CapacityDeferredRetries(); got != 1 {
+			t.Errorf("CapacityDeferredRetries = %d, want 1", got)
+		}
+		if len(mock.RecordedChatHeaders) != 2 {
+			t.Fatalf("recorded %d chat requests, want 2", len(mock.RecordedChatHeaders))
+		}
+		// Same session on the retry: instance id header identical.
+		if got := mock.RecordedChatHeaders[1].Get("x-freebuff-instance-id"); got != "inst-1" {
+			t.Errorf("retry x-freebuff-instance-id = %q, want inst-1 (same session)", got)
+		}
+		if mock.RecordedChatBodies[0] != mock.RecordedChatBodies[1] {
+			t.Error("retried body differs from original (must be byte-identical)")
+		}
+	})
+
+	t.Run("budget exhausted surfaces typed retryable error", func(t *testing.T) {
+		mock2 := testutil.NewMock()
+		defer mock2.Close()
+		var calls2 atomic.Int32
+		mock2.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			calls2.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, deferred)
+		}
+		client2, err := New("tok-b", testConfig(mock2.URL(), func(c *config.Config) { c.TransientRetries = 1 }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client2.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+		if !errors.Is(err, ErrCapacityDeferred) {
+			t.Fatalf("err = %v, want ErrCapacityDeferred", err)
+		}
+		var cde *CapacityDeferredError
+		if !errors.As(err, &cde) {
+			t.Fatalf("err = %v, want *CapacityDeferredError", err)
+		}
+		var ue *UpstreamError
+		if !errors.As(err, &ue) || !ue.Retryable {
+			t.Errorf("err = %v, want unwrap to Retryable UpstreamError", err)
+		}
+		if got := calls2.Load(); got != 2 {
+			t.Errorf("upstream chat calls = %d, want 2 (original + 1 budgeted retry)", got)
+		}
+		if got := client2.CapacityDeferredRetries(); got != 1 {
+			t.Errorf("CapacityDeferredRetries = %d, want 1", got)
+		}
+	})
+
+	t.Run("zero budget never retries", func(t *testing.T) {
+		mock3 := testutil.NewMock()
+		defer mock3.Close()
+		var calls3 atomic.Int32
+		mock3.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+			calls3.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, deferred)
+		}
+		client3, err := New("tok-c", testConfig(mock3.URL(), func(c *config.Config) { c.TransientRetries = 0 }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client3.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, body)
+		if !errors.Is(err, ErrCapacityDeferred) {
+			t.Fatalf("err = %v, want ErrCapacityDeferred", err)
+		}
+		if got := calls3.Load(); got != 1 {
+			t.Errorf("upstream chat calls = %d, want 1 (retries disabled)", got)
+		}
+	})
+}
+
+// TestClassifyIpCappedNoPacificMidnight verifies #81: a 429 ip_capped body
+// with no explicit retryAfterMs gets a bounded 1m default — never the
+// Pacific-midnight quota lock.
+func TestClassifyIpCappedNoPacificMidnight(t *testing.T) {
+	err := classifyError(http.StatusTooManyRequests, `{"status":"ip_capped"}`, http.Header{})
+	if errors.Is(err, ErrRateLimited) {
+		t.Fatal("ip_capped classified as ErrRateLimited, want distinct ErrIpCapped")
+	}
+	var ice *IpCappedError
+	if !errors.As(err, &ice) {
+		t.Fatalf("err = %v, want *IpCappedError", err)
+	}
+	if ice.RetryAfter != time.Minute {
+		t.Errorf("RetryAfter = %v, want 1m bounded default (no Pacific midnight)", ice.RetryAfter)
+	}
+	if errors.Is(err, ErrIpCapped) == false {
+		t.Errorf("err = %v, want ErrIpCapped", err)
+	}
+}
+
+// TestClassifyWaitingRoomQueued verifies #81: a 429 waiting_room_queued body
+// is a transient admission race (endsTheSession:false) — surfaced as a
+// WaitingRoomError, never session-invalid (no session refresh/recreate).
+func TestClassifyWaitingRoomQueued(t *testing.T) {
+	err := classifyError(http.StatusTooManyRequests, `{"error":{"code":"waiting_room_queued","message":"row caught mid-admit"}}`, http.Header{})
+	if errors.Is(err, ErrSessionInvalid) {
+		t.Fatal("waiting_room_queued classified as session-invalid, want transient WaitingRoomError")
+	}
+	var wr *WaitingRoomError
+	if !errors.As(err, &wr) {
+		t.Fatalf("err = %v, want *WaitingRoomError", err)
+	}
+}
+
+// TestClassifySessionLimitReached verifies #82: a 409 session_limit_reached
+// response is a distinct non-invalid error carrying the code — the ACCOUNT
+// is over its concurrent-tab budget but the session row is fine
+// (endsTheSession:false), so no session refresh/recreate may trigger.
+func TestClassifySessionLimitReached(t *testing.T) {
+	err := classifyError(http.StatusConflict, `{"error":{"code":"session_limit_reached","message":"Concurrent tab limit reached"}}`, http.Header{})
+	if errors.Is(err, ErrSessionInvalid) {
+		t.Fatal("session_limit_reached classified as session-invalid; the row is fine")
+	}
+	var sle *SessionLimitError
+	if !errors.As(err, &sle) {
+		t.Fatalf("err = %v, want *SessionLimitError", err)
+	}
+	if !errors.Is(err, ErrSessionLimitReached) {
+		t.Errorf("err = %v, want ErrSessionLimitReached", err)
+	}
+	if sle.Status != http.StatusConflict {
+		t.Errorf("Status = %d, want 409", sle.Status)
+	}
+}
+
+// TestChatSendsActingUserID verifies #79: when USER_ID is configured the
+// client sends x-freebuff-acting-user-id on the chat path (CLI parity);
+// when unset the header is omitted.
+func TestChatSendsActingUserID(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`)
+
+	t.Run("set", func(t *testing.T) {
+		client, err := New("tok-a", testConfig(mock.URL(), func(c *config.Config) { c.UserID = "user-123" }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = rc.Close()
+		if len(mock.RecordedChatHeaders) != 1 {
+			t.Fatalf("want 1 chat request, got %d", len(mock.RecordedChatHeaders))
+		}
+		if got := mock.RecordedChatHeaders[0].Get("x-freebuff-acting-user-id"); got != "user-123" {
+			t.Errorf("x-freebuff-acting-user-id = %q, want user-123", got)
+		}
+	})
+	t.Run("unset omits header", func(t *testing.T) {
+		client, err := New("tok-a", testConfig(mock.URL(), nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r"}, []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = rc.Close()
+		if got := mock.RecordedChatHeaders[1].Get("x-freebuff-acting-user-id"); got != "" {
+			t.Errorf("x-freebuff-acting-user-id = %q, want unset", got)
+		}
+	})
+}
+
+// TestInjectEnvelopeTraceSessionIDAndStableClientID verifies #80: the
+// envelope injects trace_session_id when carried by ChatOptions and derives
+// client_id stably from the run id (never a fresh per-request draw).
+func TestInjectEnvelopeTraceSessionIDAndStableClientID(t *testing.T) {
+	out, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-1", TraceSessionID: "trace-abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(out, &sent); err != nil {
+		t.Fatal(err)
+	}
+	md := sent["codebuff_metadata"].(map[string]any)
+	if md["trace_session_id"] != "trace-abc" {
+		t.Errorf("trace_session_id = %v, want trace-abc", md["trace_session_id"])
+	}
+	if md["client_id"] != "run:run-1" {
+		t.Errorf("client_id = %v, want run:run-1 (stable per run)", md["client_id"])
+	}
+	// Re-injecting the same run yields the same client_id across requests.
+	out2, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent2 map[string]any
+	_ = json.Unmarshal(out2, &sent2)
+	if md2 := sent2["codebuff_metadata"].(map[string]any); md2["client_id"] != "run:run-1" {
+		t.Errorf("client_id = %v, want stable run:run-1 across requests", md2["client_id"])
+	}
+	// Without a run id the SDK-faithful 13-char base36 draw is kept.
+	out3, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent3 map[string]any
+	_ = json.Unmarshal(out3, &sent3)
+	md3 := sent3["codebuff_metadata"].(map[string]any)
+	if id, _ := md3["client_id"].(string); !regexp.MustCompile(`^[0-9a-z]{13}$`).MatchString(id) {
+		t.Errorf("client_id %q not 13-char base36 when no run id", id)
+	}
+}
+
+// TestProbeAccountSendsIncludeUnusedRateLimits verifies #76: the zero-cost
+// GET probe carries x-freebuff-include-unused-rate-limits: 1 so the response
+// includes accessTier/glmPromo/resetAt/rateLimitsByModel for dashboard
+// display, and sessionCall parses the new fields.
+func TestProbeAccountSendsIncludeUnusedRateLimits(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var gotHeader string
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("x-freebuff-include-unused-rate-limits")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-1","accessTier":"limited","glmPromo":{"dailySessions":2,"endsAt":"2026-08-20T07:00:00.000Z"},"rateLimitsByModel":{"deepseek/deepseek-v4-flash":{"model":"deepseek/deepseek-v4-flash","limit":6,"recentCount":2,"period":"pacific_day","resetAt":"2026-08-18T07:00:00.000Z"}}}`)
+	}
+	client, err := New("tok-a", testConfig(mock.URL(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := client.ProbeAccount(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHeader != "1" {
+		t.Errorf("x-freebuff-include-unused-rate-limits = %q, want 1", gotHeader)
+	}
+	if st.AccessTier != "limited" {
+		t.Errorf("AccessTier = %q, want limited", st.AccessTier)
+	}
+	if st.GlmPromo == "" || !strings.Contains(st.GlmPromo, "dailySessions") {
+		t.Errorf("GlmPromo = %q, want raw glmPromo JSON", st.GlmPromo)
+	}
+	if st.RateLimitsByModel == nil || st.RateLimitsByModel["deepseek/deepseek-v4-flash"].Limit != 6 {
+		t.Errorf("RateLimitsByModel = %+v, want parsed per-model quota", st.RateLimitsByModel)
 	}
 }

@@ -767,3 +767,51 @@ func TestSingleFlightRunRotation(t *testing.T) {
 		t.Fatalf("StartedRuns count = %d, want 2 (initial + 1 coalesced rotation)", len(started))
 	}
 }
+
+// ── Wave 1 issue tests (#80) ─────────────────────────────────────────────
+
+// TestTraceSessionIDMintedPerRun verifies #80: each run mints a crypto/rand
+// trace session id once and reuses it across the run's requests; a rotated
+// run gets a fresh one.
+func TestTraceSessionIDMintedPerRun(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	run, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.TraceSessionID == "" {
+		t.Fatal("TraceSessionID empty, want minted UUID per run")
+	}
+	first := run.TraceSessionID
+	mgr.Release(run)
+
+	// A second acquire of the same run (no rotation) reuses the same id.
+	run2, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run2.TraceSessionID != first {
+		t.Errorf("TraceSessionID = %q after re-acquire, want %q (stable per run)", run2.TraceSessionID, first)
+	}
+	mgr.Release(run2)
+
+	// Force a rotation: age the current run past the rotation interval so
+	// the next acquire rotates it; a fresh run gets a fresh trace id.
+	mgr.mu.Lock()
+	mgr.runs[agentA].StartedAt = time.Now().Add(-2 * time.Hour)
+	mgr.mu.Unlock()
+	run3, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run3.TraceSessionID == "" {
+		t.Fatal("TraceSessionID empty after rotation")
+	}
+	if run3.TraceSessionID == first {
+		t.Errorf("TraceSessionID = %q after rotation, want a fresh id", run3.TraceSessionID)
+	}
+	mgr.Release(run3)
+}

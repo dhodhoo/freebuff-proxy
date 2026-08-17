@@ -1200,3 +1200,67 @@ func TestModelLockedFallbackInstance(t *testing.T) {
 		t.Errorf("EndSession instanceID = %q, want locked-inst-123", deleteInstanceIDs[0])
 	}
 }
+
+// ── Wave 1 issue tests (#81) ─────────────────────────────────────────────
+
+// TestHeartbeatIpCapped verifies #81: an ip_capped session status maps to
+// the distinct upstream.IpCappedError (admission-only, bounded to
+// retryAfterMs — never the Pacific-midnight quota lock), NOT a
+// RateLimitError.
+func TestHeartbeatIpCapped(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ip_capped","activeUsersForIp":5,"limit":4,"retryAfterMs":30000}`)
+	}
+
+	err := mgr.Heartbeat(context.Background())
+	if errors.Is(err, upstream.ErrRateLimited) {
+		t.Fatal("ip_capped mapped to ErrRateLimited, want distinct ErrIpCapped")
+	}
+	var ice *upstream.IpCappedError
+	if !errors.As(err, &ice) {
+		t.Fatalf("want *upstream.IpCappedError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrIpCapped) {
+		t.Error("not unwrap-able to ErrIpCapped")
+	}
+	if ice.ActiveUsersForIP != 5 || ice.Limit != 4 {
+		t.Errorf("IpCappedError = %+v, want ActiveUsersForIP 5 limit 4", ice)
+	}
+	if ice.RetryAfter != 30*time.Second {
+		t.Errorf("RetryAfter = %s, want 30s (bounded to retryAfterMs only)", ice.RetryAfter)
+	}
+}
+
+// TestSnapshotActiveUsersForIP verifies the admission response's
+// activeUsersForIp is cached and exposed through SessionSnapshot for the
+// pool snapshot (issue #81 "if cheap").
+func TestSnapshotActiveUsersForIP(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123","activeUsersForIp":3}`)
+	}
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snap := mgr.Snapshot()
+	if snap.ActiveUsersForIP != 3 {
+		t.Errorf("Snapshot.ActiveUsersForIP = %d, want 3", snap.ActiveUsersForIP)
+	}
+	if snap.Status != "active" {
+		t.Errorf("Status = %q, want active", snap.Status)
+	}
+}

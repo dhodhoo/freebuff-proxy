@@ -631,32 +631,39 @@ func probeModel(reg *registry.Registry) string {
 }
 
 // quotaSummary renders the live per-model session quota from a probe's
-// RateLimitsByModel map (models sorted for determinism), or "" when the
-// upstream response carried no quota data (compact responses omit it).
+// RateLimitsByModel map (models sorted for determinism), plus the account
+// tier and glmPromo when the response carried them (the
+// x-freebuff-include-unused-rate-limits probe header asks upstream to
+// include the unused limits); "" when the upstream response carried no quota
+// data (compact responses omit it).
 func quotaSummary(st *upstream.SessionState) string {
-	if st == nil || len(st.RateLimitsByModel) == 0 {
+	if st == nil || (len(st.RateLimitsByModel) == 0 && st.AccessTier == "" && st.GlmPromo == "") {
 		return ""
+	}
+	var parts []string
+	if st.AccessTier != "" {
+		parts = append(parts, "tier "+st.AccessTier)
 	}
 	models := make([]string, 0, len(st.RateLimitsByModel))
 	for id := range st.RateLimitsByModel {
 		models = append(models, id)
 	}
 	sort.Strings(models)
-	var sb strings.Builder
 	for _, id := range models {
 		q := st.RateLimitsByModel[id]
-		if sb.Len() > 0 {
-			sb.WriteString("; ")
-		}
-		fmt.Fprintf(&sb, "%s %s/%s", id, strconv.FormatFloat(q.Limit, 'f', -1, 64), strconv.FormatFloat(q.RecentCount, 'f', -1, 64))
+		entry := fmt.Sprintf("%s %s/%s", id, strconv.FormatFloat(q.Limit, 'f', -1, 64), strconv.FormatFloat(q.RecentCount, 'f', -1, 64))
 		if q.Period != "" {
-			sb.WriteString(" " + q.Period)
+			entry += " " + q.Period
 		}
 		if !q.ResetAt.IsZero() {
-			fmt.Fprintf(&sb, ", resets %s", q.ResetAt.Format(time.RFC3339))
+			entry += fmt.Sprintf(", resets %s", q.ResetAt.Format(time.RFC3339))
 		}
+		parts = append(parts, entry)
 	}
-	return "quota: " + sb.String()
+	if st.GlmPromo != "" {
+		parts = append(parts, "glmPromo "+st.GlmPromo)
+	}
+	return "quota: " + strings.Join(parts, "; ")
 }
 
 // handleTokenTest probes a token with a zero-cost upstream GET probe (no
@@ -1504,6 +1511,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			func(l *pool.Lease) { s.pool.CooldownBridge(l, runs.DefaultCooldown) },
 			s.pool.CooldownBridgeBan,
 			s.pool.CooldownBridgeRateLimit,
+			s.pool.CooldownBridgeIpCapped,
 			s.pool.CooldownBridgeCountryBlocked,
 		)
 	} else {
@@ -1515,6 +1523,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			func(l *pool.Lease) { s.pool.CooldownToken(l.Token, runs.DefaultCooldown) },
 			func(l *pool.Lease, be *upstream.BanError) { s.pool.CooldownTokenBan(l.Token, be) },
 			func(l *pool.Lease, rle *upstream.RateLimitError) { s.pool.CooldownTokenRateLimit(l.Token, rle) },
+			func(l *pool.Lease, ice *upstream.IpCappedError) { s.pool.CooldownTokenIpCapped(l.Token, ice) },
 			func(l *pool.Lease, cbe *upstream.CountryBlockedError) {
 				s.pool.CooldownTokenCountryBlocked(l.Token, cbe)
 			},
@@ -1605,12 +1614,13 @@ func chatDoneAttrs(model, agent string, stream bool, ms int64, chunks, bytes int
 // chatAttempt runs the retry-once recovery loop for one chat request: chat
 // through the leased token; on session-invalid / run-invalid the lease is
 // released, the cached session/run invalidated, and a fresh lease acquired
-// once; on auth-reject / ban / rate-limit the token is cooled down and the
-// error returned for writeError. The acquire/chat/invalidate/cooldown hooks
-// are closures so the pooled (fixed-token) and bridge paths share the exact
-// same recovery semantics. On success the returned body reader and final
-// lease belong to the caller: close the body and release the lease via
-// Pool.LeaseRelease when done.
+// once; on auth-reject / ban / rate-limit / ip-capped the token is cooled
+// down (ip_capped bounded to its retryAfterMs — never the Pacific-midnight
+// lock) and the error returned for writeError. The acquire/chat/invalidate/
+// cooldown hooks are closures so the pooled (fixed-token) and bridge paths
+// share the exact same recovery semantics. On success the returned body
+// reader and final lease belong to the caller: close the body and release
+// the lease via Pool.LeaseRelease when done.
 func (s *Server) chatAttempt(
 	ctx context.Context,
 	model string,
@@ -1622,6 +1632,7 @@ func (s *Server) chatAttempt(
 	cooldownAuth func(*pool.Lease),
 	cooldownBan func(*pool.Lease, *upstream.BanError),
 	cooldownRate func(*pool.Lease, *upstream.RateLimitError),
+	cooldownIpCapped func(*pool.Lease, *upstream.IpCappedError),
 	cooldownCountry func(*pool.Lease, *upstream.CountryBlockedError),
 ) (io.ReadCloser, *pool.Lease, error) {
 	lease, err := acquire(ctx, model)
@@ -1633,6 +1644,7 @@ func (s *Server) chatAttempt(
 		Model:             model,
 		RunID:             lease.Run.RunID,
 		SessionInstanceID: lease.SessionInstanceID,
+		TraceSessionID:    lease.Run.TraceSessionID,
 	}
 
 	released := false
@@ -1681,6 +1693,17 @@ func (s *Server) chatAttempt(
 			var rle *upstream.RateLimitError
 			if errors.As(err, &rle) {
 				cooldownRate(lease, rle)
+			}
+			release()
+			return nil, nil, err
+		case errors.Is(err, upstream.ErrIpCapped):
+			// ip_capped is admission-only (too many distinct users on the
+			// egress IP), NOT a quota reset: cool the token only until the
+			// body's retryAfterMs — never the Pacific-midnight lock — and
+			// never invalidate the session (existing sessions keep running).
+			var ice *upstream.IpCappedError
+			if errors.As(err, &ice) {
+				cooldownIpCapped(lease, ice)
 			}
 			release()
 			return nil, nil, err
@@ -2173,6 +2196,8 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var uwr *upstream.WaitingRoomError
 	var ue *upstream.UpstreamError
 	var rle *upstream.RateLimitError
+	var ice *upstream.IpCappedError
+	var sle *upstream.SessionLimitError
 	var be *upstream.BanError
 	var cbe *upstream.CountryBlockedError
 	var ce *upstream.CreditsError
@@ -2191,6 +2216,22 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		}
 		if retryAfter < 0 {
 			retryAfter = 0
+		}
+	case errors.As(err, &ice):
+		// ip_capped: admission-only (too many distinct users on the egress
+		// IP) — 429, not the quota 429, with the body's retryAfterMs only.
+		status, code = http.StatusTooManyRequests, "ip_capped"
+		message, retryAfter = ice.Error(), ice.RetryAfter
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+	case errors.As(err, &sle):
+		// session_limit_reached (409): the ACCOUNT is over its concurrent-tab
+		// budget; this session's row is fine. Never session-invalid.
+		status, code = http.StatusConflict, "session_limit_reached"
+		message = sle.Body
+		if message == "" {
+			message = "session limit reached"
 		}
 	case errors.As(err, &wr):
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"

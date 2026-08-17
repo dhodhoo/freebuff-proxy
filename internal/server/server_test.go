@@ -176,6 +176,15 @@ func TestChatStream(t *testing.T) {
 			t.Errorf("upstream body missing %s: %s", want, recorded)
 		}
 	}
+	// #80: trace_session_id is minted once per run and threaded through the
+	// lease into the envelope; client_id is stable per run (derived from the
+	// run id), not a fresh per-request draw.
+	if !strings.Contains(recorded, `"trace_session_id":"`) {
+		t.Errorf("upstream body missing trace_session_id: %s", recorded)
+	}
+	if !strings.Contains(recorded, `"client_id":"run:run-0001"`) {
+		t.Errorf("upstream body missing stable client_id run:run-0001: %s", recorded)
+	}
 }
 
 func TestChatNonStream(t *testing.T) {

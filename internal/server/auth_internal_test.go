@@ -376,3 +376,63 @@ func TestWriteFileAtomicFailurePreservesTarget(t *testing.T) {
 	}
 	assertNoTmpFiles(t, dir, ".env")
 }
+
+// ── Wave 1 issue tests (#81, #82, #76) ───────────────────────────────────
+
+// TestWriteErrorIpCappedAndSessionLimit verifies the writeError mappings for
+// the wave-1 typed errors: ip_capped surfaces 429 with code "ip_capped"
+// (never the quota "rate_limited"), and session_limit_reached surfaces 409
+// with its code (never session-invalid).
+func TestWriteErrorIpCappedAndSessionLimit(t *testing.T) {
+	t.Run("ip capped 429", func(t *testing.T) {
+		err := &upstream.IpCappedError{ActiveUsersForIP: 5, Limit: 4, RetryAfter: 45 * time.Second, Body: `{"status":"ip_capped"}`}
+		status, body := errorResponse(t, err)
+		if status != http.StatusTooManyRequests {
+			t.Errorf("status = %d, want 429", status)
+		}
+		if body.Error.Code != "ip_capped" {
+			t.Errorf("code = %q, want ip_capped (not rate_limited)", body.Error.Code)
+		}
+		if !strings.Contains(body.Error.Message, "retry after 45s") {
+			t.Errorf("message = %q, want bounded Retry-After detail", body.Error.Message)
+		}
+	})
+	t.Run("session limit reached 409", func(t *testing.T) {
+		err := &upstream.SessionLimitError{Status: http.StatusConflict, Body: `{"error":{"code":"session_limit_reached"}}`}
+		status, body := errorResponse(t, err)
+		if status != http.StatusConflict {
+			t.Errorf("status = %d, want 409", status)
+		}
+		if body.Error.Code != "session_limit_reached" {
+			t.Errorf("code = %q, want session_limit_reached", body.Error.Code)
+		}
+		if body.Error.Message != `{"error":{"code":"session_limit_reached"}}` {
+			t.Errorf("message = %q, want upstream body verbatim", body.Error.Message)
+		}
+	})
+}
+
+// TestQuotaSummaryTierAndGlmPromo verifies #76: quotaSummary surfaces the
+// account tier and glmPromo from a probe response carrying the unused rate
+// limits, and still returns "" when the response has no quota data.
+func TestQuotaSummaryTierAndGlmPromo(t *testing.T) {
+	if got := quotaSummary(nil); got != "" {
+		t.Errorf("quotaSummary(nil) = %q, want empty", got)
+	}
+	if got := quotaSummary(&upstream.SessionState{}); got != "" {
+		t.Errorf("quotaSummary(no data) = %q, want empty", got)
+	}
+	st := &upstream.SessionState{
+		AccessTier: "limited",
+		GlmPromo:   `{"dailySessions":2,"endsAt":"2026-08-20T07:00:00.000Z"}`,
+		RateLimitsByModel: map[string]upstream.ModelQuota{
+			"deepseek/deepseek-v4-flash": {Model: "deepseek/deepseek-v4-flash", Limit: 6, RecentCount: 2, Period: "pacific_day", ResetAt: time.Date(2026, 8, 18, 7, 0, 0, 0, time.UTC)},
+		},
+	}
+	got := quotaSummary(st)
+	for _, want := range []string{"tier limited", "deepseek/deepseek-v4-flash 6/2 pacific_day", "glmPromo", "dailySessions"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("quotaSummary = %q, missing %q", got, want)
+		}
+	}
+}

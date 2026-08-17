@@ -2372,3 +2372,120 @@ func TestUsageAccountingConcurrentTokenMutation(t *testing.T) {
 	}
 	t.Logf("hammer: attempts=%d success=%d failure=%d capped429=%d", attempts, success, failure, capped429)
 }
+
+// ── Wave 1 issue tests (#81, #77) ────────────────────────────────────────
+
+// TestAcquireIpCappedCooldownBounded verifies #81: an ip_capped admission
+// refusal surfaces the distinct IpCappedError and cools the token ONLY until
+// the body's retryAfterMs — never the Pacific-midnight quota lock — and the
+// remembered error keeps surfacing 429 ip_capped during the window.
+func TestAcquireIpCappedCooldownBounded(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"status":"ip_capped","activeUsersForIp":7,"limit":4,"retryAfterMs":45000}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ended"}`)
+	}
+	p := newTestPool(t, mock)
+
+	_, err := p.Acquire(context.Background(), modelA)
+	if errors.Is(err, upstream.ErrRateLimited) {
+		t.Fatal("ip_capped surfaced as ErrRateLimited, want distinct ErrIpCapped")
+	}
+	var ice *upstream.IpCappedError
+	if !errors.As(err, &ice) {
+		t.Fatalf("want *upstream.IpCappedError, got %v", err)
+	}
+	if !errors.Is(err, upstream.ErrIpCapped) {
+		t.Error("not unwrap-able to ErrIpCapped")
+	}
+	if ice.ActiveUsersForIP != 7 || ice.Limit != 4 {
+		t.Errorf("IpCappedError = %+v, want ActiveUsersForIP 7 limit 4", ice)
+	}
+	if ice.RetryAfter != 45*time.Second {
+		t.Errorf("RetryAfter = %s, want 45s (bounded to retryAfterMs)", ice.RetryAfter)
+	}
+
+	// Cooldown is bounded to the retry window, NOT the Pacific midnight
+	// quota lock (which would be many hours away).
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.IsZero() {
+		t.Fatal("CooldownUntil zero, want bounded window")
+	}
+	want := time.Now().Add(45 * time.Second)
+	diff := snap.CooldownUntil.Sub(want)
+	if diff < -2*time.Second || diff > 2*time.Second {
+		t.Errorf("CooldownUntil = %v, want ≈ now+45s (bounded), not Pacific midnight", snap.CooldownUntil)
+	}
+
+	// While the window is active, a second acquire surfaces the remembered
+	// ip_capped error (not a generic cooldown 502).
+	_, err = p.Acquire(context.Background(), modelA)
+	var ice2 *upstream.IpCappedError
+	if !errors.As(err, &ice2) {
+		t.Fatalf("second acquire: want *upstream.IpCappedError, got %v", err)
+	}
+}
+
+// TestPoolCooldownTokenIpCappedBounded verifies the pool-level cooldown
+// entry point (used by the server's chat-path recovery) bounds the window
+// to the error's RetryAfter only.
+func TestPoolCooldownTokenIpCappedBounded(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	p.CooldownTokenIpCapped(0, &upstream.IpCappedError{RetryAfter: 30 * time.Second, ActiveUsersForIP: 5, Limit: 4})
+	snap := p.Snapshot()[0]
+	if snap.CooldownUntil.IsZero() {
+		t.Fatal("CooldownUntil zero, want bounded window")
+	}
+	want := time.Now().Add(30 * time.Second)
+	diff := snap.CooldownUntil.Sub(want)
+	if diff < -2*time.Second || diff > 2*time.Second {
+		t.Errorf("CooldownUntil = %v, want ≈ now+30s (bounded), not Pacific midnight", snap.CooldownUntil)
+	}
+
+	// Out-of-range tokens are ignored without panicking.
+	p.CooldownTokenIpCapped(99, &upstream.IpCappedError{RetryAfter: time.Second})
+	p.CooldownTokenIpCapped(-1, &upstream.IpCappedError{RetryAfter: time.Second})
+	p.CooldownTokenIpCapped(0, nil)
+}
+
+// TestMaintainTickSkipsHeartbeatWhileChatInFlight verifies #77: the maintain
+// loop skips the session poll/heartbeat GETs while any run holds an
+// in-flight lease (a poll landing mid-chat can kick the active session with
+// 428), and resumes them once the lease drains.
+func TestMaintainTickSkipsHeartbeatWhileChatInFlight(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// Admit an active session; the lease holds InflightCount() > 0.
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease == nil || lease.Run == nil {
+		t.Fatal("nil lease/run")
+	}
+
+	before := mock.SessionPolls
+	p.maintainTick(context.Background())
+	if got := mock.SessionPolls; got != before {
+		t.Errorf("session polls during in-flight chat = %d, want %d (heartbeat/advance skipped)", got, before)
+	}
+
+	// Release the lease: the next maintain pass heartbeats again.
+	p.LeaseRelease(lease)
+	p.maintainTick(context.Background())
+	if got := mock.SessionPolls; got <= before {
+		t.Errorf("session polls after release = %d, want > %d (heartbeat resumed)", got, before)
+	}
+}

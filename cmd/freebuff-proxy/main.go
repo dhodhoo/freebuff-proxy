@@ -165,6 +165,14 @@ func main() {
 			}
 		}
 	}
+	// Per-proxy health (#88): one registry shared by the health checker
+	// loop and every pooled client's SOCKS5 dialer (degraded proxies are
+	// skipped by the fallback). nil when no SOCKS5_PROXIES are configured.
+	var proxyHealth *egress.ProxyHealth
+	if len(cfg.SOCKS5Proxies) > 0 {
+		proxyHealth = egress.NewProxyHealth(cfg.ProxyHealthMaxFailures)
+	}
+
 	clients := make([]*upstream.Client, 0, len(cfg.AuthTokens))
 	sessions := make([]*session.Manager, 0, len(cfg.AuthTokens))
 	for i, token := range cfg.AuthTokens {
@@ -173,6 +181,9 @@ func main() {
 			logger.Error("failed to build upstream client", "err", err)
 			holdForExitIfConsole()
 			os.Exit(1)
+		}
+		if proxyHealth != nil {
+			client.SetProxyHealth(proxyHealth)
 		}
 		clients = append(clients, client)
 		sessions = append(sessions, session.NewManagerWithStore(client, store))
@@ -200,6 +211,17 @@ func main() {
 	if paths := egressPaths(&cfg, logger); len(paths) > 0 {
 		go egress.RunLoop(ctx, logger, egressCache, paths, egress.ProbeTimeout, egress.DefaultTTL)
 		logger.Info("egress probes started", "paths", len(paths))
+	}
+
+	// Per-proxy health checking (#88): probes every configured SOCKS5 proxy
+	// on PROXY_HEALTH_INTERVAL and marks it out-of-rotation after
+	// PROXY_HEALTH_MAX_FAILURES consecutive failures; the pooled clients'
+	// dialers skip degraded proxies. Stops with ctx (shutdown).
+	if proxyHealth != nil && len(cfg.SOCKS5Proxies) > 0 {
+		go egress.RunHealthLoop(ctx, logger, proxyHealth, cfg.SOCKS5Proxies,
+			cfg.ProxyHealthInterval, egress.ProbeTimeout, 0)
+		logger.Info("proxy health checks started", "proxies", len(cfg.SOCKS5Proxies),
+			"interval", cfg.ProxyHealthInterval.String(), "max_failures", cfg.ProxyHealthMaxFailures)
 	}
 
 	srv := server.New(&cfg, p, reg, logger, logringHandler, *configPath)
@@ -232,6 +254,9 @@ func main() {
 		"log_level", level.String(),
 		"verbose", *verbose,
 	)
+	if cfg.UserID != "" {
+		logger.Info("acting user id set — x-freebuff-acting-user-id will be sent on chat calls", "user_id", cfg.UserID)
+	}
 	// /admin/reload and the admin dashboard are open in default deployments
 	// (no API_KEYS, or bridge mode): warn loudly so operators can decide
 	// whether to set ADMIN_TOKEN.
