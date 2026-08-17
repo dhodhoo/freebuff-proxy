@@ -1772,4 +1772,3 @@ func TestBearerCaseInsensitiveVariants(t *testing.T) {
 		}
 	})
 }
-
