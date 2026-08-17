@@ -1890,7 +1890,7 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 			}
 			phases.Since(phasetiming.TotalMS, start)
 			s.logger.Info(kind+" request refused", "model", model, "reason", "model_limited_on_egress", "until", until.Format(time.RFC3339))
-			var refuseErr error = upstream.ErrModelIPLimited
+			var refuseErr = upstream.ErrModelIPLimited
 			if lie != nil {
 				refuseErr = lie
 			}
