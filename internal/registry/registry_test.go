@@ -28,27 +28,23 @@ func fileSource(t *testing.T, path string) string {
 	return "file:///" + filepath.ToSlash(abs)
 }
 
-// expectedFallback is the model→agent map the JS fallback table (lines
-// 14-41) must produce: first-seen assignment in entry order, so the five
-// base2-free models belong to base2-free (not their dedicated one-model
-// agents), and the gemini helper models belong to file-picker / file-picker-max
-// (which precede file-lister / researcher-* / basher).
+// expectedFallback is the model→agent map the pruned fallback table (based
+// on registry.js lines 14-41, minus the rows upstream retired from
+// FREE_MODE_AGENT_MODELS) must produce: first-seen assignment in entry order,
+// so the five base2-free models belong to base2-free (not their dedicated
+// one-model agents), and the gemini helper models belong to file-picker /
+// file-picker-max (which precede file-lister / researcher-* / basher).
 var expectedFallback = map[string]string{
-	"deepseek/deepseek-v4-pro":         "base2-free",
-	"deepseek/deepseek-v4-flash":       "base2-free",
-	"minimax/minimax-m3":               "base2-free",
-	"openai/gpt-5.6-luna":              "base2-free",
-	"mimo/mimo-v2.5":                   "base2-free",
-	"z-ai/glm-5.2":                     "base2-free-glm",
-	"poolside/laguna-s-2.1":            "base2-free-laguna-s-2-1",
-	"openrouter/poolside/laguna-s-2.1": "base2-free-laguna-s-2-1-openrouter",
-	"inclusionai/ling-3.0-flash:free":  "base2-free-ling-3-flash",
-	"crof/greg-2-ultra":                "base2-free-greg-2-ultra",
-	"crof/greg-2-super":                "base2-free-greg-2-super",
-	"anthropic/claude-fable-5":         "base2-free-fable",
-	"google/gemini-2.5-flash-lite":     "file-picker",
-	"google/gemini-3.1-flash-lite":     "file-picker-max",
-	"google/gemini-3.5-flash-lite":     "file-picker-max",
+	"deepseek/deepseek-v4-pro":     "base2-free",
+	"deepseek/deepseek-v4-flash":   "base2-free",
+	"minimax/minimax-m3":           "base2-free",
+	"openai/gpt-5.6-luna":          "base2-free",
+	"mimo/mimo-v2.5":               "base2-free",
+	"z-ai/glm-5.2":                 "base2-free-glm",
+	"anthropic/claude-fable-5":     "base2-free-fable",
+	"google/gemini-2.5-flash-lite": "file-picker",
+	"google/gemini-3.1-flash-lite": "file-picker-max",
+	"google/gemini-3.5-flash-lite": "file-picker-max",
 }
 
 func TestFallbackMap(t *testing.T) {
@@ -96,6 +92,42 @@ func TestFallbackMap(t *testing.T) {
 
 	if _, err := r.AgentForModel("does/not-exist"); !errors.Is(err, ErrModelNotFound) {
 		t.Errorf("unknown model err = %v, want ErrModelNotFound", err)
+	}
+}
+
+// TestFallbackPrunesRetiredModels guards issue #121: the offline fallback
+// must not advertise model ids upstream retired from FREE_MODE_AGENT_MODELS.
+// Advertising them surfaces dead ids via /v1/models and trips upstream
+// 403 free_mode_invalid_agent_model.
+func TestFallbackPrunesRetiredModels(t *testing.T) {
+	r := New(nil, nil)
+	r.LoadFallback()
+
+	tests := []struct {
+		model string
+		agent string
+	}{
+		{model: "poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1"},
+		{model: "openrouter/poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1-openrouter"},
+		{model: "inclusionai/ling-3.0-flash:free", agent: "base2-free-ling-3-flash"},
+		{model: "crof/greg-2-ultra", agent: "base2-free-greg-2-ultra"},
+		{model: "crof/greg-2-super", agent: "base2-free-greg-2-super"},
+	}
+
+	models := r.Models()
+	agentIDs := r.AgentIDs()
+	for _, tc := range tests {
+		t.Run(tc.model, func(t *testing.T) {
+			if _, err := r.AgentForModel(tc.model); !errors.Is(err, ErrModelNotFound) {
+				t.Errorf("AgentForModel(%q) err = %v, want ErrModelNotFound", tc.model, err)
+			}
+			if contains(models, tc.model) {
+				t.Errorf("Models() still advertises retired model %q", tc.model)
+			}
+			if contains(agentIDs, tc.agent) {
+				t.Errorf("AgentIDs() still lists retired agent %q", tc.agent)
+			}
+		})
 	}
 }
 

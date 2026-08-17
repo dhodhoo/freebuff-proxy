@@ -603,8 +603,12 @@ func TestModelsEndpoint(t *testing.T) {
 	if out.Object != "list" {
 		t.Errorf("object = %q, want list", out.Object)
 	}
-	if len(out.Data) < 15 {
-		t.Errorf("models = %d, want >= 15", len(out.Data))
+	// Floor matches the pruned offline fallback table (10 models after the
+	// upstream-retired rows were dropped, see internal/registry
+	// expectedFallback): guards against the endpoint serving an empty
+	// registry, not against future upstream additions.
+	if len(out.Data) < 10 {
+		t.Errorf("models = %d, want >= 10", len(out.Data))
 	}
 	for i, m := range out.Data {
 		if m.ID == "" || m.Object != "model" || m.OwnedBy == "" {
@@ -649,8 +653,10 @@ func TestHealthz(t *testing.T) {
 	if out.UptimeSeconds < 0 {
 		t.Errorf("uptime_seconds = %v, want >= 0", out.UptimeSeconds)
 	}
-	if out.Models < 15 {
-		t.Errorf("models = %d, want >= 15", out.Models)
+	// Same floor as TestModelsEndpoint: the pruned offline fallback has 10
+	// models.
+	if out.Models < 10 {
+		t.Errorf("models = %d, want >= 10", out.Models)
 	}
 	if len(out.Tokens) != 2 {
 		t.Errorf("tokens = %d, want 2", len(out.Tokens))
