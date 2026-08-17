@@ -553,6 +553,46 @@ func SanitizeChunk(line []byte) ([]byte, bool) {
 
 // sanitizeChunk implements the per-chunk cleanup; returns nil to drop.
 func sanitizeChunk(chunk map[string]any) map[string]any {
+	if errVal, hasErr := chunk["error"]; hasErr && errVal != nil {
+		clean := make(map[string]any, 5)
+		if id, ok := chunk["id"].(string); ok && id != "" {
+			clean["id"] = id
+		}
+		if obj, ok := chunk["object"].(string); ok && obj != "" {
+			clean["object"] = obj
+		}
+		if created, ok := numInt64(chunk["created"]); ok && created > 0 {
+			clean["created"] = created
+		}
+		if model, ok := chunk["model"].(string); ok && model != "" {
+			clean["model"] = model
+		}
+		if errMap, ok := errVal.(map[string]any); ok {
+			cleanErr := make(map[string]any, len(errMap))
+			for k, v := range errMap {
+				cleanErr[k] = v
+			}
+			if _, ok := cleanErr["message"]; !ok {
+				cleanErr["message"] = "upstream error"
+			}
+			if _, ok := cleanErr["type"]; !ok {
+				cleanErr["type"] = "upstream_error"
+			}
+			clean["error"] = cleanErr
+		} else if errStr, ok := errVal.(string); ok {
+			clean["error"] = map[string]any{
+				"message": errStr,
+				"type":    "upstream_error",
+			}
+		} else {
+			clean["error"] = map[string]any{
+				"message": fmt.Sprintf("%v", errVal),
+				"type":    "upstream_error",
+			}
+		}
+		return clean
+	}
+
 	clean := make(map[string]any, 5)
 	if id, ok := chunk["id"].(string); ok && id != "" {
 		clean["id"] = id
@@ -714,6 +754,16 @@ func (a *Accumulator) Add(line []byte) error {
 	if err := json.Unmarshal(data, &chunk); err != nil {
 		return fmt.Errorf("convert: invalid chunk JSON: %w", err)
 	}
+	if errVal, ok := chunk["error"]; ok && errVal != nil {
+		if errMap, ok := errVal.(map[string]any); ok {
+			if msg, ok := errMap["message"].(string); ok && msg != "" {
+				return fmt.Errorf("upstream error: %s", msg)
+			}
+		} else if errStr, ok := errVal.(string); ok && errStr != "" {
+			return fmt.Errorf("upstream error: %s", errStr)
+		}
+		return fmt.Errorf("upstream error: %v", errVal)
+	}
 	a.accumulate(chunk)
 	return nil
 }
@@ -810,7 +860,11 @@ func (a *Accumulator) Finish() []byte {
 	}
 	finish := a.finishReason
 	if finish == "" {
-		finish = "stop"
+		if len(a.toolCalls) > 0 {
+			finish = "tool_calls"
+		} else {
+			finish = "stop"
+		}
 	}
 	resp := map[string]any{
 		"id":      a.id,

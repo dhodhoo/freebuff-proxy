@@ -1301,6 +1301,15 @@ func ensureCliSystemMarker(payload map[string]any) {
 			if content, ok := msg["content"].(string); ok && strings.Contains(content, cliSystemMarkerPhrase) {
 				return // already present
 			}
+			if parts, ok := msg["content"].([]any); ok {
+				for _, p := range parts {
+					if partMap, ok := p.(map[string]any); ok {
+						if txt, ok := partMap["text"].(string); ok && strings.Contains(txt, cliSystemMarkerPhrase) {
+							return // already present
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -1311,12 +1320,14 @@ func ensureCliSystemMarker(payload map[string]any) {
 			continue
 		}
 		if msg["role"] == "system" {
-			if content, ok := msg["content"].(string); ok {
-				if content == "" {
+			if str, ok := msg["content"].(string); ok {
+				if str == "" {
 					msg["content"] = cliSystemMarker
 				} else {
-					msg["content"] = cliSystemMarker + "\n\n" + content
+					msg["content"] = cliSystemMarker + "\n\n" + str
 				}
+			} else if parts, ok := msg["content"].([]any); ok {
+				msg["content"] = append([]any{map[string]any{"type": "text", "text": cliSystemMarker}}, parts...)
 			} else {
 				msg["content"] = cliSystemMarker
 			}

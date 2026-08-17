@@ -449,20 +449,20 @@ func TestMetricsEmptyPool(t *testing.T) {
 	}
 }
 
-// TestAuthSchemeCaseSensitive pins the Authorization scheme check: only the
-// exact "Bearer " prefix is recognized, so a lowercase "bearer " falls
-// through to the (absent) x-api-key and is rejected with 401 — and an empty
-// Bearer value is also rejected.
-func TestAuthSchemeCaseSensitive(t *testing.T) {
+// TestAuthSchemeCaseInsensitive pins the Authorization scheme check: case-insensitive
+// "Bearer " / "bearer " / "BEARER " prefix is recognized (RFC 7235 / RFC 6750),
+// while an empty value or missing space is rejected with 401.
+func TestAuthSchemeCaseInsensitive(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	ts, _ := newTestServer(t, []string{"sk-test"}, mock)
 	chatURL := ts.URL + "/v1/chat/completions"
 
 	for _, hdr := range []map[string]string{
-		{"Authorization": "bearer sk-test"}, // lowercase scheme
-		{"Authorization": "Bearer "},        // empty value
-		{"Authorization": "Bearer"},         // no space after scheme
+		{"Authorization": "Bearer "}, // empty value
+		{"Authorization": "bearer "}, // lowercase empty value
+		{"Authorization": "Bearer"},  // no space after scheme
+		{"Authorization": "Basic sk-test"},
 	} {
 		resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), hdr)
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -470,10 +470,17 @@ func TestAuthSchemeCaseSensitive(t *testing.T) {
 		}
 	}
 
-	// The exact scheme + value still passes.
-	resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": "Bearer sk-test"})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("exact Bearer status = %d, want 200: %s", resp.StatusCode, data)
+	// Case variations of Bearer scheme + value pass.
+	for _, hdr := range []map[string]string{
+		{"Authorization": "Bearer sk-test"},
+		{"Authorization": "bearer sk-test"},
+		{"Authorization": "BEARER sk-test"},
+		{"Authorization": "bEaReR sk-test"},
+	} {
+		resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), hdr)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("scheme %v status = %d, want 200: %s", hdr, resp.StatusCode, data)
+		}
 	}
 }
 

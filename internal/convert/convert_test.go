@@ -617,6 +617,39 @@ func TestSanitizeChunk(t *testing.T) {
 		}
 	})
 
+	t.Run("preserves in-band error chunk with map", func(t *testing.T) {
+		out, drop := SanitizeChunk([]byte(`{"id":"c1","error":{"message":"quota exceeded","type":"insufficient_quota","code":"quota_exceeded"}}`))
+		if drop {
+			t.Fatal("error chunk dropped")
+		}
+		got := decode(t, out)
+		if got["id"] != "c1" {
+			t.Fatalf("id = %v, want c1", got["id"])
+		}
+		errObj, ok := got["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("error object = %v, want map", got["error"])
+		}
+		if errObj["message"] != "quota exceeded" || errObj["type"] != "insufficient_quota" || errObj["code"] != "quota_exceeded" {
+			t.Fatalf("error obj mangled: %v", errObj)
+		}
+	})
+
+	t.Run("preserves in-band error chunk with string", func(t *testing.T) {
+		out, drop := SanitizeChunk([]byte(`{"error":"upstream stream interrupted"}`))
+		if drop {
+			t.Fatal("error chunk with string dropped")
+		}
+		got := decode(t, out)
+		errObj, ok := got["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("error object = %v, want map", got["error"])
+		}
+		if errObj["message"] != "upstream stream interrupted" || errObj["type"] != "upstream_error" {
+			t.Fatalf("error obj mangled: %v", errObj)
+		}
+	})
+
 	t.Run("malformed and non-JSON lines dropped", func(t *testing.T) {
 		for _, line := range []string{`{bad`, `data: {bad`, `hello`, `data: `, `: keep-alive`, ``} {
 			out, drop := SanitizeChunk([]byte(line))
@@ -770,6 +803,57 @@ func TestAccumulator(t *testing.T) {
 		out := decode(t, a.Finish())
 		if msg := out["choices"].([]any)[0].(map[string]any)["message"].(map[string]any); msg["content"] != "" {
 			t.Fatalf("content = %v", msg["content"])
+		}
+	})
+
+	t.Run("error chunk in stream returns descriptive error", func(t *testing.T) {
+		a := NewAccumulator()
+		err := a.Add([]byte(`{"error":{"message":"token rate limit reached","type":"rate_limit"}}`))
+		if err == nil {
+			t.Fatal("expected error for error chunk")
+		}
+		if !strings.Contains(err.Error(), "token rate limit reached") {
+			t.Fatalf("error %v does not contain message", err)
+		}
+
+		a2 := NewAccumulator()
+		err2 := a2.Add([]byte(`{"error":"context window exceeded"}`))
+		if err2 == nil {
+			t.Fatal("expected error for string error chunk")
+		}
+		if !strings.Contains(err2.Error(), "context window exceeded") {
+			t.Fatalf("error %v does not contain message", err2)
+		}
+	})
+
+	t.Run("finish reason defaults to tool_calls when tool calls present without finish_reason", func(t *testing.T) {
+		a := NewAccumulator()
+		for _, line := range []string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"calc","arguments":"{}"}}]}}]}`,
+		} {
+			if err := a.Add([]byte(line)); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+		}
+		out := decode(t, a.Finish())
+		if fr := out["choices"].([]any)[0].(map[string]any)["finish_reason"]; fr != "tool_calls" {
+			t.Fatalf("finish_reason = %v, want tool_calls", fr)
+		}
+	})
+
+	t.Run("finish reason preserves explicit non-empty reason when tool calls present", func(t *testing.T) {
+		a := NewAccumulator()
+		for _, line := range []string{
+			`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"calc","arguments":"{}"}}]}}]}`,
+			`{"choices":[{"index":0,"finish_reason":"length"}]}`,
+		} {
+			if err := a.Add([]byte(line)); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+		}
+		out := decode(t, a.Finish())
+		if fr := out["choices"].([]any)[0].(map[string]any)["finish_reason"]; fr != "length" {
+			t.Fatalf("finish_reason = %v, want length", fr)
 		}
 	})
 }

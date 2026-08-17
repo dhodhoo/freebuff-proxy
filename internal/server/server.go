@@ -255,14 +255,25 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// extractBearerToken extracts the token from an Authorization header if it has
+// a case-insensitive "Bearer " prefix (per RFC 7235 / RFC 6750). Returns the
+// trimmed token and true if the prefix matches, or ("", false) otherwise.
+func extractBearerToken(authHeader string) (string, bool) {
+	authHeader = strings.TrimSpace(authHeader)
+	if len(authHeader) >= 7 && strings.EqualFold(authHeader[:7], "bearer ") {
+		return strings.TrimSpace(authHeader[7:]), true
+	}
+	return "", false
+}
+
 // authorized reports whether the request carries a configured API key,
 // either as "Authorization: Bearer <key>" or "x-api-key: <key>". Comparison
 // is constant-time against every configured key.
 func (s *Server) authorized(r *http.Request) bool {
 	cfg := s.cfg.Load()
 	provided := ""
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		provided = strings.TrimPrefix(h, "Bearer ")
+	if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+		provided = tok
 	} else if h := r.Header.Get("x-api-key"); h != "" {
 		provided = h
 	}
@@ -290,8 +301,8 @@ func (s *Server) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		provided := ""
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			provided = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+			provided = tok
 		}
 		if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.AdminToken)) != 1 {
 			s.writeJSONError(w, http.StatusUnauthorized,
@@ -1341,8 +1352,8 @@ func writeFileAtomic(path string, data []byte) error {
 // this token IS the client's FreeBuff token relayed upstream.
 func clientToken(r *http.Request) string {
 	provided := ""
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		provided = strings.TrimPrefix(h, "Bearer ")
+	if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+		provided = tok
 	} else if h := r.Header.Get("x-api-key"); h != "" {
 		provided = h
 	}
@@ -1354,11 +1365,10 @@ func clientToken(r *http.Request) string {
 // FreeBuff token) and pooled traffic (no bearer; x-api-key is the API_KEYS
 // scheme and must never be relayed upstream as a FreeBuff credential).
 func bearerToken(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if !strings.HasPrefix(h, "Bearer ") {
-		return ""
+	if tok, ok := extractBearerToken(r.Header.Get("Authorization")); ok {
+		return tok
 	}
-	return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	return ""
 }
 
 // --- chat ---

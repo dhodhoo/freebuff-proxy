@@ -24,6 +24,34 @@ import (
 // real constants, so the lockout bound and map cap cannot drift from the
 // public behavior the dashboard_test.go rate-limit test depends on.
 
+func TestExtractBearerToken(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantToken string
+		wantOK    bool
+	}{
+		{"Bearer test-tok", "test-tok", true},
+		{"bearer test-tok", "test-tok", true},
+		{"BEARER test-tok", "test-tok", true},
+		{"bEaReR test-tok", "test-tok", true},
+		{"  bearer  test-tok  ", "test-tok", true},
+		{"Bearer ", "", false},
+		{"bearer   ", "", false},
+		{"Bearer", "", false},
+		{"bearer", "", false},
+		{"Basic test-tok", "", false},
+		{"", "", false},
+		{"x-api-key test-tok", "", false},
+	}
+	for _, tt := range tests {
+		gotToken, gotOK := extractBearerToken(tt.input)
+		if gotToken != tt.wantToken || gotOK != tt.wantOK {
+			t.Errorf("extractBearerToken(%q) = (%q, %v), want (%q, %v)",
+				tt.input, gotToken, gotOK, tt.wantToken, tt.wantOK)
+		}
+	}
+}
+
 func TestAdminAuthLockoutBound(t *testing.T) {
 	a := newAdminAuth()
 	// maxLoginFails wrong attempts fill the counter; the next allow() must

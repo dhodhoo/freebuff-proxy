@@ -1716,3 +1716,60 @@ func TestBridgeRequestsServedCounter(t *testing.T) {
 		t.Fatalf("RequestsServed = %d, want 3 (bridge chats must count)", got)
 	}
 }
+
+// TestBearerCaseInsensitiveVariants verifies lowercase bearer and mixed-case BEARER
+// work for API authentication, admin endpoints, and bridge token extraction.
+func TestBearerCaseInsensitiveVariants(t *testing.T) {
+	t.Run("API auth accepts case variations", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		ts, _ := newTestServer(t, []string{"sk-test"}, mock)
+		chatURL := ts.URL + "/v1/chat/completions"
+
+		for _, auth := range []string{
+			"Bearer sk-test",
+			"bearer sk-test",
+			"BEARER sk-test",
+			"bEaReR sk-test",
+		} {
+			resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": auth})
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("auth %q status = %d, want 200: %s", auth, resp.StatusCode, data)
+			}
+		}
+	})
+
+	t.Run("admin reload accepts case variations", func(t *testing.T) {
+		for _, auth := range []string{
+			"bearer admin-secret",
+			"BEARER admin-secret",
+		} {
+			mock := testutil.NewMock()
+			ts, _ := newTestServerCfg(t, nil, func(cfg *config.Config) { cfg.AdminToken = "admin-secret" }, mock)
+			resp, data := doJSON(t, http.MethodPost, ts.URL+"/admin/reload", nil, map[string]string{"Authorization": auth})
+			mock.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("admin auth %q status = %d, want 200: %s", auth, resp.StatusCode, data)
+			}
+		}
+	})
+
+	t.Run("bridge mode token extraction accepts case variations", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-b3", 1, `"choices":[{"index":0,"delta":{"content":"bridged"},"finish_reason":null}]`))
+		ts, _ := newBridgeTestServer(t, mock)
+		chatURL := ts.URL + "/v1/chat/completions"
+
+		for _, auth := range []string{
+			"bearer client-tok-lower",
+			"BEARER client-tok-upper",
+		} {
+			resp, data := doJSON(t, http.MethodPost, chatURL, chatBody(modelA), map[string]string{"Authorization": auth})
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("bridge auth %q status = %d, want 200: %s", auth, resp.StatusCode, data)
+			}
+		}
+	})
+}
+

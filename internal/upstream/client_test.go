@@ -2434,7 +2434,7 @@ func TestEnsureCliSystemMarkerBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("marker already present is untouched", func(t *testing.T) {
+	t.Run("marker already present in string is untouched", func(t *testing.T) {
 		content := cliSystemMarker + "\n\nextra instructions"
 		p := map[string]any{"messages": []any{
 			map[string]any{"role": "system", "content": content},
@@ -2450,9 +2450,65 @@ func TestEnsureCliSystemMarkerBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("non-string system content replaced", func(t *testing.T) {
+	t.Run("marker already present in structured parts is untouched", func(t *testing.T) {
+		parts := []any{
+			map[string]any{"type": "text", "text": cliSystemMarker + " customized"},
+		}
 		p := map[string]any{"messages": []any{
-			map[string]any{"role": "system", "content": []any{"structured"}},
+			map[string]any{"role": "system", "content": parts},
+			map[string]any{"role": "user", "content": "hi"},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("messages = %v, want unchanged length", msgs)
+		}
+		gotParts, ok := msgs[0].(map[string]any)["content"].([]any)
+		if !ok || len(gotParts) != 1 {
+			t.Fatalf("structured parts modified: %v", gotParts)
+		}
+		if gotParts[0].(map[string]any)["text"] != cliSystemMarker+" customized" {
+			t.Errorf("structured text modified: %v", gotParts[0])
+		}
+	})
+
+	t.Run("structured system content array prepends marker", func(t *testing.T) {
+		originalParts := []any{
+			map[string]any{"type": "text", "text": "custom instructions"},
+			map[string]any{"type": "text", "text": "more instructions"},
+		}
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": originalParts},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		parts, ok := msgs[0].(map[string]any)["content"].([]any)
+		if !ok || len(parts) != 3 {
+			t.Fatalf("system parts = %v, want 3 parts with marker prepended", msgs[0])
+		}
+		markerPart, ok := parts[0].(map[string]any)
+		if !ok || markerPart["type"] != "text" || markerPart["text"] != cliSystemMarker {
+			t.Errorf("marker part = %v, want text type with CLI marker", parts[0])
+		}
+		if parts[1].(map[string]any)["text"] != "custom instructions" || parts[2].(map[string]any)["text"] != "more instructions" {
+			t.Errorf("original parts lost: %v", parts)
+		}
+	})
+
+	t.Run("non-string non-array system content replaced", func(t *testing.T) {
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": 12345},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if got := msgs[0].(map[string]any)["content"]; got != cliSystemMarker {
+			t.Errorf("system content = %v, want the CLI marker", got)
+		}
+	})
+
+	t.Run("empty string system content replaced with marker", func(t *testing.T) {
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": ""},
 		}}
 		ensureCliSystemMarker(p)
 		msgs := p["messages"].([]any)
