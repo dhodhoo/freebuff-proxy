@@ -68,7 +68,32 @@ and use GitHub's private vulnerability reporting.
   - `chore(scope): ...`: maintenance, tooling, deps, docs meta
   - `docs: ...`: documentation changes only
 
-  One logical change per commit.
+  One logical change per commit. The subject is a sentence that states the
+  outcome; the body says why. A commit that only lists what the diff already
+  shows adds nothing. Format:
+
+  ```
+  fix(pool): re-read cfg before routing a lease
+
+  The token alias could change between Acquire and the routing decision,
+  so a stale snapshot sent the lease to the wrong upstream model.
+  Re-reading under the lock matches how bridgeMaintain selects.
+  ```
+
+  What belongs in a message:
+
+  - the problem the change solves, with the failure mode if you can name it
+  - the tradeoff you accepted and why
+  - issue references (`Closes #N`) and anything that will surprise the
+    reviewer, like a flag defaulting to off
+
+  What does not:
+
+  - credentials, tokens, or `.env` contents, ever
+  - vendored/generated file noise, reformatting passes, or "fixed lint"
+    as a subject when the diff is the real content
+  - screenshots, logs, or stack traces; link to an artifact if it matters
+  - merge noise. Rebase before merging, not merge commits.
 
 ## What to expect
 
