@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -88,8 +89,48 @@ type Config struct {
 	// reused before a fresh upstream poll (issue #60, SESSION_PROBE_CACHE_TTL
 	// default 15s): heartbeat GETs within the TTL are skipped.
 	SessionProbeCacheTTL time.Duration
-	DiscoveredSource     string // auto-discovered credentials file path (if any)
-	DiscoveredEmail      string // auto-discovered account email (if any)
+	// WebhookURL fires best-effort alert POSTs when the token pool is
+	// exhausted or a token is classified banned (issue #48, WEBHOOK_URL;
+	// empty = disabled). Payload: {"event":"pool_exhausted"|"token_banned",
+	// ...}; at most one POST per event type per 5m; never blocks the
+	// request path.
+	WebhookURL string
+	// FallbackAfter is the queue-wait threshold for model fallback (issue
+	// #100, FALLBACK_AFTER_MS default 10000): when a request's acquire is
+	// answered with a waiting-room/queue delay at least this long AND a
+	// fallback model is configured for the requested model
+	// (FallbackModels), the request is re-routed to the fallback model for
+	// the same token instead of surfacing 503. 0 disables fallback.
+	FallbackAfter time.Duration
+	// FallbackModels maps a requested model to the model served instead
+	// when the queue wait reaches FallbackAfter (issue #100,
+	// FALLBACK_MODEL=model1=fallback1,model2=fallback2). Defaults (applied
+	// only when FALLBACK_MODEL is unset): the premium free-catalog rows
+	// (deepseek-v4-pro, gpt-5.6-luna, minimax-m3, claude-fable-5,
+	// glm-5.2) → deepseek/deepseek-v4-flash, mirroring the CLI's hero flip
+	// to the unlimited flash model once the premium daily pool runs out
+	// (reference freebuff-models.ts getRecommendedFreebuffModelId).
+	FallbackModels map[string]string
+	// AdoptCLISession, when enabled (ADOPT_CLI_SESSION=false default),
+	// makes the proxy behave like the official CLI for a single account:
+	// with AUTH_TOKENS empty the token is sourced from
+	// ~/.config/manicode/credentials.json (same file AUTO_DISCOVER_TOKEN
+	// reads) and every session manager adopts the CLI's ACTIVE session
+	// instance from freebuff-instance-owner.json (re-read before each
+	// refresh); while the CLI process is alive a competing session is
+	// never created (issue #97).
+	AdoptCLISession bool
+	// WaitingRoomChain, when enabled (WAITING_ROOM_CHAIN=false default),
+	// fires the reference ad-chain + streak requests before the next
+	// session create after an upstream 428 waiting_room_required (issue
+	// #94(b), gated stub — best-effort, never blocks the request).
+	WaitingRoomChain bool
+	// EnvFile is the .env path actually loaded ("" when none existed).
+	// Resolved via ResolveEnvFile (issue #39): ./.env in the working
+	// directory wins; otherwise the platform config dir is tried.
+	EnvFile          string
+	DiscoveredSource string // auto-discovered credentials file path (if any)
+	DiscoveredEmail  string // auto-discovered account email (if any)
 }
 
 // BridgeMode reports whether the proxy runs without any AUTH_TOKENS: every
@@ -164,6 +205,11 @@ type rawConfig struct {
 	RunsDrainTTL                     string   `json:"RUNS_DRAIN_TTL"`
 	SessionReAdmitLead               string   `json:"SESSION_RE_ADMIT_LEAD"`
 	SessionProbeCacheTTL             string   `json:"SESSION_PROBE_CACHE_TTL"`
+	WebhookURL                       string   `json:"WEBHOOK_URL"`
+	FallbackAfter                    string   `json:"FALLBACK_AFTER_MS"`
+	FallbackModels                   string   `json:"FALLBACK_MODEL"`
+	AdoptCLISession                  bool     `json:"ADOPT_CLI_SESSION"`
+	WaitingRoomChain                 bool     `json:"WAITING_ROOM_CHAIN"`
 }
 
 func defaultRawConfig() rawConfig {
@@ -197,11 +243,95 @@ func defaultRawConfig() rawConfig {
 		RunsDrainTTL:                     "10m",       // #55: draining-runs TTL eviction
 		SessionReAdmitLead:               "60s",       // #99: pre-emptive re-admit lead
 		SessionProbeCacheTTL:             "15s",       // #60: admission probe cache TTL
+		FallbackAfter:                    "10000",     // #100: queue-wait fallback threshold (ms)
 	}
 }
 
 // ptrInt returns a pointer to n for *int raw fields with a non-nil default.
 func ptrInt(n int) *int { return &n }
+
+// defaultModelAliases are applied when MODEL_ALIASES is unset (issue #42):
+// common OpenAI/Anthropic/DeepSeek client model names map to the closest
+// FreeBuff free-catalog model, so a stock client works out of the box.
+// gpt-4o maps to deepseek-v4-pro (the strongest agentic catalog row,
+// closest to GPT-4-class expectations); deepseek-chat maps to the fast
+// flash row (the DeepSeek API's own chat alias); claude-3-5-sonnet maps to
+// the Claude-line fable-5 row. An explicitly-set MODEL_ALIASES (even
+// empty) suppresses all defaults.
+var defaultModelAliases = map[string]string{
+	"deepseek-chat":     "deepseek/deepseek-v4-flash",
+	"gpt-4o":            "deepseek/deepseek-v4-pro",
+	"claude-3-5-sonnet": "anthropic/claude-fable-5",
+}
+
+// defaultFallbackModels returns the FALLBACK_MODEL defaults (issue #100):
+// the premium free-catalog rows fall back to the always-available flash
+// model once their queue wait passes FALLBACK_AFTER_MS — the proxy-side
+// mirror of the CLI hero flip to the unlimited flash model when the premium
+// daily pool runs out (reference freebuff-models.ts
+// getRecommendedFreebuffModelId). Capacity-gated rows (e.g.
+// meta/muse-spark-*) are not in the free catalog, so operators extend via
+// FALLBACK_MODEL themselves; the reference MUSE_SPARK_FALLBACK_MODEL_ID
+// pattern (→ deepseek-v4-pro) is documented in the README.
+func defaultFallbackModels() map[string]string {
+	return map[string]string{
+		"deepseek/deepseek-v4-pro": "deepseek/deepseek-v4-flash",
+		"openai/gpt-5.6-luna":      "deepseek/deepseek-v4-flash",
+		"minimax/minimax-m3":       "deepseek/deepseek-v4-flash",
+		"anthropic/claude-fable-5": "deepseek/deepseek-v4-flash",
+		"z-ai/glm-5.2":             "deepseek/deepseek-v4-flash",
+	}
+}
+
+// EnvFileCandidates returns the ordered candidate paths for the .env file
+// (issue #39). The working directory wins (./.env), matching the historic
+// behavior and the README rule that cwd config is authoritative. When it
+// does not exist, the platform config dir is tried:
+//
+//	linux:   $XDG_CONFIG_HOME/freebuff-proxy/.env → ~/.config/freebuff-proxy/.env
+//	windows: %APPDATA%\freebuff-proxy\.env
+//	darwin:  ~/Library/Application Support/freebuff-proxy/.env
+func EnvFileCandidates() []string {
+	candidates := []string{filepath.Join(".", ".env")}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return candidates
+	}
+	var dir string
+	switch runtime.GOOS {
+	case "windows":
+		if appdata := os.Getenv("APPDATA"); strings.TrimSpace(appdata) != "" {
+			dir = appdata
+		} else {
+			dir = filepath.Join(home, "AppData", "Roaming")
+		}
+	case "darwin":
+		dir = filepath.Join(home, "Library", "Application Support")
+	default:
+		if xdg := os.Getenv("XDG_CONFIG_HOME"); strings.TrimSpace(xdg) != "" {
+			dir = xdg
+		} else {
+			dir = filepath.Join(home, ".config")
+		}
+	}
+	return append(candidates, filepath.Join(dir, "freebuff-proxy", ".env"))
+}
+
+// ResolveEnvFile returns the first EXISTING candidate from
+// EnvFileCandidates ("./.env" when present in the working directory — cwd
+// wins), or "" when no candidate exists. A directory at a candidate path is
+// still returned: readDotenv then fails the load (a ./.env directory must
+// not silently disable the env file, legacy behavior). The resolved path is
+// recorded on Config.EnvFile by Load so the startup banner can name the
+// file actually read (issue #39).
+func ResolveEnvFile() string {
+	for _, candidate := range EnvFileCandidates() {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
 
 // Load resolves configuration from the optional JSON file at configPath
 // ("" skips the file), the optional ./.env file (when present), and
@@ -214,7 +344,8 @@ func Load(configPath string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if err := applyDotenv(&raw); err != nil {
+	envFileUsed := ResolveEnvFile()
+	if err := applyDotenv(&raw, envFileUsed); err != nil {
 		return Config{}, err
 	}
 
@@ -271,6 +402,11 @@ func Load(configPath string) (Config, error) {
 	overrideString(&raw.RunsDrainTTL, "RUNS_DRAIN_TTL")
 	overrideString(&raw.SessionReAdmitLead, "SESSION_RE_ADMIT_LEAD")
 	overrideString(&raw.SessionProbeCacheTTL, "SESSION_PROBE_CACHE_TTL")
+	overrideString(&raw.WebhookURL, "WEBHOOK_URL")
+	overrideString(&raw.FallbackAfter, "FALLBACK_AFTER_MS")
+	overrideString(&raw.FallbackModels, "FALLBACK_MODEL")
+	overrideBool(&raw.AdoptCLISession, "ADOPT_CLI_SESSION")
+	overrideBool(&raw.WaitingRoomChain, "WAITING_ROOM_CHAIN")
 
 	parseDuration := func(raw, name string) (time.Duration, error) {
 		d, err := time.ParseDuration(strings.TrimSpace(raw))
@@ -414,6 +550,44 @@ func Load(configPath string) (Config, error) {
 		proxyHealthMaxFailures = *raw.ProxyHealthMaxFailures
 	}
 
+	// FALLBACK_AFTER_MS (issue #100): milliseconds, ""/0 = disabled. Any
+	// parse failure fails the load — a typo silently disabling model
+	// fallback would be worse than surfacing it.
+	fallbackAfter := time.Duration(0)
+	if v := strings.TrimSpace(raw.FallbackAfter); v != "" {
+		ms, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse FALLBACK_AFTER_MS: %w", err)
+		}
+		if ms < 0 {
+			return Config{}, errors.New("FALLBACK_AFTER_MS cannot be negative (0 disables model fallback)")
+		}
+		fallbackAfter = time.Duration(ms) * time.Millisecond
+	}
+
+	// MODEL_ALIASES defaults (issue #42): when the operator has not set any
+	// aliases, common OpenAI/Anthropic/DeepSeek client names map to the
+	// closest FreeBuff free-catalog model so a stock client works out of
+	// the box. An explicit (even empty) value never gets the defaults.
+	modelAliases := parseMap(raw.ModelAliases)
+	if len(modelAliases) == 0 {
+		for alias, real := range defaultModelAliases {
+			modelAliases[alias] = real
+		}
+	}
+
+	// FALLBACK_MODEL defaults (issue #100): when unset, the premium free-
+	// catalog rows fall back to the always-available flash model once their
+	// queue wait passes FALLBACK_AFTER_MS (mirrors the CLI hero flip,
+	// reference freebuff-models.ts getRecommendedFreebuffModelId: premium
+	// exhausted → unlimited flash). Operators extend with their own
+	// capacity-gated rows (e.g. meta/muse-spark-* → deepseek-v4-pro per the
+	// reference MUSE_SPARK_FALLBACK_MODEL_ID).
+	fallbackModels := parseMap(raw.FallbackModels)
+	if len(fallbackModels) == 0 {
+		fallbackModels = defaultFallbackModels()
+	}
+
 	cfg := Config{
 		ListenAddr:                       strings.TrimSpace(raw.ListenAddr),
 		UpstreamBaseURL:                  upstreamBaseURL,
@@ -442,7 +616,7 @@ func Load(configPath string) (Config, error) {
 		CORSAllowedOrigin:                strings.TrimSpace(raw.CORSAllowedOrigin),
 		RequestJitter:                    requestJitter,
 		CLIVersion:                       strings.TrimSpace(raw.CLIVersion),
-		ModelAliases:                     parseMap(raw.ModelAliases),
+		ModelAliases:                     modelAliases,
 		TransientRetries:                 transientRetries,
 		SessionPersist:                   raw.SessionPersist,
 		SessionStateFile:                 strings.TrimSpace(raw.SessionStateFile),
@@ -458,15 +632,24 @@ func Load(configPath string) (Config, error) {
 		RunsDrainTTL:                     runsDrainTTL,
 		SessionReAdmitLead:               sessionReAdmitLead,
 		SessionProbeCacheTTL:             sessionProbeCacheTTL,
+		WebhookURL:                       strings.TrimSpace(raw.WebhookURL),
+		FallbackAfter:                    fallbackAfter,
+		FallbackModels:                   fallbackModels,
+		AdoptCLISession:                  raw.AdoptCLISession,
+		WaitingRoomChain:                 raw.WaitingRoomChain,
+		EnvFile:                          envFileUsed,
 	}
 
 	// Auto-discover CLI token if no AUTH_TOKENS were explicitly configured
-	// and AUTO_DISCOVER_TOKEN is not disabled.
+	// and AUTO_DISCOVER_TOKEN is not disabled. ADOPT_CLI_SESSION (issue
+	// #97) also opts into discovery: the operator explicitly asked to run
+	// like the CLI, so AUTO_DISCOVER_TOKEN=false must not silently leave the
+	// pool empty.
 	autoDiscover := true
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("AUTO_DISCOVER_TOKEN"))); v == "false" || v == "0" || v == "off" || v == "no" {
 		autoDiscover = false
 	}
-	if autoDiscover && len(cfg.AuthTokens) == 0 && !raw.AuthTokensSet {
+	if (autoDiscover || cfg.AdoptCLISession) && len(cfg.AuthTokens) == 0 && !raw.AuthTokensSet {
 		if token, email, srcPath, ok := discoverCLIToken(); ok {
 			cfg.AuthTokens = []string{token}
 			cfg.DiscoveredSource = srcPath
@@ -584,6 +767,19 @@ func (c Config) Validate() error {
 		return fmt.Errorf("PROXY_ROTATION %q must be one of: per-token, round-robin, random", c.ProxyRotation)
 	case c.MaxMessagesPerDay < 0:
 		return errors.New("MAX_MESSAGES_PER_DAY cannot be negative")
+	}
+
+	if c.WebhookURL != "" {
+		u, err := url.Parse(c.WebhookURL)
+		if err != nil {
+			return fmt.Errorf("WEBHOOK_URL %q is not a valid URL: %w", c.WebhookURL, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("WEBHOOK_URL %q must be an http(s) URL", c.WebhookURL)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("WEBHOOK_URL %q has no host", c.WebhookURL)
+		}
 	}
 
 	_, portStr, err := net.SplitHostPort(c.ListenAddr)
@@ -744,12 +940,16 @@ func loadRaw(configPath string) (rawConfig, error) {
 	return cfg, nil
 }
 
-// applyDotenv overlays KEY=VALUE pairs from the ./.env file (when present)
-// onto raw, so a local .env works like the JSON config file. A missing file
-// is fine; any other read error fails the load. Real environment variables
-// are applied afterwards and therefore always win.
-func applyDotenv(raw *rawConfig) error {
-	vals, err := readDotenv(".env")
+// applyDotenv overlays KEY=VALUE pairs from the resolved .env file (when
+// present) onto raw, so a local .env works like the JSON config file. path
+// is the resolved env file ("" = none found, from ResolveEnvFile). A
+// missing file is fine; any other read error fails the load. Real
+// environment variables are applied afterwards and therefore always win.
+func applyDotenv(raw *rawConfig, path string) error {
+	if path == "" {
+		return nil
+	}
+	vals, err := readDotenv(path)
 	if err != nil || vals == nil {
 		return err
 	}
@@ -795,6 +995,11 @@ func applyDotenv(raw *rawConfig) error {
 	overrideStringFrom(&raw.ProxyRotation, get, "PROXY_ROTATION")
 	overrideBoolFrom(&raw.SessionPersist, get, "SESSION_PERSIST")
 	overrideStringFrom(&raw.SessionStateFile, get, "SESSION_STATE_FILE")
+	overrideStringFrom(&raw.WebhookURL, get, "WEBHOOK_URL")
+	overrideStringFrom(&raw.FallbackAfter, get, "FALLBACK_AFTER_MS")
+	overrideStringFrom(&raw.FallbackModels, get, "FALLBACK_MODEL")
+	overrideBoolFrom(&raw.AdoptCLISession, get, "ADOPT_CLI_SESSION")
+	overrideBoolFrom(&raw.WaitingRoomChain, get, "WAITING_ROOM_CHAIN")
 	return nil
 }
 

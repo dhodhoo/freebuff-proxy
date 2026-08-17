@@ -1,0 +1,102 @@
+{{define "playground"}}
+<section class="page-head">
+  <div>
+    <h1>Playground</h1>
+    <p class="muted">instant model testing — one real chat through the proxy</p>
+  </div>
+  <div class="pills">
+    <span class="pill mono">{{.Mode}}</span>
+  </div>
+</section>
+
+{{if not .HasModels}}
+<article class="card empty-card">
+  <h2>No models in the registry</h2>
+  <p>The model catalog is empty (registry refresh may have failed at boot). Check the <a href="/admin/logs">logs</a>.</p>
+</article>
+{{else}}
+<article class="card playground-card">
+  <form id="playground-form" class="playground-form">
+    <label for="pg-model">Model</label>
+    <select id="pg-model" name="model" aria-label="Model">
+      {{range .Models}}<option value="{{.}}" {{if eq . $.Model}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    <label for="pg-prompt">Prompt</label>
+    <textarea id="pg-prompt" name="prompt" rows="6" maxlength="4000" placeholder="Ask the model anything..." spellcheck="false"></textarea>
+    <button type="submit" id="pg-send">Send</button>
+  </form>
+  <div id="pg-output" class="playground-output" aria-live="polite"></div>
+</article>
+<script>
+// Issue #45: a plain fetch against the admin streaming endpoint (same
+// pipeline as /v1/chat/completions, dashboard-auth'd) with SSE handling.
+(function () {
+  var form = document.getElementById("playground-form");
+  var output = document.getElementById("pg-output");
+  var send = document.getElementById("pg-send");
+  if (!form || !output || !send) return;
+  form.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var model = document.getElementById("pg-model").value;
+    var prompt = document.getElementById("pg-prompt").value.trim();
+    if (!prompt) return;
+    output.textContent = "";
+    send.disabled = true;
+    send.textContent = "Streaming…";
+    var started = false;
+    fetch("/admin/playground/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: model, prompt: prompt, stream: true })
+    }).then(function (resp) {
+      if (!resp.ok) {
+        return resp.text().then(function (t) {
+          output.textContent = "HTTP " + resp.status + ": " + t;
+          send.disabled = false;
+          send.textContent = "Send";
+        });
+      }
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder();
+      var buf = "";
+      function pump() {
+        return reader.read().then(function (res) {
+          if (res.done) { finish(); return; }
+          buf += decoder.decode(res.value, { stream: true });
+          var idx;
+          while ((idx = buf.indexOf("\n\n")) >= 0) {
+            var chunk = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            chunk.split("\n").forEach(function (line) {
+              if (!line.startsWith("data:")) return;
+              var data = line.slice(5).trim();
+              if (data === "[DONE]") return;
+              try {
+                var obj = JSON.parse(data);
+                if (obj.choices && obj.choices[0] && obj.choices[0].delta) {
+                  var d = obj.choices[0].delta;
+                  var text = (d.content || "") + (d.reasoning_content || "");
+                  if (text) { output.textContent += text; output.scrollTop = output.scrollHeight; }
+                }
+              } catch (e) { /* keep partial lines buffered */ }
+            });
+          }
+          return pump();
+        });
+      }
+      function finish() {
+        send.disabled = false;
+        send.textContent = "Send";
+        if (!output.textContent) output.textContent = "(no content)";
+      }
+      return pump();
+    }).catch(function (err) {
+      output.textContent = "Request failed: " + err;
+      send.disabled = false;
+      send.textContent = "Send";
+    });
+  });
+})();
+</script>
+{{end}}
+{{end}}

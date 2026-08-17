@@ -196,8 +196,8 @@ func TestChatCompletionsEnvelope(t *testing.T) {
 		t.Errorf("freebuff_instance_id = %v", md["freebuff_instance_id"])
 	}
 	clientID, _ := md["client_id"].(string)
-	if clientID != "run:run-abc" {
-		t.Errorf("client_id = %q, want %q (stable per run, derived from run id)", clientID, "run:run-abc")
+	if clientID != "sess:inst-1" {
+		t.Errorf("client_id = %q, want %q (stable per session instance, derived from instance id — #52)", clientID, "sess:inst-1")
 	}
 	provider, ok := sent["provider"].(map[string]any)
 	if !ok || provider["data_collection"] != "deny" {
@@ -304,7 +304,8 @@ func TestErrorClassification(t *testing.T) {
 		{"update required", 400, `{"error":"freebuff_update_required"}`, ErrSessionInvalid},
 		{"auth", 401, `{"error":"unauthorized"}`, ErrAuthRejected},
 		{"waiting room 503", 503, `{"error":"waiting_room_queued"}`, ErrWaitingRoom},
-		{"waiting room body", 429, `{"error":"waiting_room_required"}`, ErrSessionInvalid},
+		{"waiting room required (428)", 428, `{"error":"waiting_room_required"}`, ErrWaitingRoomRequired},
+		{"waiting room required body (any status)", 429, `{"error":"waiting_room_required"}`, ErrWaitingRoomRequired},
 		{"generic", 500, `{"error":"boom"}`, &UpstreamError{Status: 500}},
 		{"402 out of credits", 402, `{"error":"out of credits"}`, ErrCredits},
 	}

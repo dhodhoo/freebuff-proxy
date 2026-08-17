@@ -97,6 +97,13 @@ Model ID: {{.Model}}</pre>
   </div>
 </article>
 
+<article class="card step-card">
+  <h2><span class="step">+</span> Generate a token via browser login</h2>
+  <p class="muted">Headless OAuth wizard (issue #62): start a GitHub login, complete it in the browser, and the proxy adds the resulting token to the pool + <code>.env</code> automatically.</p>
+  <button class="action-btn" id="login-start" hx-post="/admin/login/start" hx-target="#login-wizard" hx-swap="innerHTML">Generate token via browser login</button>
+  <div id="login-wizard"></div>
+</article>
+
 {{if .Models}}
 <section class="card models-card">
   <h2>Catalog ({{len .Models}} models)</h2>

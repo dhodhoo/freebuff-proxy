@@ -3,9 +3,13 @@
 # Usage:
 #   .\gen-freebuff-token.ps1                  # interactive: recommends options; Enter = auto-append to .\.env
 #   .\gen-freebuff-token.ps1 -ToClipboard     # generate token and copy to clipboard
+#   .\gen-freebuff-token.ps1 -Incognito       # do NOT auto-open the browser: print the login URL and wait
+#                                             # for you to open it in a private/incognito window manually
+#                                             # (prevents an existing logged-in GitHub session from being reused)
 #   .\gen-freebuff-token.ps1 -Save            # save to ~/.config/manicode/credentials.json
 #   .\gen-freebuff-token.ps1 -Append          # append to .env AUTH_TOKENS (auto-copies .env.example if missing)
 #   .\gen-freebuff-token.ps1 -EnvFile D:\.env # target .env file for -Append
+#
 # Flow:
 #   1. POST /api/auth/cli/code  → gets loginUrl + fingerprintHash
 #   2. Opens browser for GitHub OAuth login
@@ -22,6 +26,7 @@
 param(
     [switch]$Save,
     [switch]$ToClipboard,
+    [switch]$Incognito,
     [switch]$Append,
     [string]$EnvFile = "",
     [string]$BaseUrl = $(if ($env:FREEBUFF_BASE_URL) { $env:FREEBUFF_BASE_URL } else { "https://www.codebuff.com" }),
@@ -75,7 +80,7 @@ Write-Host "Accounts may be suspended or banned. You accept this risk." -Foregro
 Write-Host ""
 
 # --- 0.5 recommend options for easier usage ----------------------------------
-if (-not $Save -and -not $ToClipboard -and -not $Append) {
+if (-not $Save -and -not $ToClipboard -and -not $Append -and -not $Incognito) {
     if ([Console]::IsInputRedirected) {
         # Non-interactive (piped/CI): auto-append to the current .env
         $Append = $true
@@ -85,12 +90,14 @@ if (-not $Save -and -not $ToClipboard -and -not $Append) {
         Write-Host "  1)       Copy token to clipboard" -ForegroundColor Gray
         Write-Host "  2)       Save to ~/.config/manicode/credentials.json" -ForegroundColor Gray
         Write-Host "  3)       Print token only" -ForegroundColor Gray
+        Write-Host "  4)       Incognito login (no auto-open; use a private window)" -ForegroundColor Gray
         $choice = Read-Host "Choose [Enter]"
         switch ($choice.Trim().ToLower()) {
             { $_ -in "", "append", "a" } { $Append = $true }
             { $_ -in "1", "clipboard", "c" } { $ToClipboard = $true }
             { $_ -in "2", "save", "s" } { $Save = $true }
             { $_ -in "3", "print", "p" } { }
+            { $_ -in "4", "incognito", "i" } { $Incognito = $true }
             default {
                 Write-Host "Unknown choice '$choice'; using recommended (append)." -ForegroundColor Yellow
                 $Append = $true
@@ -127,13 +134,28 @@ if (-not $loginUrl) {
 
 # --- 2. open browser ---------------------------------------------------------
 Write-Host ""
-Write-Host "Opening browser for GitHub login..." -ForegroundColor Green
-Write-Host "URL: $loginUrl" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "  -> Log in with the GitHub account you want a token for." -ForegroundColor Yellow
-Write-Host "  -> If you want a DIFFERENT account, sign out of GitHub first!" -ForegroundColor Yellow
-Write-Host ""
-Start-Process $loginUrl
+if ($Incognito) {
+    # Issue #43: never auto-open — the default browser may reuse an existing
+    # logged-in GitHub session, minting a token for the WRONG account. The
+    # user opens the URL in a private/incognito window manually; the longer
+    # timeout accounts for the manual step.
+    $TimeoutSeconds = 600
+    Write-Host "Incognito mode: open the URL below in a PRIVATE/INCOGNITO window manually." -ForegroundColor Cyan
+    Write-Host "URL: $loginUrl" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  -> Open the URL in a private/incognito window (Ctrl+Shift+N / Cmd+Shift+N)." -ForegroundColor Yellow
+    Write-Host "  -> Log in with the GitHub account you want a token for." -ForegroundColor Yellow
+    Write-Host "  -> This run waits up to ${TimeoutSeconds}s for you." -ForegroundColor Yellow
+    Write-Host ""
+} else {
+    Write-Host "Opening browser for GitHub login..." -ForegroundColor Green
+    Write-Host "URL: $loginUrl" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  -> Log in with the GitHub account you want a token for." -ForegroundColor Yellow
+    Write-Host "  -> If you want a DIFFERENT account, sign out of GitHub first!" -ForegroundColor Yellow
+    Write-Host ""
+    Start-Process $loginUrl
+}
 
 # --- 3. poll for auth completion ---------------------------------------------
 Write-Host "Waiting for login (timeout: ${TimeoutSeconds}s)..." -ForegroundColor Cyan
@@ -206,6 +228,9 @@ if ($Save) {
 }
 
 # --- 6. output options -------------------------------------------------------
+# Incognito is a browser-flow mode, not an output mode: after the login
+# completes, behave like the recommended default (append to .\.env).
+if ($Incognito -and -not $ToClipboard -and -not $Save) { $Append = $true }
 if ($ToClipboard) {
     Set-Clipboard -Value $authToken
     Write-Host "  Copied to clipboard!" -ForegroundColor Green

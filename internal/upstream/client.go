@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,14 @@ var (
 	// surfaces 409 and never refreshes/recreates the session
 	// (reference/freebuff freebuff-session.ts FREEBUFF_GATE_CODES).
 	ErrSessionLimitReached = errors.New("upstream session limit reached")
+	// ErrWaitingRoomRequired: 428 waiting_room_required — the account must
+	// walk the reference pre-session flow (request_ad_chain + get_streak)
+	// before the next session create (issue #94). Retryable with Retry-After
+	// honored, NO token cooldown, and deliberately DISTINCT from
+	// ErrSessionInvalid: the cached session row is not stale, so the
+	// session must NOT be invalidated/refreshed (reference
+	// freebuff2api-optimized codebuff.py:1048-1074).
+	ErrWaitingRoomRequired = errors.New("upstream waiting room required")
 )
 
 // WaitingRoomError is the concrete value behind ErrWaitingRoom; callers
@@ -124,6 +133,28 @@ func (e *WaitingRoomError) Error() string {
 }
 
 func (e *WaitingRoomError) Unwrap() error { return ErrWaitingRoom }
+
+// WaitingRoomRequiredError is the concrete value behind
+// ErrWaitingRoomRequired (issue #94): a 428 waiting_room_required refusal.
+// It is retryable (RetryAfter honored) and carries no cooldown; callers
+// surface it as 503 + Retry-After.
+type WaitingRoomRequiredError struct {
+	RetryAfter time.Duration
+	Detail     string
+}
+
+func (e *WaitingRoomRequiredError) Error() string {
+	msg := "upstream waiting room required"
+	if e.RetryAfter > 0 {
+		msg += fmt.Sprintf(" (retry after %s)", e.RetryAfter)
+	}
+	if e.Detail != "" {
+		msg += ": " + e.Detail
+	}
+	return msg
+}
+
+func (e *WaitingRoomRequiredError) Unwrap() error { return ErrWaitingRoomRequired }
 
 // UpstreamError is a non-recoverable upstream failure surfaced verbatim.
 type UpstreamError struct {
@@ -502,6 +533,18 @@ type Client struct {
 	transientRetries     atomic.Int64 // transient transport failures retried
 	fingerprintRotations atomic.Int64 // pinned fingerprint swaps ahead of a retry
 
+	// waitingRoomRequired records that the last upstream refusal was a 428
+	// waiting_room_required (issue #94): the pre-session ad-chain + streak
+	// flow must fire before the next session create (WAITING_ROOM_CHAIN
+	// gate). Set by classifyError; consumed (cleared) by the pool's
+	// acquire path when the chain fires.
+	waitingRoomRequired atomic.Bool
+
+	// authOnly marks a token-less client built by NewForAuth (issue #62):
+	// newRequest must never attach auth headers (there is no credential),
+	// and the /api/auth/cli/* flow uses its own login-request helper.
+	authOnly bool
+
 	// retryBackoff overrides the randomized 200-600ms pre-retry sleep (test
 	// seam; nil uses the crypto/rand jitter).
 	retryBackoff func() time.Duration
@@ -822,7 +865,7 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 			_ = resp.Body.Close()
 			releaseCancel(cancel)
 			c.dump("chat", req, resp.StatusCode, bodyText)
-			cerr := classifyError(resp.StatusCode, bodyText, resp.Header)
+			cerr := c.classify(resp.StatusCode, bodyText, resp.Header)
 			if isCapacityDeferred(cerr) && c.capacityDeferredRetries.Load() < int64(c.transientRetriesLimit) {
 				c.capacityDeferredRetries.Add(1)
 				continue
@@ -940,7 +983,7 @@ func (c *Client) EndSession(ctx context.Context, instanceID string) error {
 		return nil // nothing to end
 	}
 	if resp.StatusCode >= 400 {
-		return classifyError(resp.StatusCode, bodyStr, resp.Header)
+		return c.classify(resp.StatusCode, bodyStr, resp.Header)
 	}
 	return nil
 }
@@ -964,7 +1007,7 @@ func (c *Client) StartRun(ctx context.Context, agentID string) (string, error) {
 	defer func() { _ = resp.Body.Close() }()
 	body := drainBody(resp.Body)
 	if resp.StatusCode >= 400 {
-		return "", classifyError(resp.StatusCode, body, resp.Header)
+		return "", c.classify(resp.StatusCode, body, resp.Header)
 	}
 	var parsed struct {
 		RunID string `json:"runId"`
@@ -1002,7 +1045,7 @@ func (c *Client) FinishRun(ctx context.Context, runID string, totalSteps int) er
 	defer func() { _ = resp.Body.Close() }()
 	body := drainBody(resp.Body)
 	if resp.StatusCode >= 400 {
-		return classifyError(resp.StatusCode, body, resp.Header)
+		return c.classify(resp.StatusCode, body, resp.Header)
 	}
 	return nil
 }
@@ -1031,7 +1074,7 @@ func (c *Client) StartChildRun(ctx context.Context, parentRunID string) (string,
 	defer func() { _ = resp.Body.Close() }()
 	body := drainBody(resp.Body)
 	if resp.StatusCode >= 400 {
-		return "", classifyError(resp.StatusCode, body, resp.Header)
+		return "", c.classify(resp.StatusCode, body, resp.Header)
 	}
 	var parsed struct {
 		RunID string `json:"runId"`
@@ -1079,7 +1122,7 @@ func (c *Client) RecordRunStep(ctx context.Context, runID, messageID string, sta
 	defer func() { _ = resp.Body.Close() }()
 	bodyStr := drainBody(resp.Body)
 	if resp.StatusCode >= 400 {
-		return classifyError(resp.StatusCode, bodyStr, resp.Header)
+		return c.classify(resp.StatusCode, bodyStr, resp.Header)
 	}
 	return nil
 }
@@ -1244,7 +1287,7 @@ func (c *Client) sessionCall(req *http.Request) (*SessionState, error) {
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, classifyError(resp.StatusCode, body, resp.Header)
+		return nil, c.classify(resp.StatusCode, body, resp.Header)
 	}
 
 	return nil, fmt.Errorf("upstream: unparseable session response %q", truncate(body, 200))
@@ -1283,6 +1326,13 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("x-codebuff-api-key", c.token)
+	if c.authOnly {
+		// Token-less login-flow client (#62/#66): never send an empty
+		// credential pair — the /api/auth/cli/* endpoints take the login
+		// User-Agent instead (see authLoginRequest).
+		req.Header.Del("Authorization")
+		req.Header.Del("x-codebuff-api-key")
+	}
 	req.Header.Set("Content-Type", "application/json")
 	ctx = req.Context()
 	if profile := c.currentStealthProfile(); profile != nil {
@@ -1599,6 +1649,104 @@ func (c *Client) TransientRetries() int64 { return c.transientRetries.Load() }
 // TRANSIENT_RETRIES budget, issue #75).
 func (c *Client) CapacityDeferredRetries() int64 { return c.capacityDeferredRetries.Load() }
 
+// PendingWaitingRoomChain reports whether the client last classified a 428
+// waiting_room_required (issue #94) and the pre-session chain has not been
+// fired/cleared yet. The pool consults it before a session create when
+// WAITING_ROOM_CHAIN is enabled.
+func (c *Client) PendingWaitingRoomChain() bool { return c.waitingRoomRequired.Load() }
+
+// ConsumeWaitingRoomChain clears the 428 flag and reports whether it was
+// set (so the caller fires the chain exactly once per 428).
+func (c *Client) ConsumeWaitingRoomChain() bool { return c.waitingRoomRequired.Swap(false) }
+
+// waitingRoomChainTimeout bounds the whole best-effort pre-session chain so
+// a hung upstream never blocks a session create for long.
+const waitingRoomChainTimeout = 15 * time.Second
+
+// FireWaitingRoomChain runs the reference pre-session flow (issue #94(b),
+// WAITING_ROOM_CHAIN gate): POST /api/v1/ads per configured ad provider,
+// then GET /api/v1/freebuff/streak — mirroring freebuff2api-optimized
+// codebuff.py _request_ads_and_streak (surface="waiting_room"). Strictly
+// best-effort: every failure is logged and swallowed; the caller must never
+// depend on it (a gated stub whose real value is keeping the account's
+// waiting-room requirement satisfied before the next session create). The
+// streak call fires once after the provider loop, matching the reference.
+func (c *Client) FireWaitingRoomChain(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, waitingRoomChainTimeout)
+	defer cancel()
+	for _, provider := range waitingRoomAdProviders {
+		if err := c.requestAds(ctx, provider); err != nil {
+			slog.Debug("waiting room chain: ads request failed", "provider", provider, "err", err)
+		}
+	}
+	if err := c.getStreak(ctx); err != nil {
+		slog.Debug("waiting room chain: streak request failed", "err", err)
+	}
+}
+
+// waitingRoomAdProviders mirrors the reference default
+// (freebuff2api-optimized config.py: ad_providers=("gravity","zeroclick")).
+var waitingRoomAdProviders = []string{"gravity", "zeroclick"}
+
+// requestAds POSTs one /api/v1/ads payload (reference codebuff.py
+// request_ads: provider + device block + userAgent).
+func (c *Client) requestAds(ctx context.Context, provider string) error {
+	payload := map[string]any{
+		"provider": provider,
+		"messages": []any{},
+		"device": map[string]any{
+			"os":       runtime.GOOS,
+			"timezone": "UTC",
+			"locale":   "en-US",
+		},
+		"userAgent": freebuffLoginUserAgent,
+		"surface":   "waiting_room",
+	}
+	body, _ := json.Marshal(payload)
+	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/ads", body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", freebuffLoginUserAgent)
+	resp, cancel, err := c.do(req, c.sessionCallTimeout)
+	if err != nil {
+		return err
+	}
+	// do() returns a nil cancel when the context already carried a deadline
+	// (the chain's own timeout), so guard the defer.
+	if cancel != nil {
+		defer cancel()
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("ads status %d: %s", resp.StatusCode, truncate(string(raw), 200))
+	}
+	return nil
+}
+
+// getStreak GETs /api/v1/freebuff/streak (reference codebuff.py get_streak).
+func (c *Client) getStreak(ctx context.Context) error {
+	req, err := c.newRequest(ctx, http.MethodGet, "/api/v1/freebuff/streak", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", freebuffLoginUserAgent)
+	resp, cancel, err := c.do(req, c.sessionCallTimeout)
+	if err != nil {
+		return err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("streak status %d: %s", resp.StatusCode, truncate(string(raw), 200))
+	}
+	return nil
+}
+
 // FingerprintRotations returns how many times the pinned TLS fingerprint was
 // rotated ahead of a retry (pool snapshot /metrics aggregation).
 func (c *Client) FingerprintRotations() int64 { return c.fingerprintRotations.Load() }
@@ -1893,13 +2041,19 @@ func injectEnvelope(body []byte, costMode string, opts ChatOptions) ([]byte, err
 
 	ensureCliSystemMarker(payload)
 
-	// client_id is stable PER RUN (derived from the run id), not a fresh
-	// draw per request — the SDK keys it to the run's promptId
-	// (reference/freebuff/sdk/src/impl/llm.ts:112-121). trace_session_id is
-	// minted once per run and reused across its requests (proxy-freebuff
-	// lib/runs.js:43-46).
+	// client_id is stable PER SESSION INSTANCE (derived from the instance
+	// id) so upstream traces correlate the whole session lifetime — the
+	// hardest identity signal the SDK keys on (issue #52 extension of #80,
+	// which made it stable per run). With no instance id (disabled session)
+	// it falls back to the run id, then to a fresh SDK-faithful draw.
+	// trace_session_id remains per run (minted once by the run manager,
+	// reused across the run's requests; run.ts: previousRun?.traceSessionId
+	// ?? randomUUID, proxy-freebuff lib/runs.js:43-46).
 	clientID := generateClientID()
-	if opts.RunID != "" {
+	switch {
+	case opts.SessionInstanceID != "":
+		clientID = "sess:" + opts.SessionInstanceID
+	case opts.RunID != "":
 		clientID = "run:" + opts.RunID
 	}
 	metadata := map[string]any{
@@ -1927,6 +2081,21 @@ func injectEnvelope(body []byte, costMode string, opts ChatOptions) ([]byte, err
 		return nil, fmt.Errorf("re-marshal envelope: %w", err)
 	}
 	return out, nil
+}
+
+// classify maps an upstream error response through the shared matrix and
+// records the 428 waiting_room_required flag (issue #94) so the pool can
+// fire the gated pre-session chain before the next session create. All
+// in-client error paths must use this wrapper; the free classifyError stays
+// pure for tests.
+func (c *Client) classify(status int, body string, hdr http.Header) error {
+	err := classifyError(status, body, hdr)
+	// classifyError returns a concrete typed error in the interface, never a
+	// nil interface — so err is always non-nil; test the sentinel directly.
+	if errors.Is(err, ErrWaitingRoomRequired) {
+		c.waitingRoomRequired.Store(true)
+	}
+	return err
 }
 
 // classifyError maps an upstream error response to the recovery matrix.
@@ -1988,8 +2157,19 @@ func classifyError(status int, body string, hdr http.Header) error {
 		// Retry-After via the shared WaitingRoomError
 		// (reference/freebuff freebuff-session.ts FREEBUFF_GATE_CODES).
 		return &WaitingRoomError{RetryAfter: retryAfter, Detail: truncate(body, 200)}
-	case containsAny(lower, "freebuff_update_required", "waiting_room_required",
-		"session_superseded", "session_expired", "session_model_mismatch", "model_locked"):
+	case containsAny(lower, "waiting_room_required"):
+		// 428 waiting_room_required (issue #94): the account must walk the
+		// reference pre-session ad-chain + streak flow before the next
+		// session create. Own retryable signal (Retry-After honored, no
+		// cooldown) — deliberately NOT ErrSessionInvalid: the session row is
+		// fine, so nothing must be invalidated (reference
+		// freebuff2api-optimized codebuff.py:1048-1074). The body marker is
+		// the discriminator (upstream can attach it to 428/429 alike); the
+		// Client.classify wrapper records the flag so the pool can fire the
+		// gated WAITING_ROOM_CHAIN before the next create.
+		return &WaitingRoomRequiredError{RetryAfter: retryAfter, Detail: truncate(body, 200)}
+	case containsAny(lower, "freebuff_update_required", "session_superseded",
+		"session_expired", "session_model_mismatch", "model_locked"):
 		return fmt.Errorf("%w: %s%s", ErrSessionInvalid, truncate(body, 200), retryDetail(retryAfter))
 	case status == http.StatusBadRequest && containsAny(lower, "runid not found", "runid not running"):
 		return fmt.Errorf("%w: %s", ErrRunInvalid, truncate(body, 200))

@@ -50,6 +50,7 @@ import (
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
 	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/updatecheck"
 	"freebuff-proxy/internal/upstream"
 )
 
@@ -81,21 +82,80 @@ type Server struct {
 	// configPath is the -config JSON path ("" when none); reloads re-apply it
 	// so JSON overrides survive dashboard saves and /admin/reload.
 	configPath string
+
+	// version is the running release tag (""/dev for dev builds); the
+	// dashboard badge compares it against the latest GitHub release (#50b).
+	// updates is the cached latest-release checker (nil = no badge).
+	version string
+	updates *updatecheck.Checker
+
+	// authClient drives the headless OAuth login wizard (issue #62): a
+	// token-less upstream client whose transport/stealth wiring matches the
+	// pooled clients. nil disables the wizard endpoints with 503.
+	authClient *upstream.Client
+	// loginFlows is the in-flight login-flow registry keyed by flow id
+	// (fingerprint): start POSTs /api/auth/cli/code, status polls it until
+	// the authToken lands (then AddToken + persist).
+	loginMu    sync.Mutex
+	loginFlows map[string]*loginFlow
 }
+
+// loginFlow is one in-flight headless login (issue #62).
+type loginFlow struct {
+	ID      string // short flow id shown to the client (fingerprint prefix)
+	Code    *upstream.CLILoginCode
+	Started time.Time
+	Done    bool
+	Token   string
+	Error   string
+	Index   int // pooled token index after AddToken (0 when bridge)
+}
+
+// loginFlowTTL drops stale flows (never completed; browser closed).
+const loginFlowTTL = 10 * time.Minute
+
+// WithVersion wires the running release tag + update checker for the
+// dashboard badge (issue #50b). A nil checker disables the badge.
+func WithVersion(version string, updates *updatecheck.Checker) Option {
+	return func(s *Server) {
+		s.version = version
+		s.updates = updates
+	}
+}
+
+// WithLoginClient wires the token-less upstream client that drives the
+// headless OAuth login wizard (issue #62). A nil client disables the
+// wizard endpoints with 503.
+func WithLoginClient(c *upstream.Client) Option {
+	return func(s *Server) {
+		s.authClient = c
+	}
+}
+
+// Option configures optional server features (release-version badge).
+type Option func(*Server)
 
 // New builds the server over the configured pool and registry. A nil logger
 // falls back to slog.Default(). The started timestamp pins /v1/models
 // "created" and /healthz uptime. logs is the optional dashboard log viewer
 // ring (nil disables the /admin/logs page data). configPath is the -config
 // JSON path the process was started with ("" = none), used by reloads so a
-// dashboard save or /admin/reload re-applies the JSON overrides.
-func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler, configPath string) *Server {
+// dashboard save or /admin/reload re-applies the JSON overrides. opts
+// configure optional features (release-version badge, login wizard client).
+func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler, configPath string, opts ...Option) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath}
+	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath, loginFlows: make(map[string]*loginFlow)}
 	s.cfg.Store(cfg)
-	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger, logs)
+	for _, opt := range opts {
+		opt(s)
+	}
+	dashOpts := []dashboard.Option{}
+	if s.version != "" {
+		dashOpts = append(dashOpts, dashboard.WithVersion(s.version, s.updates))
+	}
+	s.dash = dashboard.New(func() *config.Config { return s.cfg.Load() }, p, reg, logger, logs, dashOpts...)
 	s.adminAuth = newAdminAuth()
 	return s
 }
@@ -131,6 +191,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /admin/models", s.dashboardAuth(s.dash.Page("models")))
 	mux.Handle("GET /admin/traces", s.dashboardAuth(s.dash.Page("traces")))
 	mux.Handle("GET /admin/setup", s.dashboardAuth(s.dash.Page("setup")))
+	mux.Handle("GET /admin/playground", s.dashboardAuth(s.dash.Page("playground")))
+	mux.Handle("POST /admin/playground/chat", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handlePlaygroundChat)))))
+	mux.Handle("POST /admin/login/start", s.dashboardAuth(s.adminSensitive(s.adminCSRF(http.HandlerFunc(s.handleLoginStart)))))
+	mux.Handle("GET /admin/login/status", s.dashboardAuth(s.adminSensitive(http.HandlerFunc(s.handleLoginStatus))))
 	mux.Handle("GET /admin/config", s.dashboardAuth(s.adminSensitive(s.dash.Page("config"))))
 	mux.Handle("GET /admin/logs", s.dashboardAuth(s.adminSensitive(s.dash.Page("logs"))))
 	mux.Handle("GET /admin/metrics", s.dashboardAuth(s.dash.Page("metrics")))
@@ -889,6 +953,196 @@ func (s *Server) handleSmoke(w http.ResponseWriter, r *http.Request) {
 	s.dash.RenderSmokeResult(w, r, req.Model, tokenLabel(lease), ms, preview, dashboard.PhaseList(phases.All()))
 }
 
+// handlePlaygroundChat is the dashboard playground's streaming chat
+// endpoint (issue #45): it routes a {model, prompt} through the exact same
+// /v1/chat/completions pipeline (acquire → upstream → SSE relay) without an
+// API key — dashboard auth + CSRF already ran. The page streams the SSE.
+func (s *Server) handlePlaygroundChat(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "failed to read request: "+err.Error(), "invalid_request_error", "invalid_json", 0)
+		return
+	}
+	var req struct {
+		Model  string `json:"model"`
+		Prompt string `json:"prompt"`
+		Stream bool   `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "request must be a JSON object", "invalid_request_error", "invalid_json", 0)
+		return
+	}
+	req.Model = strings.TrimSpace(req.Model)
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	if req.Model == "" {
+		if m := probeModel(s.reg); m != "" {
+			req.Model = m
+		} else {
+			s.writeJSONError(w, http.StatusBadRequest, "no model specified and no models in the registry", "invalid_request_error", "model_not_found", 0)
+			return
+		}
+	}
+	if req.Prompt == "" {
+		req.Prompt = "ping"
+	}
+	// Build a chat-completions request and run it through the real handler
+	// (streaming forced, exactly like /v1/chat/completions).
+	chatBody := []byte(`{"model":` + strconv.Quote(req.Model) +
+		`,"messages":[{"role":"user","content":` + strconv.Quote(req.Prompt) + `}],"stream":true}`)
+	playReq := r.Clone(r.Context())
+	playReq.Body = io.NopCloser(bytes.NewReader(chatBody))
+	playReq.ContentLength = int64(len(chatBody))
+	s.handleChat(w, playReq)
+}
+
+// handleLoginStart begins the headless OAuth login wizard (issue #62):
+// POST /admin/login/start → the server requests a fresh /api/auth/cli/code
+// from upstream and returns {flow_id, login_url, expires_at} for the page
+// to hand to the user; the page then polls GET /admin/login/status.
+func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
+	if s.authClient == nil {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "login wizard disabled (no upstream auth client)", "server_error", "login_unavailable", 0)
+		return
+	}
+	s.pruneLoginFlows()
+	code, err := s.authClient.StartCLILogin(r.Context())
+	if err != nil {
+		s.logger.Warn("login wizard: start failed", "err", err)
+		s.writeJSONError(w, http.StatusBadGateway, "failed to start browser login: "+err.Error(), "server_error", "login_start_failed", 0)
+		return
+	}
+	flowID := shortFlowID(code.FingerprintID)
+	flow := &loginFlow{ID: flowID, Code: code, Started: time.Now()}
+	s.loginMu.Lock()
+	s.loginFlows[code.FingerprintID] = flow
+	s.loginMu.Unlock()
+	s.logger.Info("login wizard: started", "flow", flowID)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"flow_id":    flowID,
+		"login_url":  code.LoginURL,
+		"expires_at": code.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// handleLoginStatus polls an in-flight login (issue #62): the server polls
+// upstream /api/auth/cli/status; when the authToken appears the token is
+// added to the live pool AND persisted to .env (survives restart), like the
+// dashboard "Add token" action.
+func (s *Server) handleLoginStatus(w http.ResponseWriter, r *http.Request) {
+	s.pruneLoginFlows()
+	fp := strings.TrimSpace(r.URL.Query().Get("fingerprint"))
+	if fp == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "missing fingerprint query param", "invalid_request_error", "bad_request", 0)
+		return
+	}
+	s.loginMu.Lock()
+	flow := s.loginFlows[fp]
+	s.loginMu.Unlock()
+	if flow == nil {
+		s.writeJSONError(w, http.StatusNotFound, "login flow not found or expired — start a new one", "invalid_request_error", "login_flow_missing", 0)
+		return
+	}
+	if flow.Done {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "token_index": flow.Index, "token": flow.Token})
+		return
+	}
+	status, err := s.authClient.PollCLILogin(r.Context(), flow.Code)
+	if err != nil {
+		// Transient poll failure: keep the flow alive, report pending.
+		s.logger.Debug("login wizard: poll failed", "flow", flow.ID, "err", err)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		return
+	}
+	if !status.Done {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		return
+	}
+	// Completed: add to the pool + persist to .env (mirrors handleTokenAdd).
+	flow.Done = true
+	flow.Token = status.AuthToken
+	s.loginMu.Lock()
+	s.loginFlows[fp] = flow
+	s.loginMu.Unlock()
+	index, addErr := s.addTokenPersist(r.Context(), status.AuthToken)
+	if addErr != nil {
+		flow.Error = addErr.Error()
+		s.logger.Warn("login wizard: token persist failed", "flow", flow.ID, "err", addErr)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": addErr.Error()})
+		return
+	}
+	flow.Index = index
+	s.logger.Info("login wizard: completed", "flow", flow.ID, "token_index", index, "user", status.User.Name)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "token_index": index, "user": status.User.Name})
+}
+
+// addTokenPersist adds token to the live pool and persists the new
+// AUTH_TOKENS list to .env (mirrors handleTokenAdd's mutation + persistence
+// sequence, without the dashboard fragment render).
+func (s *Server) addTokenPersist(ctx context.Context, token string) (int, error) {
+	cfg := s.cfg.Load()
+	existing := cfg.AuthTokens
+	if len(existing) > 0 {
+		idx, err := s.pool.AddToken(token)
+		if err != nil {
+			return 0, fmt.Errorf("add token to pool: %w", err)
+		}
+		// Persist the runtime list (pool may have bridge additions too, but
+		// AUTH_TOKENS is the fixed set — append only when not already there).
+		tokens := append([]string(nil), existing...)
+		seen := false
+		for _, t := range tokens {
+			if t == token {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			tokens = append(tokens, token)
+		}
+		if err := s.syncTokensAfterMutation(tokens); err != nil {
+			return 0, err
+		}
+		return idx, nil
+	}
+	// Bridge mode (no fixed tokens): the first wizard token switches to
+	// pooled mode, exactly like handleTokenAdd.
+	idx, err := s.pool.AddToken(token)
+	if err != nil {
+		return 0, fmt.Errorf("add token to pool: %w", err)
+	}
+	if err := s.syncTokensAfterMutation([]string{token}); err != nil {
+		return 0, err
+	}
+	return idx, nil
+}
+
+// shortFlowID renders a compact flow id for the UI/logs.
+func shortFlowID(fp string) string {
+	if len(fp) > 12 {
+		return fp[:12]
+	}
+	return fp
+}
+
+// pruneLoginFlows drops flows older than loginFlowTTL.
+func (s *Server) pruneLoginFlows() {
+	cutoff := time.Now().Add(-loginFlowTTL)
+	s.loginMu.Lock()
+	for fp, flow := range s.loginFlows {
+		if flow.Started.Before(cutoff) {
+			delete(s.loginFlows, fp)
+		}
+	}
+	s.loginMu.Unlock()
+}
+
 // readBounded reads up to n bytes from r, tolerating an EOF mid-prefix.
 func readBounded(r io.Reader, n int) ([]byte, error) {
 	buf := make([]byte, n)
@@ -1564,6 +1818,7 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	var up io.ReadCloser
 	var lease *pool.Lease
 	cfg := s.cfg.Load()
+	fallbackUsed := false
 	// In hybrid, only an Authorization: Bearer token selects the bridge
 	// path — an x-api-key is the API_KEYS scheme for pooled clients and
 	// must never be relayed upstream as a FreeBuff credential.
@@ -1612,8 +1867,44 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 			s.pool.CooldownBridgeCountryBlocked,
 		)
 	} else {
+		// Issue #100: bounded queue-time model fallback. When the request's
+		// model has a configured fallback (FALLBACK_MODEL) and the pool
+		// surfaces a waiting-room/queue delay of at least FALLBACK_AFTER_MS,
+		// re-route the SAME token to the fallback model instead of handing
+		// the client a 503 the client would have to wait out. Conservative:
+		// only when a fallback is configured; the switch is surfaced to the
+		// client via the X-FreeBuff-Fallback-Model response header and in
+		// the routing log line.
+		acquire := acquireTimed(func(ctx context.Context, model string) (*pool.Lease, error) { return s.pool.Acquire(ctx, model) })
+		fallbackModel := cfg.FallbackModels[model]
+		if cfg.FallbackAfter > 0 && fallbackModel != "" && fallbackModel != model {
+			wrapped := acquire
+			acquire = func(ctx context.Context, m string) (*pool.Lease, error) {
+				l, err := wrapped(ctx, m)
+				if err == nil || errors.Is(err, registry.ErrModelNotFound) {
+					return l, err
+				}
+				var wr *session.WaitingRoomError
+				if errors.As(err, &wr) && wr.RetryAfter >= cfg.FallbackAfter {
+					s.logger.Info("model fallback: waiting room exceeds FALLBACK_AFTER_MS; switching model",
+						"model", m, "fallback", fallbackModel, "retry_after", wr.RetryAfter.String())
+					// Drop the queued session caches so the fallback-model
+					// acquire can CREATE a fresh session instead of
+					// re-surfacing the same waiting room (issue #100).
+					if cleared := s.pool.ClearQueuedCaches(); cleared > 0 {
+						s.logger.Debug("model fallback: cleared queued session caches", "cleared", cleared)
+					}
+					l2, err2 := wrapped(ctx, fallbackModel)
+					if err2 == nil {
+						fallbackUsed = true
+					}
+					return l2, err2
+				}
+				return l, err
+			}
+		}
 		up, lease, err = s.chatAttempt(ctx, model, normalized,
-			acquireTimed(func(ctx context.Context, model string) (*pool.Lease, error) { return s.pool.Acquire(ctx, model) }),
+			acquire,
 			s.pool.Chat,
 			func(l *pool.Lease) { s.pool.InvalidateSession(l.Token) },
 			func(l *pool.Lease, agentID string) { s.pool.InvalidateRun(l.Token, agentID) },
@@ -1645,6 +1936,13 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	}
 	if reasoningEffort != "" {
 		routingAttrs = append(routingAttrs, "reasoning_effort", reasoningEffort)
+	}
+	if fallbackUsed {
+		// Surface the transparent model switch to the client (issue #100):
+		// the streamed response itself is indistinguishable, so the header
+		// is the notice.
+		w.Header().Set("X-FreeBuff-Fallback-Model", cfg.FallbackModels[model])
+		routingAttrs = append(routingAttrs, "fallback", cfg.FallbackModels[model])
 	}
 	s.logger.Info(kind+" routing", routingAttrs...)
 

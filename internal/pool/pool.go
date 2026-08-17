@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/notify"
 	"freebuff-proxy/internal/phasetiming"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
@@ -224,6 +225,11 @@ type Pool struct {
 	// disables. Injected by the caller (main) via SetSessionStore so there
 	// is exactly one store shared by pooled and bridge entries.
 	store *session.Store
+
+	// notify fires best-effort webhook alerts (issue #48): pool_exhausted
+	// when every token is rate-limited, token_banned when a ban is
+	// classified. nil disables. Wired by main from WEBHOOK_URL.
+	notify *notify.Sender
 
 	// storeSessionPersist and storeStateFile record the persistence config
 	// the store was created with (captured by SetSessionStore), so SetConfig
@@ -478,6 +484,12 @@ func (p *Pool) SetSessionStore(store *session.Store) {
 	p.storeStateFile = cfg.SessionStateFile
 }
 
+// SetNotifier wires the best-effort webhook sender (issue #48, WEBHOOK_URL);
+// nil disables alerts. Safe to call at runtime (nil-friendly).
+func (p *Pool) SetNotifier(n *notify.Sender) {
+	p.notify = n
+}
+
 // Acquire resolves the model's agent, picks a start token round-robin, and
 // fails over linearly until a token yields both a run and a session. Returns
 // a lease on success. Registry misses (unknown model) are returned as-is.
@@ -578,6 +590,15 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			return nil, err
 		}
 		sessionStart := time.Now()
+		// Issue #94(b): WAITING_ROOM_CHAIN gate — when the upstream last
+		// refused this token with 428 waiting_room_required, fire the
+		// reference pre-session ad-chain + streak flow (best-effort, bounded
+		// by the client's own chain timeout) before the next session create
+		// so the admission does not bounce off the same 428 again.
+		if cfg.WaitingRoomChain && tok.client.ConsumeWaitingRoomChain() {
+			p.logger.Debug("pool: firing waiting-room pre-session chain", "token", idx+1)
+			tok.client.FireWaitingRoomChain(ctx)
+		}
 		instanceID, err := tok.session.EnsureSessionForModel(ctx, model)
 		permit.Release()
 		phasetiming.FromContext(ctx).Since(phasetiming.SessionRefreshMS, sessionStart)
@@ -600,6 +621,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			}
 			if be := asBan(err); be != nil {
 				tok.runs.CooldownBan(be)
+				p.notifyBan(idx+1, model)
 				banned = append(banned, be)
 			}
 			if cbe := asCountryBlocked(err); cbe != nil {
@@ -644,6 +666,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			}
 			if be := asBan(err); be != nil {
 				tok.runs.CooldownBan(be)
+				p.notifyBan(idx+1, model)
 				banned = append(banned, be)
 			}
 			if cbe := asCountryBlocked(err); cbe != nil {
@@ -685,6 +708,15 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		return nil, countryBlocked[0]
 	}
 	if len(rateLimited) > 0 {
+		// Pool exhausted (issue #48): every token failed and the highest-
+		// precedence bucket is rate-limit — no ban/country is present, so
+		// this is the "all tokens are at their quota/window limit" state the
+		// operator wants to be alerted about. Fire-and-forget webhook
+		// (throttled per event type); the 429 still surfaces as usual.
+		if p.notify != nil {
+			p.notify.Send(notify.Event{Event: "pool_exhausted", TokenIndex: 0, Model: model,
+				Message: "all tokens are rate-limited; the pool cannot serve the request"})
+		}
 		return nil, bestRateLimit(rateLimited)
 	}
 	if len(ipCapped) > 0 {
@@ -1093,6 +1125,22 @@ func (p *Pool) InvalidateSession(token int) {
 	(*toks)[token].session.Invalidate()
 }
 
+// ClearQueuedCaches drops every token's cached QUEUED session (issue #100):
+// the queue-time model fallback calls this before re-acquiring with the
+// fallback model, so the fallback acquire creates a fresh session instead of
+// re-surfacing the same waiting room. Returns how many queued caches were
+// cleared. Other states (active/disabled) are untouched.
+func (p *Pool) ClearQueuedCaches() int {
+	toks := p.toks.Load()
+	cleared := 0
+	for _, tok := range *toks {
+		if tok.session.ClearQueued() {
+			cleared++
+		}
+	}
+	return cleared
+}
+
 // InvalidateRun drops the current run of token for agentID so the next
 // Acquire starts a fresh one (run-invalid recovery). Out-of-range tokens are
 // ignored.
@@ -1171,13 +1219,15 @@ func (p *Pool) CooldownTokenIpCapped(token int, ice *upstream.IpCappedError) {
 }
 
 // CooldownTokenBan applies a ban cooldown to token (remembered so
-// Acquire surfaces 403 banned + resumes-at during the window).
+// Acquire surfaces 403 banned + resumes-at during the window) and fires the
+// token_banned webhook alert (issue #48, throttled per event type).
 func (p *Pool) CooldownTokenBan(token int, be *upstream.BanError) {
 	toks := p.toks.Load()
 	if token < 0 || token >= len(*toks) || be == nil {
 		return
 	}
 	(*toks)[token].runs.CooldownBan(be)
+	p.notifyBan(token+1, "")
 }
 
 // CooldownTokenCountryBlocked applies a country-block cooldown to token
@@ -1237,12 +1287,25 @@ func (p *Pool) CooldownBridgeIpCapped(lease *Lease, ice *upstream.IpCappedError)
 }
 
 // CooldownBridgeBan applies a ban cooldown to the bridge entry (remembered
-// so AcquireBridge surfaces 403 banned + resumes-at during the window).
+// so AcquireBridge surfaces 403 banned + resumes-at during the window) and
+// fires the token_banned webhook alert (issue #48, throttled).
 func (p *Pool) CooldownBridgeBan(lease *Lease, be *upstream.BanError) {
 	if lease == nil || lease.Bridge == nil || be == nil {
 		return
 	}
 	lease.Bridge.runs.CooldownBan(be)
+	p.notifyBan(0, "")
+}
+
+// notifyBan fires the token_banned webhook (issue #48). tokenIndex is the
+// 1-based pooled token index (0 = bridge). model is the requested model
+// when the caller knows it ("" otherwise). Throttled by the sender.
+func (p *Pool) notifyBan(tokenIndex int, model string) {
+	if p.notify == nil {
+		return
+	}
+	p.notify.Send(notify.Event{Event: "token_banned", TokenIndex: tokenIndex, Model: model,
+		Message: "a FreeBuff token was classified banned upstream (403)"})
 }
 
 // CooldownBridgeCountryBlocked applies a country-block cooldown to the

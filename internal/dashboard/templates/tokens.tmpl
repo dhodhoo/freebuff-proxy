@@ -91,7 +91,7 @@
           <td class="mono">{{.Recent}}</td>
           <td class="mono">{{.Limit}}</td>
           <td class="mono">{{.Period}}</td>
-          <td class="mono">{{.ResetAt}}{{if .ResetsIn}} <span class="countdown{{if .NearLimit}} countdown-near{{end}}">{{.ResetsIn}}</span>{{end}}</td>
+          <td class="mono">{{if .ResetAtUTC}}<time data-utc="{{.ResetAtUTC}}">{{.ResetAt}}</time>{{else}}{{.ResetAt}}{{end}}{{if .ResetsIn}} <span class="countdown{{if .NearLimit}} countdown-near{{end}}">{{.ResetsIn}}</span>{{end}}</td>
           <td class="mono">{{if .HasEntitlement}}{{.Entitled}}{{end}}</td>
         </tr>
         {{if .HasBar}}

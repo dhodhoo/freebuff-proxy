@@ -30,6 +30,7 @@ import (
 	"freebuff-proxy/internal/phasetiming"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/updatecheck"
 )
 
 //go:embed assets templates
@@ -50,11 +51,30 @@ type Dashboard struct {
 	started time.Time
 	tpl     *template.Template
 
+	// version is the running release tag ("" / "dev" for dev builds) and
+	// updates is the release-update indicator (issue #50b); the layout
+	// shows a badge when a newer GitHub release exists. Both may be left
+	// unset (no badge).
+	version string
+	updates *updatecheck.Checker
+
 	// metricHist is the rolling counter history sampled by the metrics page
 	// (UI-poll-driven, not a background goroutine). Per-instance so multiple
 	// dashboards never share one window.
 	metricsMu  sync.Mutex
 	metricHist []metricSample
+}
+
+// Option configures optional Dashboard features (version + update checker).
+type Option func(*Dashboard)
+
+// WithVersion wires the running release tag and the update checker for the
+// header badge (issue #50b). Nil checker disables the badge.
+func WithVersion(version string, updates *updatecheck.Checker) Option {
+	return func(d *Dashboard) {
+		d.version = version
+		d.updates = updates
+	}
 }
 
 // New builds the dashboard. cfg must return the current configuration — the
@@ -63,7 +83,7 @@ type Dashboard struct {
 // failures panic: the templates are embedded, so a parse error is a build
 // invariant violation, not a runtime condition. logs is the optional log
 // viewer ring (nil hides the /admin/logs page data).
-func New(cfg func() *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler) *Dashboard {
+func New(cfg func() *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.Logger, logs *logring.Handler, opts ...Option) *Dashboard {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -71,17 +91,57 @@ func New(cfg func() *config.Config, p *pool.Pool, reg *registry.Registry, logger
 	if err != nil {
 		panic("dashboard: embedded template parse failed: " + err.Error())
 	}
-	return &Dashboard{cfg: cfg, pool: p, reg: reg, logger: logger, started: time.Now(), tpl: tpl, logs: logs}
+	d := &Dashboard{cfg: cfg, pool: p, reg: reg, logger: logger, started: time.Now(), tpl: tpl, logs: logs}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
 // layoutData carries the pre-rendered page body into the layout shell. The
 // body is template.HTML deliberately: it was produced by executing one of
 // our own escaped content templates, so no second escaping pass applies.
 // Page names the content template so the layout can mount the right htmx
-// poll for live pages (overview/logs/metrics).
+// poll for live pages (overview/logs/metrics). OpenBanner flags the
+// unauthenticated-remote dashboard warning (issue #46); UpdateBadge carries
+// the release-update indicator (issue #50b).
 type layoutData struct {
 	Body template.HTML
 	Page string
+
+	OpenBanner bool
+	// Update fields: only rendered when HasUpdate is true.
+	HasUpdate      bool
+	CurrentVersion string
+	LatestVersion  string
+	UpdateURL      string
+}
+
+// releaseURL is where the update badge points (the releases page).
+const releaseURL = "https://github.com/trefeon/freebuff-proxy/releases"
+
+// hostIsLoopback reports whether a request Host (possibly with port) is a
+// loopback name — 127.0.0.1, localhost, ::1 — or the listen address's own
+// host (issue #46).
+func hostIsLoopback(host, listenAddr string) bool {
+	h := host
+	if hostname, _, err := net.SplitHostPort(host); err == nil {
+		h = hostname
+	}
+	h = strings.Trim(strings.TrimSpace(strings.ToLower(h)), "[]")
+	switch h {
+	case "", "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	if listenAddr != "" {
+		if lh, _, err := net.SplitHostPort(listenAddr); err == nil {
+			lh = strings.Trim(strings.TrimSpace(strings.ToLower(lh)), "[]")
+			if lh != "" && lh != "0.0.0.0" && lh != "::" && lh == h {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // isHX reports whether the request came from htmx (fragment, not full page).
@@ -102,7 +162,23 @@ func (d *Dashboard) render(w http.ResponseWriter, r *http.Request, content strin
 		d.logger.Error("dashboard page render failed", "template", content, "err", err)
 		return
 	}
-	if err := d.tpl.ExecuteTemplate(w, "layout", layoutData{Body: template.HTML(buf.String()), Page: content}); err != nil {
+	ld := layoutData{Body: template.HTML(buf.String()), Page: content}
+	cfg := d.cfg()
+	// Issue #46: with ADMIN_TOKEN unset, a request whose Host is not a
+	// loopback name reaches an OPEN dashboard — show a banner recommending
+	// ADMIN_TOKEN (and linking the config page).
+	ld.OpenBanner = cfg.AdminToken == "" && !hostIsLoopback(r.Host, cfg.ListenAddr)
+	// Issue #50b: release update badge — non-blocking (3s fetch bound,
+	// 6h in-memory cache; failures render no badge).
+	if d.version != "" && d.updates != nil && r.Context() != nil {
+		if latest, err := d.updates.Latest(r.Context()); err == nil && latest != "" && updatecheck.UpdateAvailable(d.version, latest) {
+			ld.HasUpdate = true
+			ld.CurrentVersion = d.version
+			ld.LatestVersion = latest
+			ld.UpdateURL = releaseURL
+		}
+	}
+	if err := d.tpl.ExecuteTemplate(w, "layout", ld); err != nil {
 		d.logger.Error("dashboard layout render failed", "err", err)
 	}
 }
@@ -157,11 +233,34 @@ func (d *Dashboard) dataFor(name string) any {
 		return d.tracesData()
 	case "setup":
 		return d.setupData()
+	case "playground":
+		return d.playgroundData()
 	case "metrics":
 		return d.metricsData()
 	default:
 		return nil
 	}
+}
+
+// --- playground (issue #45) ---
+
+// playgroundData feeds the interactive chat playground: the registry model
+// list (pre-selected first model) and the routing mode hint.
+type playgroundData struct {
+	Models    []string
+	Model     string
+	HasModels bool
+	Mode      string
+}
+
+func (d *Dashboard) playgroundData() playgroundData {
+	models := d.reg.Models()
+	pd := playgroundData{Models: models, Mode: d.cfg().EffectiveMode()}
+	pd.HasModels = len(models) > 0
+	if pd.HasModels {
+		pd.Model = models[0]
+	}
+	return pd
 }
 
 // --- logs ---
@@ -307,6 +406,7 @@ type quotaRow struct {
 	Recent         string
 	Period         string
 	ResetAt        string
+	ResetAtUTC     string // RFC3339 UTC for the browser-local formatter (#50a)
 	ResetsIn       string // e.g. "in 4h 12m" (empty when no reset time)
 	Entitled       string
 	HasEntitlement bool
@@ -316,6 +416,16 @@ type quotaRow struct {
 	// are pre-formatted strings (formatQuota), so templates cannot compare
 	// them numerically — the numeric decision lives here.
 	HasBar bool
+}
+
+// utcAttr renders a time as an RFC3339 UTC string for the data-utc
+// attribute the browser-local formatter reads (issue #50a). Zero times
+// render "".
+func utcAttr(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func (d *Dashboard) tokensData() tokensData {
@@ -329,11 +439,12 @@ func (d *Dashboard) tokensData() tokensData {
 		}
 		for model, q := range t.QuotaByModel {
 			row := quotaRow{
-				Model:   model,
-				Limit:   formatQuota(q.Limit),
-				Recent:  formatQuota(q.RecentCount),
-				Period:  q.Period,
-				ResetAt: shortTime(q.ResetAt),
+				Model:      model,
+				Limit:      formatQuota(q.Limit),
+				Recent:     formatQuota(q.RecentCount),
+				Period:     q.Period,
+				ResetAt:    shortTime(q.ResetAt),
+				ResetAtUTC: utcAttr(q.ResetAt),
 			}
 			if q.Limit > 0 {
 				row.UsagePct = int(q.RecentCount * 100 / q.Limit)

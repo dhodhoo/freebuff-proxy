@@ -14,19 +14,29 @@
 <header class="site">
   <nav class="container">
     <ul>
-      <li><a href="/admin" class="brand">freebuff-proxy <span class="brand-sub">admin</span></a></li>
+      <li><a href="/admin" class="brand">freebuff-proxy <span class="brand-sub">admin</span></a>{{if .HasUpdate}}<a href="{{.UpdateURL}}" class="update-badge" title="new release available">update: {{.LatestVersion}}</a>{{end}}</li>
     </ul>
     <ul>
       <li><a href="/admin" class="nav-link">Overview</a></li>
       <li><a href="/admin/tokens" class="nav-link">Tokens</a></li>
       <li><a href="/admin/models" class="nav-link">Models</a></li>
       <li><a href="/admin/traces" class="nav-link">Traces</a></li>
+      <li><a href="/admin/playground" class="nav-link">Playground</a></li>
       <li><a href="/admin/config" class="nav-link">Config</a></li>
       <li><a href="/admin/setup" class="nav-link">Setup</a></li>
       <li><a href="/admin/logs" class="nav-link">Logs</a></li>
       <li><a href="/admin/metrics" class="nav-link">Metrics</a></li>
     </ul>
   </nav>
+  {{if .OpenBanner}}
+  <div class="open-banner container" role="status">
+    <strong>Dashboard is open — no ADMIN_TOKEN set.</strong>
+    This proxy is reachable from a non-loopback address and the admin UI is
+    unauthenticated: any client that can reach it can view state and change
+    configuration. Set <code>ADMIN_TOKEN</code> in <a href="/admin/config">Config</a>
+    to require a login.
+  </div>
+  {{end}}
 </header>
 <main class="container">
   <div id="{{.Page}}-root">{{.Body}}</div>
@@ -39,6 +49,26 @@
 <footer class="container muted">
   <p>single binary · htmx driven · <a href="/healthz">healthz</a> · <a href="/metrics">metrics</a></p>
 </footer>
+<script>
+// Issue #50a: render every [data-utc] timestamp in the BROWSER's local
+// timezone (zero build step). The server ships RFC3339 UTC; this converts
+// on load and every 30s so long-open pages stay fresh.
+(function () {
+  function formatLocal(el) {
+    var iso = el.getAttribute("data-utc");
+    if (!iso) return;
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return;
+    var s = d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    el.textContent = s + " (local)";
+  }
+  function convertAll() {
+    document.querySelectorAll("time[data-utc]").forEach(formatLocal);
+  }
+  convertAll();
+  setInterval(convertAll, 30000);
+})();
+</script>
 </body>
 </html>
 {{end}}

@@ -29,11 +29,13 @@ import (
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/egress"
 	"freebuff-proxy/internal/logring"
+	"freebuff-proxy/internal/notify"
 	"freebuff-proxy/internal/pool"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/server"
 	"freebuff-proxy/internal/session"
 	"freebuff-proxy/internal/telemetry"
+	"freebuff-proxy/internal/updatecheck"
 	"freebuff-proxy/internal/upstream"
 )
 
@@ -53,6 +55,7 @@ func main() {
 	uninstallService := flag.Bool("uninstall-service", false, "stop and unregister the background service")
 	serviceStatus := flag.Bool("service-status", false, "check whether the background service is registered and running (exit 0 registered, 1 not)")
 	autoYes := flag.Bool("yes", false, "auto-confirm prompts during setup")
+	refreshToken := flag.Int("refresh-token", -1, "re-authenticate token #N in .env via the headless GitHub login flow and exit (interactive: start → print login URL → poll; with -yes and GITHUB_USER/GITHUB_PASSWORD/GITHUB_TOTP set: protocol login)")
 	flag.Parse()
 
 	if w := modeFlagsExclusiveWarning(*showDoctor, *showUpdate, *showSetup, *testToken, *installService, *uninstallService, *serviceStatus); w != "" {
@@ -65,6 +68,9 @@ func main() {
 	}
 	if *testToken {
 		runTokenTest(*configPath)
+	}
+	if *refreshToken >= 0 {
+		runTokenRefresh(*configPath, *refreshToken, *autoYes)
 	}
 	if *showDoctor {
 		runDoctor(*configPath)
@@ -103,18 +109,35 @@ func main() {
 	// through our logger so the configured level and log file cover them too.
 	slog.SetDefault(logger)
 
-	// The proxy reads ./.env from the working directory, which on Windows
-	// launchers (Task Scheduler, shortcuts, services) is often not the
-	// executable's directory. Log the absolute path used, and warn when a
-	// .env sitting next to the executable is silently ignored — that is the
-	// usual reason config "seems to vanish" under a non-interactive launcher.
-	envFile, _ := filepath.Abs(".env")
+	// The proxy reads the resolved .env (issue #39): ./.env in the working
+	// directory wins; otherwise the platform config dir is tried
+	// ($XDG_CONFIG_HOME / %APPDATA% / ~/Library/Application Support, under
+	// freebuff-proxy/). Log the absolute path used, and warn when a .env
+	// sitting next to the executable is silently ignored — that is the
+	// usual reason config "seems to vanish" under a non-interactive
+	// launcher (Task Scheduler, shortcuts, services).
+	envFile := cfg.EnvFile
+	if envFile != "" {
+		if abs, err := filepath.Abs(envFile); err == nil {
+			envFile = abs
+		}
+	}
 	logger.Info("config loaded", "env_file", envFile, "config_file", *configPath)
-	if cwd, err := os.Getwd(); err == nil {
+	if cfg.EnvFile == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			exe, exeErr := os.Executable()
+			if exeErr == nil {
+				if p := ignoredExeAdjacentEnv(cwd, exe); p != "" {
+					logger.Warn("found .env next to the executable, but no .env candidate exists in the config search path — that file is NOT applied",
+						"cwd", cwd, "exe_dir", filepath.Dir(exe))
+				}
+			}
+		}
+	} else if cwd, err := os.Getwd(); err == nil {
 		exe, exeErr := os.Executable()
 		if exeErr == nil {
 			if p := ignoredExeAdjacentEnv(cwd, exe); p != "" {
-				logger.Warn("found .env next to the executable, but .env is read from the working directory — that file is NOT applied",
+				logger.Warn("found .env next to the executable, but the config search resolved a different .env — that file is NOT applied",
 					"cwd", cwd, "exe_dir", filepath.Dir(exe), "env_file", envFile)
 			}
 		}
@@ -199,6 +222,29 @@ func main() {
 	}
 	p.SetSessionStore(store)
 
+	// Issue #48: best-effort webhook alerts (WEBHOOK_URL) for pool
+	// exhaustion / token bans — fire-and-forget, throttled, never blocking.
+	if cfg.WebhookURL != "" {
+		p.SetNotifier(notify.New(cfg.WebhookURL, nil))
+		logger.Info("webhook alerts enabled", "url", cfg.WebhookURL)
+	}
+
+	// Issue #97: ADOPT_CLI_SESSION — seed every session manager with the
+	// CLI-session adoption mode (owner file re-read per refresh; never
+	// create a competing session while the CLI is alive).
+	if cfg.AdoptCLISession {
+		ownerFile, err := cliOwnerFilePath()
+		if err != nil {
+			logger.Error("ADOPT_CLI_SESSION: cannot resolve freebuff-instance-owner.json", "err", err)
+			holdForExitIfConsole()
+			os.Exit(1)
+		}
+		for _, sess := range sessions {
+			sess.SetCLIAdoption(session.CLIAdoption{Enabled: true, OwnerFile: ownerFile})
+		}
+		logger.Info("ADOPT_CLI_SESSION: adopting the official CLI session (single-session friendly)", "owner_file", ownerFile)
+	}
+
 	// Prewarm + the 60s maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)
 
@@ -224,7 +270,16 @@ func main() {
 			"interval", cfg.ProxyHealthInterval.String(), "max_failures", cfg.ProxyHealthMaxFailures)
 	}
 
-	srv := server.New(&cfg, p, reg, logger, logringHandler, *configPath)
+	// Issue #62: the dashboard login wizard drives the same headless OAuth
+	// flow as the CLI against the proxy's own transport/stealth wiring; the
+	// token it yields is added to the pool + .env (nil disables the wizard).
+	loginClient, _ := upstream.NewForAuth(&cfg)
+	serverOpts := []server.Option{server.WithLoginClient(loginClient)}
+	// Issue #50b: release update indicator — the dashboard badge compares
+	// the running version against the latest GitHub release (6h cache).
+	serverOpts = append(serverOpts, server.WithVersion(version, updatecheck.New(updatecheck.DefaultRepo, nil)))
+
+	srv := server.New(&cfg, p, reg, logger, logringHandler, *configPath, serverOpts...)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),

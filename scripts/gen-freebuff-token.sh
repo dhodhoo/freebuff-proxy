@@ -5,6 +5,9 @@
 #   ./gen-freebuff-token.sh              # interactive: recommends options; Enter = auto-append to ./.env
 #   ./gen-freebuff-token.sh --print      # generate token and print to screen only
 #   ./gen-freebuff-token.sh --clipboard  # copy to clipboard (xclip/pbcopy)
+#   ./gen-freebuff-token.sh --incognito  # do NOT auto-open the browser: print the login URL and wait
+#                                        # for you to open it in a private/incognito window manually
+#                                        # (prevents an existing logged-in GitHub session from being reused)
 #   ./gen-freebuff-token.sh --save       # save to ~/.config/manicode/credentials.json
 #   ./gen-freebuff-token.sh --append     # append to .env AUTH_TOKENS (auto-copies .env.example if missing)
 #   ./gen-freebuff-token.sh --env /path/.env  # target .env for --append
@@ -19,7 +22,7 @@ set -euo pipefail
 BASE_URL="${FREEBUFF_BASE_URL:-https://www.codebuff.com}"
 TIMEOUT=300
 POLL_INTERVAL=5
-MODE="interactive"  # interactive (default) | print | save | clipboard | append
+MODE="interactive"  # interactive (default) | print | save | clipboard | append | incognito
 ENV_FILE=""
 
 while [ $# -gt 0 ]; do
@@ -27,6 +30,7 @@ while [ $# -gt 0 ]; do
     --print)     MODE="print"; shift ;;
     --save)      MODE="save"; shift ;;
     --clipboard) MODE="clipboard"; shift ;;
+    --incognito) MODE="incognito"; shift ;;
     --append)    MODE="append"; shift ;;
     --env)       ENV_FILE="$2"; shift 2 ;;
     --env=*)     ENV_FILE="${1#--env=}"; shift ;;
@@ -62,6 +66,7 @@ if [ "$MODE" = "interactive" ]; then
     echo "  1)       Copy token to clipboard"
     echo "  2)       Save to ~/.config/manicode/credentials.json"
     echo "  3)       Print token only"
+    echo "  4)       Incognito login (no auto-open; use a private window)"
     printf "Choose [Enter]: "
     read -r CHOICE
     case "$CHOICE" in
@@ -69,6 +74,7 @@ if [ "$MODE" = "interactive" ]; then
       1|clipboard|c) MODE="clipboard" ;;
       2|save|s) MODE="save" ;;
       3|print|p) MODE="print" ;;
+      4|incognito|i) MODE="incognito" ;;
       *) warn "Unknown choice '$CHOICE'; using recommended (append)."; MODE="append" ;;
     esac
     echo ""
@@ -96,21 +102,36 @@ fi
 
 # --- 2. open browser ---------------------------------------------------------
 echo ""
-ok "Opening browser for GitHub login..."
-gray "URL: $LOGIN_URL"
-echo ""
-warn "  -> Log in with the GitHub account you want a token for."
-warn "  -> If you want a DIFFERENT account, sign out of GitHub first!"
-echo ""
-
-# Cross-platform browser open
-if command -v xdg-open >/dev/null 2>&1; then
-  xdg-open "$LOGIN_URL" 2>/dev/null &
-elif command -v open >/dev/null 2>&1; then
-  open "$LOGIN_URL"
+if [ "$MODE" = "incognito" ]; then
+  # Issue #43: never auto-open — the default browser may reuse an existing
+  # logged-in GitHub session, minting a token for the WRONG account. The user
+  # opens the URL in a private/incognito window manually; the longer timeout
+  # accounts for the manual step.
+  TIMEOUT=600
+  c "Incognito mode: open the URL below in a PRIVATE/INCOGNITO window manually."
+  gray "URL: $LOGIN_URL"
+  echo ""
+  warn "  -> Open the URL in a private/incognito window (Ctrl+Shift+N / Cmd+Shift+N)."
+  warn "  -> Log in with the GitHub account you want a token for."
+  warn "  -> This run waits up to ${TIMEOUT}s for you."
+  echo ""
 else
-  warn "Cannot open browser automatically. Open this URL manually:"
-  echo "  $LOGIN_URL"
+  ok "Opening browser for GitHub login..."
+  gray "URL: $LOGIN_URL"
+  echo ""
+  warn "  -> Log in with the GitHub account you want a token for."
+  warn "  -> If you want a DIFFERENT account, sign out of GitHub first!"
+  echo ""
+
+  # Cross-platform browser open
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$LOGIN_URL" 2>/dev/null &
+  elif command -v open >/dev/null 2>&1; then
+    open "$LOGIN_URL"
+  else
+    warn "Cannot open browser automatically. Open this URL manually:"
+    echo "  $LOGIN_URL"
+  fi
 fi
 
 # --- 3. poll for auth completion ---------------------------------------------
@@ -185,6 +206,13 @@ CRED
 fi
 
 # --- 6. output options -------------------------------------------------------
+case "$MODE" in
+  incognito)
+    # Incognito is a browser-flow mode, not an output mode: after the login
+    # completes, behave like the recommended default (append to ./.env).
+    MODE="append"
+    ;;
+esac
 case "$MODE" in
   clipboard)
     if command -v pbcopy >/dev/null 2>&1; then

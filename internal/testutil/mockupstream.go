@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -141,6 +142,22 @@ type MockUpstream struct {
 	// (any route). Tests assert it stays unchanged when a pass must not
 	// touch the upstream at all.
 	Requests int
+
+	// AuthCLICodeStatus is the status served by POST /api/auth/cli/code
+	// (issue #62/#66); 200 by default. AuthCLICodeBody overrides the JSON
+	// body served; the default is a valid code response with LoginURL.
+	AuthCLICodeStatus int
+	AuthCLICodeBody   string
+	// AuthCLICodeRequests counts POST /api/auth/cli/code hits.
+	AuthCLICodeRequests int
+	// AuthCLIStatusBody is the JSON body served by GET
+	// /api/auth/cli/status. When empty, the response is 401 (pending).
+	// AuthCLIStatusRequests counts status polls.
+	AuthCLIStatusBody     string
+	AuthCLIStatusRequests int
+	// AuthCLIHandler fully overrides both /api/auth/cli/* routes when set
+	// (route dispatch falls through to it after the request counters).
+	AuthCLIHandler func(w http.ResponseWriter, r *http.Request)
 }
 
 // NewMock starts the mock server. Call Close when done.
@@ -234,6 +251,38 @@ func (m *MockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		m.handleSteps(w, r)
 	case r.URL.Path == "/api/v1/chat/completions" && r.Method == http.MethodPost:
 		m.handleChat(w, r)
+	case r.URL.Path == "/api/auth/cli/code" && r.Method == http.MethodPost:
+		m.mu.Lock()
+		m.AuthCLICodeRequests++
+		status, body := m.AuthCLICodeStatus, m.AuthCLICodeBody
+		handler := m.AuthCLIHandler
+		m.mu.Unlock()
+		if handler != nil {
+			handler(w, r)
+			return
+		}
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if body == "" {
+			body = `{"fingerprintId":"enhanced-test","fingerprintHash":"fp-hash-1","loginUrl":"https://github.com/login/oauth/authorize?auth_code=abc","expiresAt":` + strconv.FormatInt(time.Now().Add(5*time.Minute).UnixMilli(), 10) + `}`
+		}
+		writeRaw(w, status, body)
+	case r.URL.Path == "/api/auth/cli/status" && r.Method == http.MethodGet:
+		m.mu.Lock()
+		m.AuthCLIStatusRequests++
+		statusBody := m.AuthCLIStatusBody
+		handler := m.AuthCLIHandler
+		m.mu.Unlock()
+		if handler != nil {
+			handler(w, r)
+			return
+		}
+		if statusBody == "" {
+			w.WriteHeader(401)
+			return
+		}
+		writeRaw(w, 200, statusBody)
 	default:
 		writeJSON(w, 404, `{"error":"not found"}`)
 	}

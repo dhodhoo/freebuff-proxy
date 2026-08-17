@@ -1,0 +1,327 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/pool"
+	"freebuff-proxy/internal/registry"
+	"freebuff-proxy/internal/session"
+	"freebuff-proxy/internal/testutil"
+	"freebuff-proxy/internal/updatecheck"
+	"freebuff-proxy/internal/upstream"
+)
+
+// --- #46: open-dashboard banner ---------------------------------------------
+
+// TestOpenDashboardBannerRemote verifies the banner shows when ADMIN_TOKEN
+// is unset AND the request Host is not a loopback name.
+func TestOpenDashboardBannerRemote(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	srv := newServer(t, mock, nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.Host = "192.168.1.50:3457"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	page := rec.Body.String()
+	if !strings.Contains(page, "Dashboard is open") {
+		t.Error("remote host with no ADMIN_TOKEN: banner missing")
+	}
+}
+
+// TestOpenDashboardBannerLoopback verifies the banner does NOT show for a
+// loopback Host (127.0.0.1 / localhost).
+func TestOpenDashboardBannerLoopback(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	srv := newServer(t, mock, nil)
+	for _, host := range []string{"127.0.0.1:3457", "localhost:3457", "[::1]:3457"} {
+		req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if strings.Contains(rec.Body.String(), "Dashboard is open") {
+			t.Errorf("host %s: banner shown, want none (loopback)", host)
+		}
+	}
+}
+
+// TestDashboardBannerHiddenWithAdminToken verifies the banner never shows
+// when ADMIN_TOKEN is set.
+func TestDashboardBannerHiddenWithAdminToken(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	srv := newServerCfg(t, mock, func(c *config.Config) { c.AdminToken = "secret" })
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.Host = "192.168.1.50:3457"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	// Without the cookie the request redirects to login (still no banner on
+	// the login page).
+	if strings.Contains(rec.Body.String(), "Dashboard is open") {
+		t.Error("banner shown with ADMIN_TOKEN set")
+	}
+}
+
+// --- #45: playground ---------------------------------------------------------
+
+func TestPlaygroundPageRenders(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	srv := newServer(t, mock, nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/playground", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	page := rec.Body.String()
+	if !strings.Contains(page, "Playground") || !strings.Contains(page, "pg-model") || !strings.Contains(page, "pg-send") {
+		t.Error("playground page missing key elements")
+	}
+}
+
+// TestPlaygroundChatStreams verifies the playground chat endpoint streams
+// the real chat pipeline (SSE body) without an API key.
+func TestPlaygroundChatStreams(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	srv := newServer(t, mock, nil)
+	body := `{"model":"z-ai/glm-5.2","prompt":"ping","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/playground/chat", strings.NewReader(body))
+	req.Host = "127.0.0.1:3457"
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Errorf("content-type = %q, want text/event-stream", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "data:") {
+		t.Error("no SSE data in playground response")
+	}
+}
+
+// --- #62: login wizard endpoints ---------------------------------------------
+
+func TestLoginWizardFlow(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	// Wire a real auth client through the option so the wizard works.
+	srv := newServerCfg(t, mock, nil, func(s *Server) {
+		auth, err := upstream.NewForAuth(&config.Config{UpstreamBaseURL: mock.URL()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.authClient = auth
+	})
+
+	// Start.
+	req := httptest.NewRequest(http.MethodPost, "/admin/login/start", nil)
+	req.Host = "127.0.0.1:3457"
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("start status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var startResp struct {
+		FlowID   string `json:"flow_id"`
+		LoginURL string `json:"login_url"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &startResp); err != nil {
+		t.Fatal(err)
+	}
+	if startResp.FlowID == "" || startResp.LoginURL == "" {
+		t.Fatalf("start response missing flow_id/login_url: %s", rec.Body.String())
+	}
+
+	// Poll: pending (mock serves 401 until AuthCLIStatusBody is set).
+	poll := func() string {
+		req := httptest.NewRequest(http.MethodGet, "/admin/login/status?fingerprint=enhanced-test", nil)
+		req.Host = "127.0.0.1:3457"
+		req.RemoteAddr = "127.0.0.1:12345"
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status code = %d: %s", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Status string `json:"status"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out.Status
+	}
+	if got := poll(); got != "pending" {
+		t.Errorf("first poll = %q, want pending", got)
+	}
+
+	// Complete the login upstream; the next poll must add the token.
+	mock.AuthCLIStatusBody = `{"authToken":"cb_wizard","user":{"id":"gh-9","name":"Wiz","email":"wiz@example.com"}}`
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := poll(); got == "completed" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if srv.pool.TokenCount() != 2 {
+		t.Errorf("pool tokens = %d, want 2 (1 fixed + wizard token)", srv.pool.TokenCount())
+	}
+}
+
+// --- #100: queue-time model fallback -----------------------------------------
+
+// TestChatFallbackAfterWaitingRoom verifies the acquire-time fallback:
+// with FALLBACK_AFTER_MS + FALLBACK_MODEL configured and the waiting room
+// RetryAfter >= the threshold, the request is re-routed to the fallback
+// model and the X-FreeBuff-Fallback-Model header surfaces the switch.
+func TestChatFallbackAfterWaitingRoom(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "queued"
+	mock.SessionSequence = []string{"queued", "active"} // first create queues; the fallback model's create succeeds
+	mock.EstimatedWaitMs = 20000                        // > FALLBACK_AFTER_MS (10s)
+	srv := newServerCfg(t, mock, func(c *config.Config) {
+		c.FallbackAfter = 10 * time.Second
+		c.FallbackModels = map[string]string{"z-ai/glm-5.2": "deepseek/deepseek-v4-flash"}
+	})
+	body := `{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Host = "127.0.0.1:3457"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fallback served): %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-FreeBuff-Fallback-Model"); got != "deepseek/deepseek-v4-flash" {
+		t.Errorf("X-FreeBuff-Fallback-Model = %q, want deepseek/deepseek-v4-flash", got)
+	}
+}
+
+// TestChatNoFallbackBelowThreshold verifies a short waiting room (below
+// FALLBACK_AFTER_MS) surfaces 503 waiting_room_queued as usual.
+func TestChatNoFallbackBelowThreshold(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionMode = "queued"
+	mock.EstimatedWaitMs = 1000 // < FALLBACK_AFTER_MS
+	srv := newServerCfg(t, mock, func(c *config.Config) {
+		c.FallbackAfter = 10 * time.Second
+		c.FallbackModels = map[string]string{"z-ai/glm-5.2": "deepseek/deepseek-v4-flash"}
+	})
+	body := `{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Host = "127.0.0.1:3457"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (wait below threshold)", rec.Code)
+	}
+	if got := rec.Header().Get("X-FreeBuff-Fallback-Model"); got != "" {
+		t.Errorf("fallback header set without fallback: %q", got)
+	}
+}
+
+// --- #50b: update badge ------------------------------------------------------
+
+func TestUpdateBadgeRendered(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var hits atomic.Int64
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{"tag_name":"v9.9.9"}`))
+	}))
+	defer gh.Close()
+	tr := &rewriteTransport{target: gh.URL}
+	checker := updatecheck.New(updatecheck.DefaultRepo, &http.Client{Transport: tr})
+	srv := newServerCfg(t, mock, nil, func(s *Server) {
+		s.version = "v0.9.3"
+		s.updates = checker
+	})
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.Host = "127.0.0.1:3457"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	page := rec.Body.String()
+	latest, lerr := srv.updates.Latest(context.Background())
+	idx := strings.Index(page, "update:")
+	t.Logf("hits=%d badge=%v latest=%q err=%v ctx=%q", hits.Load(), strings.Contains(page, "update:"), latest, lerr, page[idx:idx+40])
+	if !strings.Contains(page, "update: v9.9.9") {
+		t.Error("update badge missing for newer release")
+	}
+	if hits.Load() == 0 {
+		t.Error("update checker never queried")
+	}
+}
+
+// rewriteTransport sends every request to target (tests must not contact
+// api.github.com).
+type rewriteTransport struct {
+	target string
+}
+
+func (t *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.URL.Scheme = "http"
+	clone.URL.Host = strings.TrimPrefix(t.target, "http://")
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+// newServer builds a test server over one mock token with a config mutation
+// and optional server options; returns the raw *Server for pool/option
+// assertions.
+func newServer(t *testing.T, mock *testutil.MockUpstream, mut func(*config.Config)) *Server {
+	t.Helper()
+	return newServerOpts(t, mock, mut)
+}
+
+func newServerCfg(t *testing.T, mock *testutil.MockUpstream, mut func(*config.Config), opts ...func(*Server)) *Server {
+	t.Helper()
+	return newServerOpts(t, mock, mut, opts...)
+}
+
+func newServerOpts(t *testing.T, mock *testutil.MockUpstream, mut func(*config.Config), opts ...func(*Server)) *Server {
+	t.Helper()
+	cfg := &config.Config{
+		AuthTokens:         []string{"tok-0"},
+		RotationInterval:   time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 5 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+		UpstreamBaseURL:    "https://www.codebuff.com",
+	}
+	if mut != nil {
+		mut(cfg)
+	}
+	clientCfg := *cfg
+	clientCfg.UpstreamBaseURL = mock.URL()
+	client, err := upstream.New(cfg.AuthTokens[0], &clientCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := session.NewManager(client)
+	reg := registry.New(cfg, nil)
+	reg.LoadFallback()
+	p, err := pool.New(cfg, []*upstream.Client{client}, []*session.Manager{sess}, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverOpts := make([]Option, 0, len(opts))
+	for _, o := range opts {
+		serverOpts = append(serverOpts, o)
+	}
+	srv := New(cfg, p, reg, nil, nil, "", serverOpts...)
+	return srv
+}

@@ -11,10 +11,14 @@
 package session
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,6 +91,12 @@ type Manager struct {
 	// redundant GET (heartbeat) within the TTL.
 	probeTTL     time.Duration
 	lastAdmitted time.Time
+
+	// adopt is the issue #97 CLI-session adoption mode (ADOPT_CLI_SESSION):
+	// nil (default) = create sessions normally. When set, the manager adopts
+	// the CLI's active instance and refuses to create a competing session
+	// while the CLI process is alive.
+	adopt *CLIAdoption
 }
 
 type cachedState struct {
@@ -150,6 +160,142 @@ func (m *Manager) SetAdmissionProbeTTL(d time.Duration) {
 	m.mu.Lock()
 	m.probeTTL = d
 	m.mu.Unlock()
+}
+
+// CLIOwner mirrors the official CLI's freebuff-instance-owner.json (issue
+// #97, reference proxy-freebuff server.js readCliInstanceOwner): the CLI
+// rewrites this file whenever its active session changes (restart,
+// rotation, new conversation).
+type CLIOwner struct {
+	InstanceID string `json:"instanceId"`
+	PID        int    `json:"pid"`
+}
+
+// CLIAdoption is the issue #97 opt-in wiring: with ADOPT_CLI_SESSION the
+// proxy behaves like the official CLI for a single account — it adopts the
+// CLI's ACTIVE session instance and never creates a competing one while the
+// CLI process is alive. Enabled is false by default; OwnerFile is the
+// freebuff-instance-owner.json path; Initial is the startup snapshot (the
+// file is re-read before every refresh). testAlive overrides the PID
+// liveness check in tests (nil = platform check).
+type CLIAdoption struct {
+	Enabled   bool
+	OwnerFile string
+	Initial   CLIOwner
+	testAlive func(int) bool
+}
+
+// SetCLIAdoption configures (or clears, with a zero value) the CLI-session
+// adoption mode (issue #97, ADOPT_CLI_SESSION). Wired by main.go before the
+// pool starts serving.
+func (m *Manager) SetCLIAdoption(a CLIAdoption) {
+	m.mu.Lock()
+	if a.Enabled {
+		a.testAlive = processAlive
+		m.adopt = &a
+	} else {
+		m.adopt = nil
+	}
+	m.mu.Unlock()
+}
+
+// adoptOwner re-reads the CLI owner file fresh (issue #97(c)): the CLI
+// rewrites freebuff-instance-owner.json when its session changes, so a
+// startup snapshot alone would go stale after a CLI restart.
+func (m *Manager) adoptOwner() (CLIOwner, bool) {
+	m.mu.Lock()
+	adopt := m.adopt
+	m.mu.Unlock()
+	if adopt == nil || !adopt.Enabled {
+		return CLIOwner{}, false
+	}
+	data, err := os.ReadFile(adopt.OwnerFile)
+	if err != nil {
+		return CLIOwner{}, false
+	}
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	var owner CLIOwner
+	if err := json.Unmarshal(data, &owner); err != nil {
+		return CLIOwner{}, false
+	}
+	if owner.InstanceID == "" && owner.PID == 0 {
+		// Empty owner record: fall back to the startup snapshot only for the
+		// instance id (the pid is required for liveness).
+		owner = adopt.Initial
+	}
+	return owner, true
+}
+
+// adoptOrCreate is the issue #97 session-creation path: when CLI adoption
+// is enabled it adopts the CLI's active session (or refuses to create a
+// competing one); otherwise it creates a fresh session exactly as before.
+func (m *Manager) adoptOrCreate(ctx context.Context, requestedModel string) (*upstream.SessionState, error) {
+	m.mu.Lock()
+	adopt := m.adopt
+	m.mu.Unlock()
+	if adopt == nil || !adopt.Enabled {
+		return m.client.CreateSessionForModel(ctx, requestedModel)
+	}
+
+	owner, ok := m.adoptOwner()
+	if !ok {
+		// Owner file missing/unreadable (issue #97(c)): the CLI's session
+		// state is unknown, so a create could supersede and log out the CLI.
+		// Refuse loudly rather than compete.
+		slog.Warn("ADOPT_CLI_SESSION: freebuff-instance-owner.json missing — refusing to create a competing session",
+			"file", adopt.OwnerFile)
+		return nil, fmt.Errorf("ADOPT_CLI_SESSION: freebuff-instance-owner.json missing (%s) — refusing to create a competing session (start the CLI once or disable ADOPT_CLI_SESSION)", adopt.OwnerFile)
+	}
+	if owner.PID <= 0 || !adopt.testAlive(owner.PID) {
+		// The CLI process is not running: the proxy may create (and own) a
+		// session for the account, exactly like the reference fallback.
+		return m.client.CreateSessionForModel(ctx, requestedModel)
+	}
+	if owner.InstanceID == "" {
+		return nil, fmt.Errorf("ADOPT_CLI_SESSION: the FreeBuff CLI is running but no session instance was recorded — refusing to create a competing session (stop the CLI or retry)")
+	}
+	// CLI alive: adopt ITS session — poll it, never POST a competing one
+	// (a create supersedes the CLI's session and logs it out).
+	st, err := m.client.GetSession(ctx, owner.InstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("ADOPT_CLI_SESSION: CLI session %s could not be verified (%v) — refusing to create a competing session (stop the CLI or retry)", shortInstance(owner.InstanceID), err)
+	}
+	status := strings.TrimSpace(st.Status)
+	switch status {
+	case "active":
+		if requestedModel != "" && st.Model != "" && st.Model != requestedModel {
+			return nil, fmt.Errorf("ADOPT_CLI_SESSION: the CLI session is for model %s but %s was requested — refusing to create a competing session (use %s or stop the CLI)", st.Model, requestedModel, st.Model)
+		}
+		slog.Info("adopted existing CLI freebuff session", "instance_id", shortInstance(st.InstanceID), "model", st.Model)
+		return st, nil
+	case "queued":
+		// Adopt the queue position: pollAt mirrors the create path.
+		if st.PollAt.IsZero() {
+			wait := time.Duration(st.EstimatedWaitMs) * time.Millisecond
+			if wait < time.Second {
+				wait = time.Second
+			}
+			if wait > 5*time.Second {
+				wait = 5 * time.Second
+			}
+			st.PollAt = time.Now().Add(wait)
+		}
+		slog.Info("adopted queued CLI freebuff session", "instance_id", shortInstance(st.InstanceID), "position", st.Position)
+		return st, nil
+	case "disabled":
+		slog.Info("adopted disabled CLI freebuff session")
+		return st, nil
+	default:
+		return nil, fmt.Errorf("ADOPT_CLI_SESSION: CLI session %s is not adoptable (status %q) — refusing to create a competing session (restart the CLI or stop it)", shortInstance(owner.InstanceID), status)
+	}
+}
+
+// shortInstance renders a session instance id's first 8 chars for logs.
+func shortInstance(id string) string {
+	if len(id) > 8 {
+		return id[:8] + "…"
+	}
+	return id
 }
 
 // commit replaces the cached state and mirrors it into the store (when
@@ -425,14 +571,14 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 			// instead of burning a fresh session quota.
 			st, err = m.pollPersisted(ctx, targetModel)
 			if st == nil && err == nil {
-				st, err = m.client.CreateSessionForModel(ctx, targetModel)
+				st, err = m.adoptOrCreate(ctx, targetModel)
 			}
 		} else {
 			// Live refresh (expired cache or model mismatch): never consult
 			// the store. Re-adopting a persisted slot here would pin the
 			// previous model's session on every refresh; always create for
 			// the requested model (baseline behavior).
-			st, err = m.client.CreateSessionForModel(ctx, targetModel)
+			st, err = m.adoptOrCreate(ctx, targetModel)
 		}
 		if err != nil {
 			return err
@@ -636,6 +782,21 @@ func (m *Manager) Invalidate() {
 	m.commit(nil)
 	m.mu.Unlock()
 	slog.Debug("session invalidated", "instance_id", instanceID)
+}
+
+// ClearQueued drops the cached session only when it is in the queued
+// (waiting-room) state, and reports whether it did (issue #100: the
+// queue-time model fallback clears queued caches so a fallback-model
+// acquire can create a fresh session instead of re-surfacing the same
+// waiting room). Active/disabled states are untouched.
+func (m *Manager) ClearQueued() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state != nil && m.state.status == "queued" {
+		m.commit(nil)
+		return true
+	}
+	return false
 }
 
 // EndSession deletes the upstream session (if any) and clears the cache.

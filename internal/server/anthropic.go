@@ -687,12 +687,12 @@ func (s *Server) relayAnthropicStream(ctx context.Context, w http.ResponseWriter
 			if lc.err != nil {
 				if ctx.Err() == nil {
 					s.logger.Warn("anthropic upstream stream error", "err", lc.err)
-					s.finalizeAnthropicStream(send, st, nil)
+					s.finalizeAnthropicStream(send, st)
 				}
 				return
 			}
 			if lc.done {
-				s.finalizeAnthropicStream(send, st, nil)
+				s.finalizeAnthropicStream(send, st)
 				return
 			}
 			clean, drop := convert.SanitizeChunk(lc.line)
@@ -812,9 +812,8 @@ func (s *Server) accumulateAnthropicChunk(send func(map[string]any), st *anthrop
 }
 
 // finalizeAnthropicStream closes every open content block and emits
-// message_delta + message_stop. usage, when non-nil, overrides the
-// captured usage (used on the error path).
-func (s *Server) finalizeAnthropicStream(send func(map[string]any), st *anthropicStreamState, usage map[string]any) {
+// message_delta + message_stop.
+func (s *Server) finalizeAnthropicStream(send func(map[string]any), st *anthropicStreamState) {
 	st.closeThinking(send)
 	st.closeText(send)
 	indexes := make([]int, 0, len(st.toolCalls))
