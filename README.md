@@ -14,7 +14,7 @@ Your coding tools expect an OpenAI-style endpoint (`/v1/chat/completions`). The 
 
 > **⚠️ Terms-of-service risk.** Using your FreeBuff token through this proxy conflicts with FreeBuff/Codebuff terms of service; upstream abuse detection can suspend or permanently ban accounts. Use `SAFE_MODE=true`, keep usage modest, and do not run unattended 24/7. See [Getting Started](docs/guides/getting-started.md).
 
-> **⚠️ Honest expectations.** FreeBuff's servers are strict, and this proxy **reduces** ban risk — it does not eliminate it. Nothing here can guarantee your account is never flagged or banned. Upstream detection is documented in the open-source FreeBuff client: per-request IP scoring (VPN/proxy/Tor/hosting egress → limited tier or terminal `country_blocked`), per-account trust levels with sticky caps (third-party-client flag, shared signup network, shared mailbox), daily spend ceilings ($0.50/day for restricted cohorts), and mass sweeps against known farm shapes (6,699 of 7,129 disposable-email accounts were already banned when the blocklist was compiled). This project is a local adapter that exposes FreeBuff's models as an OpenAI-compatible API for other coding agents (OpenCode, pi, hermes, openclaw, or any client that supports a custom endpoint). Your auth tokens are handled automatically by the gateway, which reimplements the official CLI's wire protocol (~99% parity); it is not the official client, and upstream changes can break it until adapted. Keep usage modest and follow the hygiene rules below; further improvements to session handling and ban avoidance are planned.
+> **⚠️ Honest expectations.** FreeBuff's servers are strict, and this proxy **reduces** ban risk; it does not eliminate it. Nothing here can guarantee your account is never flagged or banned. Upstream detection is documented in the open-source FreeBuff client: per-request IP scoring (VPN/proxy/Tor/hosting egress → limited tier or terminal `country_blocked`), per-account trust levels with sticky caps (third-party-client flag, shared signup network, shared mailbox), daily spend ceilings ($0.50/day for restricted cohorts), and mass sweeps against known farm shapes (6,699 of 7,129 disposable-email accounts were already banned when the blocklist was compiled). This project is a local adapter that exposes FreeBuff's models as an OpenAI-compatible API for other coding agents (OpenCode, pi, hermes, openclaw, or any client that supports a custom endpoint). Your auth tokens are handled automatically by the gateway, which reimplements the official CLI's wire protocol (~99% parity); it is not the official client, and upstream changes can break it until adapted. Keep usage modest and follow the hygiene rules below; further improvements to session handling and ban avoidance are planned.
 
 ---
 
@@ -54,15 +54,15 @@ If you are a beginner, you don't need to write code or compile anything:
    - **Model**: `deepseek/deepseek-v4-flash`
    *(See [Client Integration Guide](docs/guides/client-integration.md) for 1-click config snippets)*.
 
-**Before you start — the rules (what you should / shouldn't do):**
+**Before you start, the rules (what you should / shouldn't do):**
 
 | ✅ Do | ❌ Don't |
 |---|---|
-| Use **one key until it is rate-limited** — the pool drains it naturally | **Don't rotate many healthy keys** — looks like account farming |
-| Use a **normal residential connection** | **Don't use a VPN / proxy / Tor** — hard-block signal: limited tier or `country_blocked` |
-| Register with a **real email** (e.g. Gmail) | **Don't use temp-mail** — documented ban cohort (6,699 of 7,129 accounts already banned) |
-| Request **only models your tier/region offers** (default Flash) | **Don't request out-of-region models** — refused/downgraded and correlated with your IP's geo |
-| Read a `429` as **quota, resets Pacific midnight** | **Don't confuse it with a ban** — only `403` `banned`/`country_blocked` is terminal |
+| Use **one key until it is rate-limited**; the pool drains it naturally | **Don't rotate many healthy keys**; it looks like account farming |
+| Use a **normal residential connection** | **Don't use a VPN / proxy / Tor** (hard-block signal: limited tier or `country_blocked`) |
+| Register with a **real email** (e.g. Gmail) | **Don't use temp-mail** (documented ban cohort: 6,699 of 7,129 accounts already banned) |
+| Request **only models your tier/region offers** (default Flash) | **Don't request out-of-region models**: refused/downgraded and correlated with your IP's geo |
+| Read a `429` as **quota, resets Pacific midnight** | **Don't confuse it with a ban**; only `403` `banned`/`country_blocked` is terminal |
 | Expect **reduced** risk, not immunity | **Don't run unattended 24/7** or expect zero ban risk |
 | Keep the pool **draining one key at a time** | **Don't hammer many tokens from one public IP** (`ip_capped`) |
 
@@ -161,11 +161,11 @@ cp .env.example .env   # then set AUTH_TOKENS
 docker compose up -d --build
 ```
 
-**Or** download a release binary from [Releases](https://github.com/trefeon/freebuff-proxy/releases) (Linux/macOS/Windows × amd64/arm64), unzip it, right-click the extracted folder → **Open in Terminal**, and run `./start-proxy.sh` (Windows: `.\start-proxy.cmd` — the `.cmd` wrappers bypass the PowerShell execution policy). The bundled scripts also include a headless token generator (`gen-freebuff-token.sh` / `gen-token.cmd`).
+**Or** download a release binary from [Releases](https://github.com/trefeon/freebuff-proxy/releases) (Linux/macOS/Windows × amd64/arm64), unzip it, right-click the extracted folder → **Open in Terminal**, and run `./start-proxy.sh` (Windows: `.\start-proxy.cmd`; the `.cmd` wrappers bypass the PowerShell execution policy). The bundled scripts also include a headless token generator (`gen-freebuff-token.sh` / `gen-token.cmd`).
 
 ### 2. Obtain an Auth Token
 
-Generate one headlessly (opens a browser OAuth login). Run with no flags for an interactive menu — the recommended default (Enter) appends the token to `.env`, auto-creating it from `.env.example` if missing:
+Generate one headlessly (opens a browser OAuth login). Run with no flags for an interactive menu; the recommended default (Enter) appends the token to `.env`, auto-creating it from `.env.example` if missing:
 
 **Windows (PowerShell):**
 
@@ -267,7 +267,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `SESSION_STATE_FILE` | `.freebuff-session-state.json` | Path of the session state file (used when `SESSION_PERSIST=true`; token-keyed, `0600`) |
 
 When `SESSION_PERSIST=true`, the state file stores a SHA-256 hash of each
-active token plus its session metadata (instance id, expiry, tier/country) —
+active token plus its session metadata (instance id, expiry, tier/country),
 including bridge-mode client tokens, since every session manager shares the
 one store. The raw token is never written, and the file is created with mode
 `0600`. Leave `SESSION_PERSIST` unset (or `false`) to opt out entirely.
@@ -279,7 +279,7 @@ opt out). It enables essential anti-ban protections and presets:
 
 - **JA3 TLS Stealth**: Mimics real browser handshakes (Chrome 120/126, Safari 17/18, Firefox 120/128, Edge 126) via `uTLS` to prevent WAF / CDN bot detection.
 - **Proxy Header Sanitization**: Strips 25 proxy-identifying headers (`X-Forwarded-For`, `Via`, `CF-Connecting-IP`, etc.).
-- **Request Jitter**: Injects randomized 0–2s delay jitter to break robotic, machine-like cadence.
+- **Request Jitter**: Injects randomized 0-2s delay jitter to break robotic, machine-like cadence.
 - **Idle Rotation**: Finishes runs after 30 minutes of inactivity.
 - **Daily Cap** (optional): `MAX_MESSAGES_PER_DAY` defaults to `0` (unlimited). The upstream `429` lock is the real enforcement; see below.
 
@@ -293,13 +293,13 @@ opt out). It enables essential anti-ban protections and presets:
 - **Do not route through a VPN.** VPN / proxy / Tor / hosting egress is a hard-block signal:
   it demotes the account to the limited tier or a terminal `country_blocked`, and restricted
   cohorts are priced at a **$0.50/day spend ceiling** (≈1 session/day). The proxy's stealth
-  settings mask TLS fingerprints and proxy headers — they do **not** change your public IP.
+  settings mask TLS fingerprints and proxy headers; they do **not** change your public IP.
   Use a normal residential connection.
 - **Do not hammer many tokens at once from the same public IP.** Upstream caps how many
   distinct users can hold an active free session on one egress IP (`ip_capped`, 429), and
   accounts created from the same signup network (≥8 per /24) or mailbox (≥3) are permanently
   capped at lower trust levels. Documented ban cohorts include single-IP rings and same-day
-  account mints. The pool already drains keys one at a time — do not add aggressive rotation
+  account mints. The pool already drains keys one at a time; do not add aggressive rotation
   on top.
 - **Only request models your account's tier and region actually offers.** Out-of-tier picks
   are silently downgraded to `deepseek/deepseek-v4-flash` or refused (`model_unavailable`,
@@ -307,10 +307,10 @@ opt out). It enables essential anti-ban protections and presets:
   resolved geo, so a premium model request from a VPN/hosting IP is a suspicious,
   ToS-prohibited combination.
 - **Know the difference between a quota and a ban.** `429` (quota/waiting room, resets at
-  Pacific midnight) is the normal end-of-day signal — the proxy locks the token locally and
+  Pacific midnight) is the normal end-of-day signal; the proxy locks the token locally and
   answers in `<1ms`, and routers fail over. Only `403` with `banned` / `country_blocked`
   means the account itself is gone: stop using it and move to a fresh established account.
-- **For ~24h of continuous coding, budget 4–5 keys.** Each FreeBuff account has a daily
+- **For ~24h of continuous coding, budget 4-5 keys.** Each FreeBuff account has a daily
   session quota (≈6 sessions on the limited tier, ≈5 premium sessions/day). One key ≈ one
   day of moderate use. Configure `AUTH_TOKENS` with as many keys as you need and let the
   pool drain them one at a time.
@@ -334,7 +334,7 @@ opt out). It enables essential anti-ban protections and presets:
 | Endpoint | Auth | Description |
 |---|---|---|
 | `POST /v1/chat/completions` | `API_KEYS` (when set) | OpenAI-compatible chat, streaming and non-streaming |
-| `GET /v1/models` | `API_KEYS` (when set) | Model catalog from the registry (fallback at boot + live refresh). Each row carries `available`/`status`/`current_access_tier`: models outside the limited-tier allowlist (`deepseek-v4-flash`, `mimo-v2.5`) are marked `available:false, status:"region_limited"` when the token's egress region demotes it to the limited tier — `MODELS_HIDE_UNAVAILABLE=true` prunes them from the list |
+| `GET /v1/models` | `API_KEYS` (when set) | Model catalog from the registry (fallback at boot + live refresh). Each row carries `available`/`status`/`current_access_tier`: models outside the limited-tier allowlist (`deepseek-v4-flash`, `mimo-v2.5`) are marked `available:false, status:"region_limited"` when the token's egress region demotes it to the limited tier; `MODELS_HIDE_UNAVAILABLE=true` prunes them from the list |
 | `GET /healthz` | none | JSON: `status`, `uptime_seconds`, `models`, per-token snapshot (incl. per-model `quota` map when the last admission carried it), `bridge_tokens` |
 | `GET /metrics` | none | Prometheus text format: uptime, model count, per-token 24h messages / requests / active runs / cooldown, per-model quota (`freebuff_proxy_quota_recent` / `freebuff_proxy_quota_limit`) |
 | `POST /admin/reload` | `ADMIN_TOKEN` (when set) | Hot-reload configuration from disk without restart |

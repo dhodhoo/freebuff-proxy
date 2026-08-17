@@ -54,7 +54,7 @@ After creating the `freebuff` node, open it and click **Add API Key**:
 
 > [!IMPORTANT]
 > **Connection Strategy with Multiple Keys (Bridge Mode)**:
-> If you add multiple FreeBuff accounts in 9router, set connection strategy to **Fallback / Priority (Fill the first)** — **NEVER Round-Robin**.
+> If you add multiple FreeBuff accounts in 9router, set connection strategy to **Fallback / Priority (Fill the first)**: **NEVER Round-Robin**.
 > Round-robin drains all accounts simultaneously and triggers anti-farm ban detection. Fallback uses one account until its daily quota (`429`) is exhausted, then smoothly fails over to the next key.
 
 > [!NOTE]

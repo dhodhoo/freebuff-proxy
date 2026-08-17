@@ -21,11 +21,11 @@ This guide takes you from zero to a working OpenAI-compatible proxy connected to
 
 Using freebuff-proxy is five steps, most of them one command:
 
-1. **Get a FreeBuff account + token (`cb_...`)** — the official CLI or `scripts/gen-token.*` does this for you.
-2. **Install the proxy** — one command (below).
-3. **Choose your mode** — one user with your own account(s) → **pooled** (`AUTH_TOKENS=cb_...`); a router serving many users → **bridge** (leave `AUTH_TOKENS=` empty).
-4. **Run and verify** — `./freebuff-proxy`, then `curl http://127.0.0.1:3457/healthz`.
-5. **Connect your AI tool** — point it at `http://127.0.0.1:3457/v1`, model `deepseek/deepseek-v4-flash`.
+1. **Get a FreeBuff account + token (`cb_...`)**: the official CLI or `scripts/gen-token.*` does this for you.
+2. **Install the proxy**: one command (below).
+3. **Choose your mode**: one user with your own account(s) → **pooled** (`AUTH_TOKENS=cb_...`); a router serving many users → **bridge** (leave `AUTH_TOKENS=` empty).
+4. **Run and verify**: `./freebuff-proxy`, then `curl http://127.0.0.1:3457/healthz`.
+5. **Connect your AI tool**: point it at `http://127.0.0.1:3457/v1`, model `deepseek/deepseek-v4-flash`.
 
 ---
 
@@ -36,13 +36,13 @@ Using this proxy conflicts with Codebuff's terms of service. Upstream abuse dete
 | ✅ Do | ❌ Don't |
 |---|---|
 | **Keep `SAFE_MODE=true`** (default; anti-ban stealth: TLS fingerprint, header sanitization, request jitter, idle rotation) | **Don't** run 24/7 on heavy unattended automated tasks |
-| Use a **normal residential connection** | **Don't use a VPN / proxy / Tor** — hard-block signal: limited tier or terminal `country_blocked`, restricted cohorts get a $0.50/day spend ceiling (≈1 session/day) |
-| Request **only models your tier/region offers** | **Don't request out-of-region models** — refused or silently downgraded to `deepseek/deepseek-v4-flash`, and the model id is correlated with your egress IP's region |
-| Keep **one modest account** | **Don't create spam clusters** — upstream caps distinct active sessions per egress IP (`ip_capped`); accounts from the same signup network (≥8 per /24) or mailbox (≥3) are permanently capped at lower trust levels |
+| Use a **normal residential connection** | **Don't use a VPN / proxy / Tor**. Hard-block signal: limited tier or terminal `country_blocked`, restricted cohorts get a $0.50/day spend ceiling (≈1 session/day) |
+| Request **only models your tier/region offers** | **Don't request out-of-region models**: refused or silently downgraded to `deepseek/deepseek-v4-flash`, and the model id is correlated with your egress IP's region |
+| Keep **one modest account** | **Don't create spam clusters**: upstream caps distinct active sessions per egress IP (`ip_capped`); accounts from the same signup network (≥8 per /24) or mailbox (≥3) are permanently capped at lower trust levels |
 | **Use one key until it is rate-limited** | **Don't rotate several healthy keys aggressively** (farming signal) |
-| Register with a **real email address** (e.g. Gmail) | **Don't use temp-mail** — documented ban cohort: 6,699 of 7,129 accounts on flagged domains already banned |
-| Read a `429` as **quota, resets Pacific midnight** (proxy locks the token locally, answers in `<1ms`) | **Don't confuse it with a ban** — only `403` `banned`/`country_blocked` means the account is gone; use a new established account |
-| Budget **4–5 keys for 24h of coding** | **Don't** expect more than one key ≈ one day of moderate use |
+| Register with a **real email address** (e.g. Gmail) | **Don't use temp-mail**. Documented ban cohort: 6,699 of 7,129 accounts on flagged domains already banned |
+| Read a `429` as **quota, resets Pacific midnight** (proxy locks the token locally, answers in `<1ms`) | **Don't confuse it with a ban**: only `403` `banned`/`country_blocked` means the account is gone; use a new established account |
+| Budget **4-5 keys for 24h of coding** | **Don't** expect more than one key ≈ one day of moderate use |
 
 ---
 
