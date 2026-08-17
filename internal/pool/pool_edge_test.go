@@ -367,7 +367,7 @@ func TestBridgeIdleSweepSkipsBusy(t *testing.T) {
 	if p.bridgeToken("busy-tok") == nil {
 		t.Error("busy bridge entry evicted while its lease is outstanding")
 	}
-	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+	if got := parentFinished(mock); len(got) != 0 {
 		t.Errorf("finished runs = %d, want 0 (busy run must not be finished)", len(got))
 	}
 }
@@ -422,7 +422,7 @@ func TestBridgeEvictionAllBusyKeepsCap(t *testing.T) {
 		}
 	}
 	// No runs were FINISHed: nothing was evictable this pass.
-	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+	if got := parentFinished(mock); len(got) != 0 {
 		t.Errorf("finished runs = %d, want 0 (nothing evictable while all entries busy)", len(got))
 	}
 	for _, l := range held {
@@ -461,7 +461,7 @@ func TestRemoveLastTokenDrainsRun(t *testing.T) {
 
 	// The removed token's run was FINISHed and its admitted session ended
 	// (both synchronous inside RemoveLastToken).
-	if got := mock.FinishedRunsSnapshot(); len(got) != 1 || got[0].Status != "completed" {
+	if got := parentFinished(mock); len(got) != 1 || got[0].Status != "completed" {
 		t.Errorf("finished runs = %v, want 1 completed", got)
 	}
 	if mock.SessionEnds != 1 {

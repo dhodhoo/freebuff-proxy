@@ -21,7 +21,7 @@ var envKeys = []string{
 	"SOCKS5_PROXY", "SOCKS5_PROXIES", "PROXY_ROTATION", "COST_MODE", "USER_ID",
 	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
-	"MODELS_HIDE_UNAVAILABLE", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
+	"MODELS_HIDE_UNAVAILABLE", "CORS_ALLOWED_ORIGIN", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
 	"AUTO_DISCOVER_TOKEN", "TRANSIENT_RETRIES", "ADMIN_TOKEN",
 	"SESSION_PERSIST", "SESSION_STATE_FILE",
 	"STABLE_EGRESS", "HTTP2_UPSTREAM", "PROXY_HEALTH_INTERVAL", "PROXY_HEALTH_MAX_FAILURES",
@@ -97,6 +97,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.HybridMode {
 		t.Error("HybridMode = true, want false (default)")
 	}
+	if cfg.CORSAllowedOrigin != "*" {
+		t.Errorf("CORSAllowedOrigin = %q, want %q (default)", cfg.CORSAllowedOrigin, "*")
+	}
 	if got := cfg.EffectiveMode(); got != "pooled" {
 		t.Errorf("EffectiveMode = %q, want pooled", got)
 	}
@@ -117,6 +120,35 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.SessionStateFile != ".freebuff-session-state.json" {
 		t.Errorf("SessionStateFile = %q, want %q", cfg.SessionStateFile, ".freebuff-session-state.json")
+	}
+}
+
+// TestCORSAllowedOrigin pins the CORS_ALLOWED_ORIGIN env parsing: the env
+// value (or a JSON/.env value) overrides the "*" default, and a whitespace-
+// only value is skipped (overrideStringFrom convention) so the "*" default
+// stays — an empty/whitespace .env line cannot disable CORS.
+func TestCORSAllowedOrigin(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("CORS_ALLOWED_ORIGIN", "https://app.example.com")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CORSAllowedOrigin != "https://app.example.com" {
+		t.Errorf("CORSAllowedOrigin = %q, want env override", cfg.CORSAllowedOrigin)
+	}
+
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok-1")
+	t.Setenv("CORS_ALLOWED_ORIGIN", "   ")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load(blank): %v", err)
+	}
+	if cfg.CORSAllowedOrigin != "*" {
+		t.Errorf("CORSAllowedOrigin = %q, want retained default %q (whitespace-only env is skipped)", cfg.CORSAllowedOrigin, "*")
 	}
 }
 

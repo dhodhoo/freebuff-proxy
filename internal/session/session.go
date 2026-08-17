@@ -39,6 +39,9 @@ const (
 	// probe target for token tests / smoke: every account (including
 	// limited tier) can use it, unlike an alphabetical-first catalog pick.
 	DefaultFallbackModel = "deepseek/deepseek-v4-flash"
+	// asyncReAdmitTimeout bounds the background pre-emptive re-admit
+	// (issue #99) so a hung upstream never leaks a goroutine.
+	asyncReAdmitTimeout = time.Minute
 )
 
 // WaitingRoomError is returned when the session is queued and pollAt has not
@@ -72,6 +75,18 @@ type Manager struct {
 	// becoming the next refresher and re-running the failing upstream create.
 	// Cleared when a new refresh starts, so a later caller retries normally.
 	refreshErr error
+
+	// reAdmitLead (issue #99, SESSION_RE_ADMIT_LEAD default 60s): when the
+	// cached active session has less than this much time left, EnsureSession
+	// triggers a pre-emptive async re-admit (single-flight through the
+	// existing refreshing machinery) and rides the old session; the next
+	// request gets the new instance. 0 disables.
+	reAdmitLead time.Duration
+	// probeTTL (issue #60, SESSION_PROBE_CACHE_TTL default 15s) + lastAdmitted:
+	// the last successful upstream session response is reused to skip a
+	// redundant GET (heartbeat) within the TTL.
+	probeTTL     time.Duration
+	lastAdmitted time.Time
 }
 
 type cachedState struct {
@@ -97,6 +112,9 @@ type cachedState struct {
 	// admission/poll that carried rateLimitsByModel (key = model id);
 	// nil until such a response is seen.
 	quotaByModel map[string]upstream.ModelQuota
+	// standing is the upstream account standing block (issue #96); nil until
+	// an admission/poll that carried it.
+	standing *upstream.SessionStanding
 }
 
 // NewManager builds a session manager for the given upstream client.
@@ -112,6 +130,26 @@ func NewManagerWithStore(client *upstream.Client, store *Store) *Manager {
 		m.key = client.TokenKey()
 	}
 	return m
+}
+
+// SetReAdmitLead configures the pre-emptive re-admit lead (issue #99): when
+// the cached active session has less than d left, EnsureSessionForModel
+// triggers an async re-admit and rides the old session. d <= 0 disables.
+// Wired by the pool from SESSION_RE_ADMIT_LEAD; safe to call at runtime.
+func (m *Manager) SetReAdmitLead(d time.Duration) {
+	m.mu.Lock()
+	m.reAdmitLead = d
+	m.mu.Unlock()
+}
+
+// SetAdmissionProbeTTL configures the admission probe cache TTL (issue #60):
+// heartbeat GETs within d of the last successful session response are
+// skipped. d <= 0 disables. Wired by the pool from SESSION_PROBE_CACHE_TTL;
+// safe to call at runtime.
+func (m *Manager) SetAdmissionProbeTTL(d time.Duration) {
+	m.mu.Lock()
+	m.probeTTL = d
+	m.mu.Unlock()
 }
 
 // commit replaces the cached state and mirrors it into the store (when
@@ -158,6 +196,23 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 			case "active":
 				if (model == "" || s.model == "" || s.model == model) && time.Now().Before(s.expiresAt.Add(-expiryMargin)) {
 					instance := s.instanceID
+					// Issue #99: pre-emptive re-admit. When the session has
+					// less than the re-admit lead left, kick off an async
+					// re-admit (single-flight through the refreshing
+					// machinery) and ride the old session this request; the
+					// next request gets the new instance. The refresh runs on
+					// a background context so the caller's cancellation never
+					// strands a half-started admission.
+					if m.reAdmitLead > 0 && time.Until(s.expiresAt.Add(-expiryMargin)) <= m.reAdmitLead {
+						m.refreshing = true
+						m.refreshErr = nil
+						refreshCh := make(chan struct{})
+						m.refreshCh = refreshCh
+						m.mu.Unlock()
+						go m.asyncReAdmit(model)
+						slog.Debug("session: pre-emptive re-admit triggered", "instance_id", instance, "model", s.model)
+						return instance, nil
+					}
 					m.mu.Unlock()
 					slog.Debug("session reused", "instance_id", instance, "model", s.model, "expires_at", s.expiresAt.Format(time.RFC3339))
 					return instance, nil
@@ -212,6 +267,13 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 							RetryAfter: time.Until(s.pollAt),
 						}
 					}
+					// Issue #99: a failed pre-emptive re-admit leaves the old
+					// active session authoritative — ride it rather than
+					// erroring a request that could still be served.
+					if s != nil && s.status == "active" &&
+						time.Now().Before(s.expiresAt.Add(-expiryMargin)) {
+						return s.instanceID, nil
+					}
 					return "", err
 				}
 				continue // refresh succeeded; loop re-evaluates cached state
@@ -264,6 +326,31 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 		}
 	}
 	return "", errors.New("session: not ready after repeated refreshes")
+}
+
+// asyncReAdmit runs a pre-emptive refresh in the background (issue #99): the
+// triggering request rides the old session while the new admission proceeds;
+// concurrent requests park on the single-flight refreshCh and get the new
+// instance once it lands (or ride the old session when the refresh fails and
+// it is still usable). Bounded by asyncReAdmitTimeout so a hung upstream
+// never leaks a goroutine.
+func (m *Manager) asyncReAdmit(model string) {
+	ctx, cancel := context.WithTimeout(context.Background(), asyncReAdmitTimeout)
+	defer cancel()
+	err := m.refresh(ctx, model)
+	m.mu.Lock()
+	m.refreshing = false
+	if err != nil {
+		m.refreshErr = err
+	}
+	close(m.refreshCh)
+	m.refreshCh = nil
+	m.mu.Unlock()
+	if err != nil {
+		slog.Debug("session: pre-emptive re-admit failed", "err", err)
+		return
+	}
+	slog.Debug("session: pre-emptive re-admit done")
 }
 
 // statusError maps an upstream session status to the typed error callers
@@ -372,7 +459,11 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 				ipPrivacySignals:   st.IpPrivacySignals,
 				limit:              st.Limit,
 				quotaByModel:       st.RateLimitsByModel,
+				standing:           st.Standing,
 			})
+			// Issue #60: the successful admission refreshes the probe cache
+			// window — subsequent heartbeat GETs within the TTL are skipped.
+			m.lastAdmitted = time.Now()
 			m.mu.Unlock()
 			slog.Debug("session created", "status", "active", "instance_id", st.InstanceID,
 				"model", model, "expires_at", st.ExpiresAt.Format(time.RFC3339))
@@ -478,6 +569,9 @@ type SessionSnapshot struct {
 	// upstream wire nests entitlement inside each rate-limit entry.
 	QuotaByModel map[string]QuotaSnapshot
 	Entitlement  map[string]float64
+	// Standing is the upstream account standing block (issue #96); nil until
+	// an admission/poll that carried it.
+	Standing *upstream.SessionStanding
 }
 
 // QuotaSnapshot is one model's live session quota for healthz/metrics
@@ -527,6 +621,7 @@ func (m *Manager) Snapshot() SessionSnapshot {
 		ExpiresAt:          m.state.expiresAt,
 		GracePeriodEndsAt:  m.state.gracePeriodEndsAt,
 		QuotaByModel:       quota,
+		Standing:           m.state.standing,
 	}
 }
 
@@ -676,6 +771,14 @@ func (m *Manager) Heartbeat(ctx context.Context) error {
 		m.mu.Unlock()
 		return nil
 	}
+	// Issue #60: admission probe caching — within the probe TTL of the last
+	// successful session response the cached state is authoritative, so the
+	// heartbeat GET is redundant; skip it (less upstream traffic, fewer
+	// chances to trip the one-client-at-a-time gate).
+	if m.probeTTL > 0 && !m.lastAdmitted.IsZero() && time.Since(m.lastAdmitted) < m.probeTTL {
+		m.mu.Unlock()
+		return nil
+	}
 	instanceID := m.state.instanceID
 	m.mu.Unlock()
 
@@ -683,6 +786,10 @@ func (m *Manager) Heartbeat(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	m.mu.Lock()
+	// A successful GET confirms the cached state: refresh the probe window.
+	m.lastAdmitted = time.Now()
+	m.mu.Unlock()
 	if serr := statusError(st.Status, st); serr != nil {
 		// A banned session is dead until the account unban: drop the cached
 		// admission (cooldown) so the token re-admits only after the pool's

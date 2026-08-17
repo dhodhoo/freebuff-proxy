@@ -41,6 +41,51 @@ const countryBlockCooldown = 15 * time.Minute
 // deadline (PRD §5: "10s force deadline").
 const shutdownTimeout = 10 * time.Second
 
+// Defaults for the bounded deferred-FINISH queue (issue #90) and the
+// draining-runs list bounds (issue #55). Overridable via
+// runs.Options (pool wires config knobs RUN_FINISH_QUEUE_SIZE /
+// RUN_FINISH_INLINE_TIMEOUT / RUNS_DRAIN_QUEUE_CAP / RUNS_DRAIN_TTL).
+const (
+	defaultFinishQueueSize     = 64
+	defaultInlineFinishTimeout = 250 * time.Millisecond
+	defaultDrainQueueCap       = 64
+	defaultDrainTTL            = 10 * time.Minute
+)
+
+// Options configures a RunManager: the rotation interval, the bounded
+// deferred-FINISH worker queue bounds (#90/#55), and the optional
+// session-state store for run persistence across restarts (#40). Zero
+// values fall back to the package defaults.
+type Options struct {
+	RotationInterval    time.Duration
+	FinishQueueSize     int
+	InlineFinishTimeout time.Duration
+	DrainQueueCap       int
+	DrainTTL            time.Duration
+	Store               *session.Store
+}
+
+// asyncJobKind discriminates the deferred-side-effect jobs carried by the
+// bounded finish queue (issue #90/#91): FINISH a rotated/drained run,
+// record a completed chat step, or create the context-pruner child run.
+type asyncJobKind uint8
+
+const (
+	jobFinish asyncJobKind = iota
+	jobStep
+	jobChildRun
+)
+
+// asyncJob is one unit of deferred upstream work. jobs are processed by a
+// single background worker per RunManager; when the bounded queue is full
+// the caller runs the job inline bounded by the inline timeout.
+type asyncJob struct {
+	kind      asyncJobKind
+	run       *Run
+	messageID string
+	startTime time.Time
+}
+
 // newTraceSessionID mints a UUIDv4 trace session id from crypto/rand,
 // mirroring the CLI's randomUUID per run (run.ts: previousRun?.traceSessionId
 // ?? randomUUID). A crypto/rand failure is unrecoverable in practice; fall
@@ -70,6 +115,15 @@ type Run struct {
 
 	inflight  int  // leases outstanding; guarded by the manager mutex
 	finishing bool // FINISH in flight; guarded by the manager mutex
+	// queued marks a deferred FINISH job already in the bounded queue
+	// (issue #90): rotate and Maintain both enqueue draining runs, and the
+	// dedupe prevents a failed attempt from being FINISHed twice upstream.
+	// Guarded by the manager mutex.
+	queued bool
+	// drainedAt is when the run was pushed onto the draining list (issue
+	// #55): the TTL eviction drops entries stuck draining past DrainTTL.
+	// Guarded by the manager mutex.
+	drainedAt time.Time
 }
 
 // runFlight coordinates single-flight coalescing for concurrent StartRun calls.
@@ -128,19 +182,93 @@ type RunManager struct {
 	// that get FINISHed leave the active+draining sets and would otherwise
 	// take their request counts out of Snapshot.
 	totalRequests int
+
+	// Deferred-FINISH queue (issue #90): rotated/drained runs, chat steps,
+	// and child-run creation are processed by one background worker per
+	// finishQueue is bounded (Options.FinishQueueSize); when it is
+	// full the caller runs the job inline bounded by inlineFinishTimeout.
+	// finishStop is closed once (finishOnce) by Shutdown; the worker drains
+	// the queue and exits, tracked by finishWg. finishStartOnce starts the
+	// worker on first use. finishExited is closed by the worker on exit
+	// (test hook for goroutine-leak assertions).
+	finishQueue         chan asyncJob
+	finishStop          chan struct{}
+	finishOnce          sync.Once
+	finishStartOnce     sync.Once
+	finishWg            sync.WaitGroup
+	finishExited        chan struct{}
+	inlineFinishTimeout time.Duration
+	// drainQueueCap / drainTTL bound the draining list (issue #55).
+	drainQueueCap int
+	drainTTL      time.Duration
+
+	// store persists active runs across restarts (SESSION_PERSIST, issue
+	// #40); nil disables. key is the stable token hash
+	// (upstream.Client.TokenKey) mirroring the session store's key space.
+	store *session.Store
+	key   string
 }
 
 // NewRunManager builds the manager for one token. rotationInterval is how
 // long a run lives before it is rotated (config ROTATION_INTERVAL, default
 // 6h). The session manager is used only for Shutdown's EndSession.
 func NewRunManager(client *upstream.Client, session *session.Manager, rotationInterval time.Duration) *RunManager {
-	return &RunManager{
-		client:           client,
-		session:          session,
-		rotationInterval: rotationInterval,
-		runs:             make(map[string]*Run),
-		starting:         make(map[string]*runFlight),
+	return NewRunManagerOpts(client, session, Options{RotationInterval: rotationInterval})
+}
+
+// NewRunManagerOpts builds the manager with full Options (rotation
+// interval plus the bounded finish queue and draining-list bounds from
+// issues #90/#55 and optional run persistence from #40). Zero option
+// values fall back to the package defaults.
+func NewRunManagerOpts(client *upstream.Client, session *session.Manager, opts Options) *RunManager {
+	queueSize := opts.FinishQueueSize
+	if queueSize < 1 {
+		queueSize = defaultFinishQueueSize
 	}
+	inlineTimeout := opts.InlineFinishTimeout
+	if inlineTimeout <= 0 {
+		inlineTimeout = defaultInlineFinishTimeout
+	}
+	drainCap := opts.DrainQueueCap
+	if drainCap < 1 {
+		drainCap = defaultDrainQueueCap
+	}
+	drainTTL := opts.DrainTTL
+	if drainTTL <= 0 {
+		drainTTL = defaultDrainTTL
+	}
+	m := &RunManager{
+		client:              client,
+		session:             session,
+		rotationInterval:    opts.RotationInterval,
+		runs:                make(map[string]*Run),
+		starting:            make(map[string]*runFlight),
+		finishQueue:         make(chan asyncJob, queueSize),
+		finishStop:          make(chan struct{}),
+		finishExited:        make(chan struct{}),
+		inlineFinishTimeout: inlineTimeout,
+		drainQueueCap:       drainCap,
+		drainTTL:            drainTTL,
+	}
+	if client != nil {
+		m.key = client.TokenKey()
+	}
+	if opts.Store != nil {
+		m.store = opts.Store
+	}
+	return m
+}
+
+// SetStore injects the shared session-state store used for run persistence
+// (SESSION_PERSIST, issue #40). The pool calls this on SetSessionStore for
+// the fixed-token managers (built before the store exists) and passes the
+// store through Options for runtime-added tokens. A nil store disables run
+// persistence. Runs already tracked keep their state; persistence applies
+// to subsequent START/FINISH transitions.
+func (m *RunManager) SetStore(store *session.Store) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store = store
 }
 
 // Acquire returns the current run for agentID, starting one on first use or
@@ -242,10 +370,15 @@ func (m *RunManager) FinishRun(ctx context.Context, run *Run, totalSteps int) {
 		// Keep the run around for a Maintain retry; the id is not
 		// necessarily dead upstream (network errors, 5xx).
 		m.mu.Lock()
+		run.drainedAt = time.Now()
 		m.draining = append(m.draining, run)
+		m.pruneDrainingLocked()
 		m.mu.Unlock()
 		slog.Debug("runs: FINISH failed, will retry on maintain", "run_id", run.RunID, "err", err)
+		return
 	}
+	// FINISHed cleanly: a restart must not resurrect the run.
+	m.removeRun(run)
 }
 
 // Maintain rotates aged runs and FINISHes the draining list. Runs with
@@ -267,6 +400,10 @@ func (m *RunManager) Maintain(ctx context.Context) {
 			toRotate = append(toRotate, agentID)
 		}
 	}
+	// Bound the draining list before re-enqueuing its FINISHes: entries
+	// past the TTL or cap are force-dropped (issue #55) so a persistently
+	// failing FINISH cannot grow the list without bound.
+	m.pruneDrainingLocked()
 	draining := append([]*Run(nil), m.draining...)
 	m.mu.Unlock()
 
@@ -275,8 +412,12 @@ func (m *RunManager) Maintain(ctx context.Context) {
 			slog.Debug("runs: maintain rotate failed", "agent_id", agentID, "err", err)
 		}
 	}
+	// Deferred-FINISH through the bounded queue (issue #90): the maintain
+	// tick never blocks on upstream FINISH calls; the worker (or the inline
+	// fallback) owns them. finishIfReady skips busy/finishing runs, so a
+	// run with an outstanding lease stays draining for the next pass.
 	for _, run := range draining {
-		m.finishIfReady(run)
+		m.enqueueFinish(run)
 	}
 }
 
@@ -288,6 +429,34 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, shutdownTimeout)
 		defer cancel()
+	}
+
+	// Stop the deferred-job worker first (issue #90): it drains whatever is
+	// queued, so its FINISHes land before our own claim below, and no job
+	// can start after we snapshot the runs. The worker's finishing-flag
+	// claims are respected by the claim loop (finishing runs are skipped).
+	m.finishOnce.Do(func() { close(m.finishStop) })
+	m.finishWg.Wait()
+
+	// Run persistence (issue #40): with a store, keep the active runs alive
+	// across the restart like the session keep-alive — FINISHing them here
+	// would force the next process to re-START and burn upstream calls. The
+	// runs are already persisted on START; re-save so the latest Requests
+	// counter survives.
+	if m.store != nil && m.key != "" {
+		m.mu.Lock()
+		snapshot := make([]Run, 0, len(m.runs))
+		for _, run := range m.runs {
+			snapshot = append(snapshot, *run)
+		}
+		m.mu.Unlock()
+		for i := range snapshot {
+			m.persistRun(&snapshot[i])
+		}
+		if err := m.session.Shutdown(ctx); err != nil {
+			slog.Warn("runs: shutdown session with errors", "errors", err)
+		}
+		return
 	}
 
 	m.mu.Lock()
@@ -347,6 +516,8 @@ func (m *RunManager) FinishAllRuns(ctx context.Context) {
 	for _, run := range all {
 		if err := m.client.FinishRun(ctx, run.RunID, run.Requests); err != nil {
 			errs = append(errs, fmt.Sprintf("finish run %s: %v", run.RunID, err))
+		} else {
+			m.removeRun(run)
 		}
 	}
 	if len(errs) > 0 {
@@ -620,6 +791,42 @@ func (m *RunManager) rotate(ctx context.Context, agentID string) error {
 		m.starting[agentID] = flight
 		m.mu.Unlock()
 
+		// Issue #40: resume a persisted run instead of STARTing a fresh one
+		// when a restart left an active run behind. Only runs started within
+		// the rotation interval are adopted — a stale entry is dropped so
+		// the upstream's own rotation wins. Best-effort: the store read
+		// never fails the rotate.
+		if m.store != nil && m.key != "" {
+			if pr := m.store.LoadRun(m.key, agentID); pr != nil {
+				if pr.RunID != "" && time.Since(pr.StartedAt) < m.rotationInterval {
+					m.mu.Lock()
+					oldRun := m.runs[agentID]
+					m.runs[agentID] = &Run{
+						AgentID:        agentID,
+						RunID:          pr.RunID,
+						StartedAt:      pr.StartedAt,
+						TraceSessionID: pr.TraceSessionID,
+						Requests:       pr.Requests,
+					}
+					flight.err = nil
+					close(flight.done)
+					delete(m.starting, agentID)
+					if oldRun != nil {
+						oldRun.drainedAt = time.Now()
+						m.draining = append(m.draining, oldRun)
+						m.pruneDrainingLocked()
+					}
+					m.mu.Unlock()
+					if oldRun != nil {
+						m.enqueueFinish(oldRun)
+					}
+					slog.Debug("runs: run resumed from store", "agent_id", agentID, "run_id", pr.RunID)
+					return nil
+				}
+				m.store.RemoveRun(m.key, agentID)
+			}
+		}
+
 		runID, err := m.client.StartRun(ctx, agentID)
 
 		m.mu.Lock()
@@ -633,25 +840,230 @@ func (m *RunManager) rotate(ctx context.Context, agentID string) error {
 		}
 		slog.Debug("runs: run started", "agent_id", agentID, "run_id", runID)
 
+		newRun := &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now(), TraceSessionID: newTraceSessionID()}
 		oldRun := m.runs[agentID]
-		m.runs[agentID] = &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now(), TraceSessionID: newTraceSessionID()}
+		m.runs[agentID] = newRun
 		if oldRun != nil {
+			oldRun.drainedAt = time.Now()
 			m.draining = append(m.draining, oldRun)
+			m.pruneDrainingLocked()
 		}
 		m.mu.Unlock()
 
+		m.persistRun(newRun)
 		if oldRun != nil {
-			go m.finishIfReady(oldRun)
+			m.enqueueFinish(oldRun)
 		}
+		// Issue #91: create the context-pruner child of the new parent run
+		// (ancestorRunIds=[parent]), best-effort through the bounded queue.
+		m.enqueue(asyncJob{kind: jobChildRun, run: newRun})
 		return nil
 	}
 }
 
-// finishIfReady FINISHes a rotated run once it has no outstanding leases and
-// is no longer the current run for its agent. Concurrent callers are
-// serialized by the finishing flag.
-func (m *RunManager) finishIfReady(run *Run) {
+// enqueueFinish submits a deferred FINISH for run through the bounded queue
+// (issue #90). Runs already queued are skipped (rotate and Maintain both
+// enqueue draining runs; without the dedupe a failed attempt would be
+// FINISHed twice upstream once the finishing flag resets).
+func (m *RunManager) enqueueFinish(run *Run) {
+	if run == nil {
+		return
+	}
 	m.mu.Lock()
+	if run.queued {
+		m.mu.Unlock()
+		return
+	}
+	run.queued = true
+	m.mu.Unlock()
+	m.enqueue(asyncJob{kind: jobFinish, run: run})
+}
+
+// enqueue submits a deferred upstream job to the bounded finish queue
+// (issue #90). When the queue is full the job runs inline, bounded by the
+// inline finish timeout — the caller never blocks on the worker.
+func (m *RunManager) enqueue(job asyncJob) {
+	if job.run == nil && job.kind != jobChildRun {
+		return
+	}
+	if m.finishQueue == nil {
+		return
+	}
+	m.startFinishWorker()
+	select {
+	case m.finishQueue <- job:
+	default:
+		// Queue full: synchronous inline fallback bounded by the short
+		// inline deadline (mirrors the reference async finalizer's
+		// finalizeInlineTimeout). A run whose FINISH exceeds the deadline is
+		// left draining for the next Maintain retry.
+		ctx, cancel := context.WithTimeout(context.Background(), m.inlineFinishTimeout)
+		defer cancel()
+		m.runJob(ctx, job)
+	}
+}
+
+// startFinishWorker launches the single deferred-job worker on first use.
+// The worker exits when Shutdown closes finishStop after draining the
+// queue, so no goroutine outlives the manager.
+func (m *RunManager) startFinishWorker() {
+	m.finishStartOnce.Do(func() {
+		m.finishWg.Add(1)
+		go m.finishLoop()
+	})
+}
+
+// finishLoop is the deferred-job worker: FINISH rotated/drained runs,
+// record chat steps, and create context-pruner child runs, all best-effort.
+func (m *RunManager) finishLoop() {
+	defer m.finishWg.Done()
+	defer close(m.finishExited)
+	for {
+		select {
+		case <-m.finishStop:
+			// Shutdown: drain whatever is queued, then exit.
+			for {
+				select {
+				case job := <-m.finishQueue:
+					m.runJob(context.Background(), job)
+				default:
+					return
+				}
+			}
+		case job := <-m.finishQueue:
+			m.runJob(context.Background(), job)
+		}
+	}
+}
+
+// runJob executes one deferred job (FINISH / step / child run). Best-effort:
+// failures are logged, never surfaced to a caller.
+func (m *RunManager) runJob(ctx context.Context, job asyncJob) {
+	switch job.kind {
+	case jobFinish:
+		m.finishIfReadyCtx(ctx, job.run)
+	case jobStep:
+		if job.run == nil || job.run.RunID == "" || m.client == nil {
+			return
+		}
+		if err := m.client.RecordRunStep(ctx, job.run.RunID, job.messageID, job.startTime); err != nil {
+			slog.Debug("runs: record step failed", "run_id", job.run.RunID, "err", err)
+		}
+	case jobChildRun:
+		m.createChildRun(ctx, job.run)
+	}
+}
+
+// createChildRun starts the context-pruner child of parentRunID and FINISHes
+// it once created (issue #91, CLI parity: createChildRun + finishChildRun).
+// Best-effort: failures are logged only.
+func (m *RunManager) createChildRun(ctx context.Context, parent *Run) {
+	if parent == nil || parent.RunID == "" || m.client == nil {
+		return
+	}
+	childID, err := m.client.StartChildRun(ctx, parent.RunID)
+	if err != nil {
+		slog.Debug("runs: context-pruner child start failed", "parent_run_id", parent.RunID, "err", err)
+		return
+	}
+	if err := m.client.FinishRun(ctx, childID, 1); err != nil {
+		slog.Debug("runs: context-pruner child finish failed", "child_run_id", childID, "err", err)
+	}
+}
+
+// RecordStep queues a completed-chat step recording for run (issue #91):
+// the server fires it after a successful chat with the response message id.
+// Best-effort through the bounded queue; failures are logged only.
+func (m *RunManager) RecordStep(run *Run, messageID string) {
+	if run == nil || run.RunID == "" {
+		return
+	}
+	m.enqueue(asyncJob{kind: jobStep, run: run, messageID: messageID, startTime: time.Now()})
+}
+
+// Precreate starts the run for agentID if none is fresh, without leasing it
+// (issue #90a): the pool calls it right after a session admission so the
+// first chat on a newly-admitted session does not pay the START latency.
+// Best-effort: the caller's Acquire surfaces any real failure through the
+// normal path.
+func (m *RunManager) Precreate(ctx context.Context, agentID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	run := m.runs[agentID]
+	needs := run == nil || time.Since(run.StartedAt) >= m.rotationInterval
+	m.mu.Unlock()
+	if !needs {
+		return nil
+	}
+	return m.rotate(ctx, agentID)
+}
+
+// persistRun writes the run into the session-state store (issue #40) so a
+// restart can resume it without re-START. Best-effort; the store write
+// never fails the caller.
+func (m *RunManager) persistRun(run *Run) {
+	if m.store == nil || m.key == "" || run == nil {
+		return
+	}
+	m.mu.Lock()
+	requests := run.Requests
+	startedAt := run.StartedAt
+	m.mu.Unlock()
+	m.store.SaveRun(m.key, run.AgentID, session.PersistedRun{
+		RunID:          run.RunID,
+		AgentID:        run.AgentID,
+		TraceSessionID: run.TraceSessionID,
+		StartedAt:      startedAt,
+		Requests:       requests,
+	})
+}
+
+// removeRun drops the run from the session-state store (issue #40): the
+// run was FINISHed upstream, so a restart must not resurrect it.
+func (m *RunManager) removeRun(run *Run) {
+	if m.store == nil || m.key == "" || run == nil {
+		return
+	}
+	m.store.RemoveRun(m.key, run.AgentID)
+}
+
+// pruneDrainingLocked bounds the draining list (issue #55): entries stuck
+// past DrainTTL or beyond DrainQueueCap are force-dropped with a warn log —
+// their upstream FINISH is best-effort anyway, and the list must never grow
+// unbounded when FINISH keeps failing. Caller holds m.mu.
+func (m *RunManager) pruneDrainingLocked() {
+	now := time.Now()
+	kept := m.draining[:0]
+	for _, run := range m.draining {
+		if !run.drainedAt.IsZero() && now.Sub(run.drainedAt) > m.drainTTL {
+			slog.Warn("runs: dropping draining run (TTL expired)", "run_id", run.RunID, "agent_id", run.AgentID, "age", now.Sub(run.drainedAt).Round(time.Second))
+			continue
+		}
+		kept = append(kept, run)
+	}
+	m.draining = kept
+	if len(m.draining) > m.drainQueueCap {
+		overflow := m.draining[m.drainQueueCap:]
+		m.draining = append([]*Run(nil), m.draining[:m.drainQueueCap]...)
+		for _, run := range overflow {
+			slog.Warn("runs: dropping draining run (queue cap)", "run_id", run.RunID, "agent_id", run.AgentID)
+		}
+	}
+}
+
+// finishIfReadyCtx is finishIfReady with an explicit context: the deferred
+// queue worker uses a background context (the client-side session-call
+// timeout bounds it), while the inline fallback passes its short deadline
+// so a saturated queue cannot stall the caller.
+func (m *RunManager) finishIfReadyCtx(ctx context.Context, run *Run) {
+	m.mu.Lock()
+	// The worker picked up the job: clear the queued marker so a later
+	// Maintain pass may retry a run that was not finishable right now.
+	if run != nil {
+		run.queued = false
+	}
 	if run == nil || run.inflight > 0 || run.finishing {
 		m.mu.Unlock()
 		return
@@ -663,9 +1075,7 @@ func (m *RunManager) finishIfReady(run *Run) {
 	run.finishing = true
 	m.mu.Unlock()
 
-	// Client-side call timeout bounds this (sessionCallTimeout); background
-	// context is fine for a drain goroutine.
-	if err := m.client.FinishRun(context.Background(), run.RunID, run.Requests); err != nil {
+	if err := m.client.FinishRun(ctx, run.RunID, run.Requests); err != nil {
 		m.mu.Lock()
 		run.finishing = false
 		m.mu.Unlock()
@@ -682,7 +1092,43 @@ func (m *RunManager) finishIfReady(run *Run) {
 	}
 	m.draining = filtered
 	m.mu.Unlock()
+	m.removeRun(run)
 	slog.Debug("runs: run finished", "run_id", run.RunID, "requests", run.Requests)
+}
+
+// ReleaseAbandoned releases run after the downstream client's context was
+// cancelled mid-chat (issue #53, CLI DELETE-on-exit parity): when this was
+// the LAST in-flight request on the run, the run is dropped from the active
+// set and FINISHed through the bounded queue so upstream does not keep an
+// abandoned agent run alive until rotation. Concurrent requests on the same
+// run keep it alive (inflight stays > 0). The decrement and the finish
+// decision happen under the manager mutex, so a racing Acquire can never
+// lease a run that is about to be finished.
+func (m *RunManager) ReleaseAbandoned(run *Run) {
+	if run == nil {
+		return
+	}
+	m.mu.Lock()
+	if run.inflight > 0 {
+		run.inflight--
+	}
+	if run.inflight > 0 {
+		// Other requests are still in flight on this run: keep it alive.
+		m.mu.Unlock()
+		return
+	}
+	// Last lease on the run. If it is still the current run, drop it from
+	// the active set so no new acquire reuses it, then FINISH it. A run
+	// that already rotated away is owned by the draining queue.
+	if current, ok := m.runs[run.AgentID]; ok && current == run {
+		delete(m.runs, run.AgentID)
+		m.mu.Unlock()
+		m.enqueueFinish(run)
+		return
+	}
+	m.mu.Unlock()
+	// Rotated already: leave the draining FINISH in charge (it will run
+	// once the inflight drain completes; nothing else is leasing it now).
 }
 
 // drop removes run from the active set (if it is still current) and the

@@ -121,8 +121,8 @@ func TestRoundRobinDistribution(t *testing.T) {
 		if len(mock.StartedRuns) != 1 || mock.StartedRuns[0] != agentA {
 			t.Errorf("mock%d started runs = %v, want [%s]", i, mock.StartedRuns, agentA)
 		}
-		if len(mock.FinishedRuns) != 0 {
-			t.Errorf("mock%d finished runs = %v, want none", i, mock.FinishedRuns)
+		if len(parentFinished(mock)) != 0 {
+			t.Errorf("mock%d finished runs = %v, want none", i, parentFinished(mock))
 		}
 	}
 
@@ -1124,7 +1124,7 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 	p.lastActive = time.Now().Add(-time.Second)
 	p.lastActiveMu.Unlock()
 	p.maintainTick(context.Background())
-	finished := mock.FinishedRunsSnapshot()
+	finished := parentFinished(mock)
 	if len(finished) != 1 || finished[0].Status != "completed" {
 		t.Fatalf("finished runs after idle = %v, want 1 completed", finished)
 	}
@@ -2020,7 +2020,7 @@ func TestBridgeEvictionSkipsBusyEntry(t *testing.T) {
 	if e := p.bridgeToken("client-tok-00"); e == nil {
 		t.Fatal("busy bridge entry was evicted while its lease is outstanding")
 	}
-	finished := mock.FinishedRunsSnapshot()
+	finished := parentFinished(mock)
 	if len(finished) != 1 {
 		t.Errorf("finished runs = %d, want 1 (only the idle evicted entry)", len(finished))
 	}
@@ -2058,7 +2058,7 @@ func TestShutdownDrainsBridgeEntries(t *testing.T) {
 	p.Shutdown(context.Background())
 
 	// Both bridge entries' runs were FINISHed and sessions ended.
-	finished := mock.FinishedRunsSnapshot()
+	finished := parentFinished(mock)
 	if len(finished) != 2 {
 		t.Errorf("finished runs = %d, want 2 (bridge runs drained on shutdown)", len(finished))
 	}

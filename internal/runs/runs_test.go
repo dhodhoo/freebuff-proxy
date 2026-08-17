@@ -233,10 +233,11 @@ func TestShutdownFinishesAllAndEndsSession(t *testing.T) {
 		t.Errorf("active runs after shutdown = %d, want 0", snap.ActiveRuns)
 	}
 
-	// Idempotent: a second shutdown must not duplicate FINISHes.
+	// Idempotent: a second shutdown must not duplicate FINISHes. Child-run
+	// FINISHes (issue #91) are excluded from the count.
 	mgr.Shutdown(context.Background())
-	if len(mock.FinishedRuns) != 2 {
-		t.Errorf("finished runs after double shutdown = %d, want 2", len(mock.FinishedRuns))
+	if got := len(nonChildFinished(mock)); got != 2 {
+		t.Errorf("finished runs after double shutdown = %d, want 2", got)
 	}
 }
 
@@ -558,7 +559,7 @@ func TestShutdownSkipsMidFinishRun(t *testing.T) {
 
 	mgr.Shutdown(context.Background())
 
-	finished := mock.FinishedRunsSnapshot()
+	finished := nonChildFinished(mock)
 	if len(finished) != 1 {
 		t.Fatalf("finished runs = %v, want exactly 1 (only agentB's run)", finished)
 	}

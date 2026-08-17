@@ -24,12 +24,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"freebuff-proxy/internal/config"
+	"freebuff-proxy/internal/phasetiming"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
 	"freebuff-proxy/internal/session"
@@ -95,6 +97,9 @@ type bridgeEntry struct {
 	runs     *runs.RunManager
 	lastUsed time.Time
 	usage    []time.Time // rolling 24h successful-chat timestamps (MAX_MESSAGES_PER_DAY)
+	// spend is the per-client-token spend ledger (issue #87); guarded by
+	// Pool.bridgeMu like usage.
+	spend *spendLedger
 }
 
 // TokenSnapshot is one token's healthz view.
@@ -111,6 +116,17 @@ type TokenSnapshot struct {
 	DailyLimit           int    // configured MAX_MESSAGES_PER_DAY (0 = unlimited)
 	UsagePct             int    // percentage of daily limit used (0 when unlimited)
 	RiskLevel            string // "low", "moderate", "high", "critical" account safety indicator (#6)
+	// Spend24h / SpendDay / SpendWeek / SpendMonth are the local per-token
+	// spend ledger (issue #87): tokens spent in the rolling 24h window and
+	// the current UTC day/week/month buckets (with rollover). Fed by
+	// pool.RecordSpend from chat usage blocks; surfaced next to Messages24h.
+	Spend24h        int64
+	SpendDay        int64
+	SpendWeek       int64
+	SpendMonth      int64
+	SpendDayStart   time.Time
+	SpendWeekStart  time.Time
+	SpendMonthStart time.Time
 	// TierAccess / CountryCode / CountryBlockReason are the token's last
 	// known upstream session tier and region-block state. CountryBlockReason
 	// is non-empty when the account (or its egress region) is blocked;
@@ -128,6 +144,9 @@ type TokenSnapshot struct {
 	// nests entitlement inside each rate-limit entry).
 	QuotaByModel map[string]session.QuotaSnapshot
 	Entitlement  map[string]float64
+	// Standing is the upstream account standing block (issue #96); nil until
+	// the session reports it.
+	Standing *upstream.SessionStanding
 	// TransientRetries / FingerprintRotations are this token's upstream
 	// client counters (TRANSIENT_RETRIES): retried transport failures and
 	// pinned TLS fingerprint swaps. Surfaced per-token in /metrics.
@@ -175,6 +194,18 @@ type Pool struct {
 	// upstream chat, per token. Guarded by usageMu.
 	usageMu      sync.Mutex
 	msgsPerToken [][]time.Time
+
+	// createGate bounds concurrent session admissions (issue #86): per-model
+	// and global in-flight create counters with wait-or-503, wired from
+	// SESSION_CREATE_MAX_PARALLEL_GLOBAL/PER_MODEL.
+	gate *createGate
+
+	// Spend ledger (issue #87): per-token token spend, rolling 24h window
+	// plus day/week/month buckets with rollover. Guarded by spendMu;
+	// spendPerToken stays index-aligned with msgsPerToken under usageMu's
+	// publish order (AddToken/RemoveLastToken update both slices together).
+	spendMu       sync.Mutex
+	spendPerToken []*spendLedger
 
 	// Idle rotation (IDLE_ROTATION_TIMEOUT): last successful Acquire and
 	// whether the maintain loop already FINISHed all runs for the current
@@ -229,11 +260,19 @@ func New(cfg *config.Config, clients []*upstream.Client, sessions []*session.Man
 	p := &Pool{reg: reg, logger: slog.Default(), bridge: make(map[string]*bridgeEntry)}
 	p.cfg.Store(cfg)
 	p.msgsPerToken = make([][]time.Time, len(cfg.AuthTokens))
+	p.spendPerToken = make([]*spendLedger, len(cfg.AuthTokens))
+	for i := range p.spendPerToken {
+		p.spendPerToken[i] = newSpendLedger()
+	}
+	p.gate = newCreateGate(cfg.SessionCreateMaxParallelGlobal, cfg.SessionCreateMaxParallelPerModel)
 	toks := make([]*tokenEntry, 0, len(cfg.AuthTokens))
 	for i := range cfg.AuthTokens {
+		sess := sessions[i]
+		sess.SetReAdmitLead(cfg.SessionReAdmitLead)
+		sess.SetAdmissionProbeTTL(cfg.SessionProbeCacheTTL)
 		toks = append(toks, &tokenEntry{
-			session: sessions[i],
-			runs:    runs.NewRunManager(clients[i], sessions[i], cfg.RotationInterval),
+			session: sess,
+			runs:    runs.NewRunManagerOpts(clients[i], sess, runOptions(cfg)),
 			client:  clients[i],
 		})
 	}
@@ -241,11 +280,40 @@ func New(cfg *config.Config, clients []*upstream.Client, sessions []*session.Man
 	return p, nil
 }
 
+// runOptions maps config knobs to the run manager's Options (issues
+// #90/#55): the bounded finish queue and draining-list bounds.
+func runOptions(cfg *config.Config) runs.Options {
+	return runs.Options{
+		RotationInterval:    cfg.RotationInterval,
+		FinishQueueSize:     cfg.RunFinishQueueSize,
+		InlineFinishTimeout: cfg.RunFinishInlineTimeout,
+		DrainQueueCap:       cfg.RunsDrainQueueCap,
+		DrainTTL:            cfg.RunsDrainTTL,
+	}
+}
+
 // SetConfig swaps in a reloaded configuration. The pool reads config
 // through an atomic pointer, so a config change takes effect on the next
 // Acquire/maintain pass without rebuilding the pool.
 func (p *Pool) SetConfig(cfg *config.Config) {
 	p.cfg.Store(cfg)
+
+	// Runtime-adjustable knobs: the create gate caps (#86) and the session
+	// re-admit lead / probe cache TTL (#99/#60) follow config reloads.
+	if p.gate != nil {
+		p.gate.setLimits(cfg.SessionCreateMaxParallelGlobal, cfg.SessionCreateMaxParallelPerModel)
+	}
+	toks := p.toks.Load()
+	for _, tok := range *toks {
+		tok.session.SetReAdmitLead(cfg.SessionReAdmitLead)
+		tok.session.SetAdmissionProbeTTL(cfg.SessionProbeCacheTTL)
+	}
+	p.bridgeMu.Lock()
+	for _, entry := range p.bridge {
+		entry.session.SetReAdmitLead(cfg.SessionReAdmitLead)
+		entry.session.SetAdmissionProbeTTL(cfg.SessionProbeCacheTTL)
+	}
+	p.bridgeMu.Unlock()
 
 	// Session persistence is decided at startup: the store is built from the
 	// boot config and injected once via SetSessionStore, so a reload cannot
@@ -275,9 +343,12 @@ func (p *Pool) AddToken(token string) (int, error) {
 		return 0, fmt.Errorf("pool: add token: %w", err)
 	}
 	sess := session.NewManagerWithStore(client, p.store)
+	cfg := p.cfg.Load()
+	sess.SetReAdmitLead(cfg.SessionReAdmitLead)
+	sess.SetAdmissionProbeTTL(cfg.SessionProbeCacheTTL)
 	entry := &tokenEntry{
 		session: sess,
-		runs:    runs.NewRunManager(client, sess, p.cfg.Load().RotationInterval),
+		runs:    runs.NewRunManagerOpts(client, sess, runOptions(cfg)),
 		client:  client,
 	}
 	next := make([]*tokenEntry, 0, len(*toks)+1)
@@ -288,10 +359,14 @@ func (p *Pool) AddToken(token string) (int, error) {
 	// a matching entry in p.msgsPerToken, so recordChat/usageCount for the
 	// new index can never index past the usage slice. The two fields are
 	// otherwise independent (toks is an atomic pointer, msgsPerToken is
-	// usageMu-guarded); only this publish order matters.
+	// usageMu-guarded); only this publish order matters. The spend ledger
+	// slice rides along so Snapshot() stays index-aligned too.
 	p.usageMu.Lock()
 	p.msgsPerToken = append(p.msgsPerToken, nil)
 	p.usageMu.Unlock()
+	p.spendMu.Lock()
+	p.spendPerToken = append(p.spendPerToken, newSpendLedger())
+	p.spendMu.Unlock()
 	p.toks.Store(&next)
 	return idx, nil
 }
@@ -317,6 +392,9 @@ func (p *Pool) RemoveLastToken() error {
 	p.usageMu.Lock()
 	p.msgsPerToken = p.msgsPerToken[:len(p.msgsPerToken)-1]
 	p.usageMu.Unlock()
+	p.spendMu.Lock()
+	p.spendPerToken = p.spendPerToken[:len(p.spendPerToken)-1]
+	p.spendMu.Unlock()
 
 	// The busy check above and the swap are TOCTOU: an Acquire that loaded
 	// the pre-removal snapshot can lease the removed token in between. Park
@@ -363,6 +441,9 @@ func (p *Pool) RemoveAllTokens(ctx context.Context) {
 	p.usageMu.Lock()
 	p.msgsPerToken = nil
 	p.usageMu.Unlock()
+	p.spendMu.Lock()
+	p.spendPerToken = nil
+	p.spendMu.Unlock()
 }
 
 // TokenCount returns the current fixed-token count.
@@ -379,6 +460,14 @@ func (p *Pool) TokenCount() int {
 // restart, when the caller builds a fresh store).
 func (p *Pool) SetSessionStore(store *session.Store) {
 	p.store = store
+	// Issue #40: run persistence rides the same store. The fixed-token run
+	// managers were built before the store existed (SetSessionStore runs
+	// after New), so inject it here; runtime-added tokens pass it through
+	// Options at construction.
+	toks := p.toks.Load()
+	for _, tok := range *toks {
+		tok.runs.SetStore(store)
+	}
 	if store == nil {
 		p.storeSessionPersist = false
 		p.storeStateFile = ""
@@ -412,7 +501,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	// hot token fails does it fall back to the remaining eligible tokens
 	// from the round-robin start (cold path), exactly like the historical
 	// linear failover. When no token is hot the order is unchanged.
-	order := p.acquireOrder(toks, start, model)
+	order, quotaLimited := p.acquireOrder(toks, start, model)
 	var errs []string
 	var waiting []*session.WaitingRoomError
 	var rateLimited []*upstream.RateLimitError
@@ -464,7 +553,34 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			continue
 		}
 
+		// Issue #85: session-quota-capped token for the requested model.
+		// The hot path excludes these in acquireOrder (their rate-limit
+		// reasons ride back in quotaLimited); the no-hot round-robin path
+		// reaches them here and records the reason the same way.
+		if _, _, capped := quotaRemaining(tok, model); capped {
+			rateLimited = append(rateLimited, quotaLimitError(tok, model))
+			errs = append(errs, fmt.Sprintf("%s: session quota exhausted for model", name))
+			p.logger.Debug("pool: token skipped (session quota exhausted)", "token", idx+1, "model", model)
+			continue
+		}
+
+		// Session-create admission gate (issue #86): concurrent session
+		// creates are bounded globally and per model; when the gate is at
+		// capacity the acquire waits (the caller's deadline surfaces as
+		// 503). The permit is held only for the admission call, never
+		// across the upstream chat.
+		permit, err := p.gate.acquire(ctx, model)
+		if err != nil {
+			// Context expired while waiting for a create slot: the caller's
+			// deadline surfaces as 503 (wait-or-503). The pass is aborted —
+			// the ctx is done, so trying further tokens would only repeat
+			// the same wait.
+			return nil, err
+		}
+		sessionStart := time.Now()
 		instanceID, err := tok.session.EnsureSessionForModel(ctx, model)
+		permit.Release()
+		phasetiming.FromContext(ctx).Since(phasetiming.SessionRefreshMS, sessionStart)
 		if err != nil {
 			if errors.Is(err, upstream.ErrAuthRejected) {
 				tok.runs.Cooldown(runs.DefaultCooldown)
@@ -504,7 +620,15 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		if cur := p.toks.Load(); idx < 0 || idx >= len(*cur) || (*cur)[idx] != tok {
 			continue
 		}
+		// Issue #90a: pre-create the run at session admission (best-effort)
+		// so the first chat on a freshly-admitted session does not pay the
+		// START latency. When a run already exists this is a cheap no-op;
+		// when the START fails here the Acquire below retries and surfaces
+		// the real error through the normal failover path.
+		_ = tok.runs.Precreate(ctx, agentID)
+		runStart := time.Now()
 		run, err := tok.runs.Acquire(ctx, agentID)
+		phasetiming.FromContext(ctx).Since(phasetiming.RunAcquireMS, runStart)
 		if err != nil {
 			if errors.Is(err, upstream.ErrAuthRejected) {
 				tok.runs.Cooldown(runs.DefaultCooldown)
@@ -549,6 +673,11 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 	// ip_capped, lowest queue position, earliest daily reset). Only when
 	// every bucket is empty — all tokens failed with errors outside the
 	// matrix — is the generic error surfaced.
+	// Issue #85: quota-capped tokens were excluded in acquireOrder (never
+	// attempted); their rate-limit reasons land here so a fully-capped pool
+	// surfaces a real 429 with the earliest window reset instead of a
+	// generic combined error.
+	rateLimited = append(rateLimited, quotaLimited...)
 	if len(banned) > 0 {
 		return nil, banned[0]
 	}
@@ -577,19 +706,31 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 // (loaded once in Acquire) — the order is built against the same snapshot
 // the failover loop indexes, so an AddToken racing the call can never make
 // the loop index past its own snapshot. start is the round-robin start
-// index; model is the requested upstream model, used as a tiebreak to
-// prefer a hot token whose session already serves it (sessions are shared
-// across models in practice, so the match is not a requirement).
-func (p *Pool) acquireOrder(toks *[]*tokenEntry, start int, model string) []int {
+// index; model is the requested upstream model.
+//
+// Issue #85: within the hot set, tokens whose last admission reported a
+// known positive remaining session quota for the requested model rank above
+// unknown-quota tokens, ordered by smallest remaining first (drain the
+// account closest to its limit; preserve fuller quotas —
+// reference/freebuff-reverse .../scheduler.go:472-496 tier ordering). Tokens
+// whose quota is exhausted for the model (RecentCount >= Limit with a future
+// ResetAt) are excluded from this pass entirely; their rate-limit reasons
+// are returned so the caller surfaces a real 429 when every token is capped.
+func (p *Pool) acquireOrder(toks *[]*tokenEntry, start int, model string) ([]int, []*upstream.RateLimitError) {
 	cfg := p.cfg.Load()
 	// eligible mirrors the per-token checks the failover loop applies:
-	// not cooling down and (when configured) under the daily message cap.
+	// not cooling down, under the daily message cap, and not quota-capped
+	// for the requested model (issue #85). It never records the exclusion
+	// reasons — the caller does that in one place.
 	eligible := func(idx int) bool {
 		tok := (*toks)[idx]
 		if time.Now().Before(tok.runs.CooldownUntil()) {
 			return false
 		}
 		if cfg.MaxMessagesPerDay > 0 && p.usageCount(idx) >= cfg.MaxMessagesPerDay {
+			return false
+		}
+		if _, _, capped := quotaRemaining(tok, model); capped {
 			return false
 		}
 		return true
@@ -605,26 +746,36 @@ func (p *Pool) acquireOrder(toks *[]*tokenEntry, start int, model string) []int 
 	}
 	if len(hot) == 0 {
 		// No hot tokens: plain round-robin over every token, exactly like
-		// the historical behavior.
+		// the historical behavior. Capped/cooldown tokens stay in the order
+		// — the failover loop re-checks and records their reasons.
 		order := make([]int, len(*toks))
 		for i := range order {
 			order[i] = (start + i) % len(*toks)
 		}
-		return order
+		return order, nil
 	}
 
-	// Prefer the hot token whose session already serves the requested
-	// model; the rest keep their round-robin order.
-	best := 0
-	for i, idx := range hot {
-		if (*toks)[idx].session.Snapshot().Model == model {
-			best = i
-			break
+	// Quota-aware secondary sort (issue #85), stable over the round-robin
+	// base order: session-model match first (existing tiebreak), then known
+	// positive remaining quota before unknown, then smallest remaining
+	// first.
+	sort.SliceStable(hot, func(i, j int) bool {
+		a, b := hot[i], hot[j]
+		aMatch := (*toks)[a].session.Snapshot().Model == model
+		bMatch := (*toks)[b].session.Snapshot().Model == model
+		if aMatch != bMatch {
+			return aMatch
 		}
-	}
-	if best > 0 {
-		hot = append(hot[best:], hot[:best]...)
-	}
+		aKnown, aRem, _ := quotaRemaining((*toks)[a], model)
+		bKnown, bRem, _ := quotaRemaining((*toks)[b], model)
+		if aKnown != bKnown {
+			return aKnown
+		}
+		if aKnown {
+			return aRem < bRem
+		}
+		return false
+	})
 
 	// Cold fallback: the remaining eligible tokens from the round-robin
 	// start, excluding the hot tokens already attempted this pass (each
@@ -641,7 +792,68 @@ func (p *Pool) acquireOrder(toks *[]*tokenEntry, start int, model string) []int 
 		}
 		order = append(order, idx)
 	}
-	return order
+
+	// The capped tokens excluded above are never visited by the failover
+	// loop, so their rate-limit reasons must ride back with the order: when
+	// every token is capped the pool surfaces a real 429 with the earliest
+	// window reset instead of a generic combined error.
+	inOrder := make(map[int]struct{}, len(order))
+	for _, idx := range order {
+		inOrder[idx] = struct{}{}
+	}
+	var quotaLimited []*upstream.RateLimitError
+	for idx := range *toks {
+		if _, ok := inOrder[idx]; ok {
+			continue
+		}
+		if _, _, capped := quotaRemaining((*toks)[idx], model); capped {
+			quotaLimited = append(quotaLimited, quotaLimitError((*toks)[idx], model))
+		}
+	}
+	return order, quotaLimited
+}
+
+// quotaRemaining reports the token's session-quota state for model from the
+// last admission (issue #85): known reports whether the quota is known with
+// a positive remaining allowance; remaining is the positive delta; capped
+// reports RecentCount >= Limit with a future ResetAt (the token must be
+// skipped this pass — it cannot serve the model right now). Quotas with a
+// past/absent ResetAt are treated as fresh (the window rolled) and never
+// capped.
+func quotaRemaining(tok *tokenEntry, model string) (known bool, remaining float64, capped bool) {
+	q, ok := tok.session.Snapshot().QuotaByModel[model]
+	if !ok || q.Limit <= 0 {
+		return false, 0, false
+	}
+	resetFuture := !q.ResetAt.IsZero() && q.ResetAt.After(time.Now())
+	if resetFuture && q.RecentCount >= q.Limit {
+		return false, 0, true
+	}
+	if q.RecentCount < q.Limit {
+		return true, q.Limit - q.RecentCount, false
+	}
+	// RecentCount >= Limit but the window already rolled: unknown until the
+	// next admission reports a fresh count.
+	return false, 0, false
+}
+
+// quotaLimitError builds the 429 surfaced when token is excluded for the
+// model's exhausted session quota (issue #85): RetryAfter is the time until
+// the window reset, mirroring the upstream RateLimitError contract.
+func quotaLimitError(tok *tokenEntry, model string) *upstream.RateLimitError {
+	q := tok.session.Snapshot().QuotaByModel[model]
+	retryAfter := time.Duration(0)
+	if !q.ResetAt.IsZero() && q.ResetAt.After(time.Now()) {
+		retryAfter = time.Until(q.ResetAt)
+	}
+	return &upstream.RateLimitError{
+		Status:      "rate_limited",
+		RetryAfter:  retryAfter,
+		Limit:       q.Limit,
+		RecentCount: q.RecentCount,
+		ResetAt:     q.ResetAt,
+		Body:        "session quota exhausted for model",
+	}
 }
 
 // tokenHasLiveSession reports whether token's cached session is active and
@@ -702,7 +914,16 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		return nil, p.bridgeDailyLimitError(entry)
 	}
 
+	// Session-create admission gate (issue #86), mirroring the fixed-token
+	// path: concurrent session creates are bounded globally and per model.
+	permit, err := p.gate.acquire(ctx, model)
+	if err != nil {
+		return nil, err
+	}
+	sessionStart := time.Now()
 	instanceID, err := entry.session.EnsureSessionForModel(ctx, model)
+	permit.Release()
+	phasetiming.FromContext(ctx).Since(phasetiming.SessionRefreshMS, sessionStart)
 	if err != nil {
 		if errors.Is(err, upstream.ErrAuthRejected) {
 			entry.runs.Cooldown(runs.DefaultCooldown)
@@ -722,7 +943,11 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		}
 		return nil, err
 	}
+	// Issue #90a: pre-create the run at session admission (best-effort).
+	_ = entry.runs.Precreate(ctx, agentID)
+	runStart := time.Now()
 	run, err := entry.runs.Acquire(ctx, agentID)
+	phasetiming.FromContext(ctx).Since(phasetiming.RunAcquireMS, runStart)
 	if err != nil {
 		if errors.Is(err, upstream.ErrAuthRejected) {
 			entry.runs.Cooldown(runs.DefaultCooldown)
@@ -784,6 +1009,77 @@ func (p *Pool) LeaseRelease(lease *Lease) {
 	if parked && lease.entry.runs.InflightCount() == 0 {
 		p.drainRemovedToken(lease.entry)
 	}
+}
+
+// LeaseAbandon releases a lease whose downstream client context was
+// cancelled mid-chat (issue #53, CLI DELETE-on-exit parity): when this was
+// the LAST in-flight request on the run, the run is dropped from the active
+// set and FINISHed through the bounded queue so upstream does not keep an
+// abandoned agent run alive until rotation. Concurrent requests on the same
+// run keep it alive. The server calls this instead of LeaseRelease when it
+// observes a client disconnect.
+func (p *Pool) LeaseAbandon(lease *Lease) {
+	if lease == nil || lease.Run == nil {
+		return
+	}
+	if lease.Bridge != nil {
+		lease.Bridge.runs.ReleaseAbandoned(lease.Run)
+		return
+	}
+	if lease.entry != nil {
+		lease.entry.runs.ReleaseAbandoned(lease.Run)
+		return
+	}
+	toks := p.toks.Load()
+	if lease.Token < 0 || lease.Token >= len(*toks) {
+		return
+	}
+	(*toks)[lease.Token].runs.ReleaseAbandoned(lease.Run)
+}
+
+// RecordRunStep records a completed chat step upstream (issue #91, CLI
+// parity): the server fires it after a successful chat with the response
+// message id. Best-effort through the bounded finish queue — failures are
+// logged, never surfaced.
+func (p *Pool) RecordRunStep(lease *Lease, messageID string) {
+	if lease == nil || lease.Run == nil {
+		return
+	}
+	if lease.Bridge != nil {
+		lease.Bridge.runs.RecordStep(lease.Run, messageID)
+		return
+	}
+	if lease.entry != nil {
+		lease.entry.runs.RecordStep(lease.Run, messageID)
+		return
+	}
+	toks := p.toks.Load()
+	if lease.Token < 0 || lease.Token >= len(*toks) {
+		return
+	}
+	(*toks)[lease.Token].runs.RecordStep(lease.Run, messageID)
+}
+
+// RecordSpend adds tokens to the lease's backing token spend ledger (issue
+// #87): the server reports the usage block of a completed chat. Non-positive
+// deltas are ignored.
+func (p *Pool) RecordSpend(lease *Lease, tokens int64) {
+	if lease == nil || tokens <= 0 {
+		return
+	}
+	if lease.Bridge != nil {
+		p.bridgeRecordSpend(lease.Bridge, tokens)
+		return
+	}
+	if lease.entry != nil {
+		p.recordSpendEntry(lease.entry, tokens)
+		return
+	}
+	toks := p.toks.Load()
+	if lease.Token < 0 || lease.Token >= len(*toks) {
+		return
+	}
+	p.recordSpend(lease.Token, tokens)
 }
 
 // InvalidateSession drops the cached free session of token so the next
@@ -1126,6 +1422,8 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 			riskLevel = "moderate"
 		}
 
+		spend := p.spendSnapshot(i)
+
 		out = append(out, TokenSnapshot{
 			Token:                   i,
 			CooldownUntil:           rs.CooldownUntil,
@@ -1145,8 +1443,16 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 			SessionActiveUsersForIP: ss.ActiveUsersForIP,
 			QuotaByModel:            ss.QuotaByModel,
 			Entitlement:             ss.Entitlement,
+			Standing:                ss.Standing,
 			TransientRetries:        tok.client.TransientRetries(),
 			FingerprintRotations:    tok.client.FingerprintRotations(),
+			Spend24h:                spend.Rolling24h,
+			SpendDay:                spend.Day,
+			SpendWeek:               spend.Week,
+			SpendMonth:              spend.Month,
+			SpendDayStart:           spend.DayStart,
+			SpendWeekStart:          spend.WeekStart,
+			SpendMonthStart:         spend.MonthStart,
 		})
 	}
 	return out
@@ -1328,9 +1634,12 @@ func (p *Pool) bridgeEntryFor(clientToken string) (*bridgeEntry, error) {
 		p.bridgeMu.Unlock()
 		return nil, fmt.Errorf("bridge: %w", err)
 	}
-	entry := &bridgeEntry{token: clientToken, client: client}
+	entry := &bridgeEntry{token: clientToken, client: client, spend: newSpendLedger()}
+	cfg := p.cfg.Load()
 	entry.session = session.NewManagerWithStore(client, p.store)
-	entry.runs = runs.NewRunManager(client, entry.session, p.cfg.Load().RotationInterval)
+	entry.session.SetReAdmitLead(cfg.SessionReAdmitLead)
+	entry.session.SetAdmissionProbeTTL(cfg.SessionProbeCacheTTL)
+	entry.runs = runs.NewRunManagerOpts(client, entry.session, runOptions(cfg))
 	entry.lastUsed = time.Now()
 
 	p.bridge[clientToken] = entry
@@ -1649,6 +1958,14 @@ func (p *Pool) maintainTick(ctx context.Context) {
 			case "queued":
 				if _, err := tok.session.EnsureSession(mCtx); err != nil {
 					p.logger.Debug("pool: maintain session not ready", "token", i+1, "err", err)
+				} else {
+					// Issue #90a: the queue advanced to active — pre-create
+					// the run for the session's model agent so the first
+					// request on this session does not pay the START latency.
+					after := tok.session.Snapshot()
+					if agentID, err := p.reg.AgentForModel(after.Model); err == nil && agentID != "" {
+						_ = tok.runs.Precreate(mCtx, agentID)
+					}
 				}
 			case "active":
 				if err := tok.session.Heartbeat(mCtx); err != nil {
@@ -1747,6 +2064,14 @@ func (p *Pool) bridgeMaintain(ctx context.Context, idle bool) {
 			case "queued":
 				if _, err := entry.session.EnsureSession(mCtx); err != nil {
 					p.logger.Debug("pool: bridge maintain session not ready", "err", err)
+				} else {
+					// Issue #90a: pre-create the run for the session's model
+					// agent so the first request on this session does not pay
+					// the START latency (mirrors the fixed-token path).
+					after := entry.session.Snapshot()
+					if agentID, err := p.reg.AgentForModel(after.Model); err == nil && agentID != "" {
+						_ = entry.runs.Precreate(mCtx, agentID)
+					}
 				}
 			case "active":
 				if err := entry.session.Heartbeat(mCtx); err != nil {
