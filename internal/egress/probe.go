@@ -108,8 +108,8 @@ func DirectDialer(timeout time.Duration) func(ctx context.Context, network, addr
 // function routes every connection through the proxy. The userinfo is
 // carried through to the SOCKS5 handshake so authenticated proxies actually
 // authenticate (previously it was dropped and the handshake failed —
-// Audit B2). x/net/proxy's Dial is not context-aware, so a wedged proxy is
-// bounded by the probe's client timeout rather than ctx cancellation.
+// Audit B2). The returned dialer supports context cancellation via
+// proxy.ContextDialer.
 func Socks5Dialer(addr string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
 	host, auth, err := parseSocks5(addr)
 	if err != nil {
@@ -120,6 +120,9 @@ func Socks5Dialer(addr string) (func(ctx context.Context, network, addr string) 
 		return nil, fmt.Errorf("egress: SOCKS5 dialer for %s: %w", host, err)
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if cd, ok := d.(proxy.ContextDialer); ok {
+			return cd.DialContext(ctx, network, addr)
+		}
 		return d.Dial(network, addr)
 	}, nil
 }

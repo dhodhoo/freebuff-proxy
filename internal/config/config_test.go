@@ -583,6 +583,15 @@ func TestValidate(t *testing.T) {
 		{"bad proxy rotation", func(c *Config) { c.ProxyRotation = "round robin" }},
 		{"negative max messages", func(c *Config) { c.MaxMessagesPerDay = -1 }},
 		{"session persist with empty state file", func(c *Config) { c.SessionPersist = true; c.SessionStateFile = "" }},
+		{"invalid listen port non-int", func(c *Config) { c.ListenAddr = "127.0.0.1:abc" }},
+		{"invalid listen port overflow", func(c *Config) { c.ListenAddr = "127.0.0.1:99999" }},
+		{"invalid listen port zero", func(c *Config) { c.ListenAddr = "127.0.0.1:0" }},
+		{"invalid http proxy url", func(c *Config) { c.HTTPProxy = "http://bad url:8080" }},
+		{"invalid http proxy scheme", func(c *Config) { c.HTTPProxy = "ftp://proxy:8080" }},
+		{"invalid http proxy host", func(c *Config) { c.HTTPProxy = "http://" }},
+		{"invalid socks5 proxy scheme", func(c *Config) { c.SOCKS5Proxy = "http://proxy:1080" }},
+		{"invalid socks5 proxy hostless url", func(c *Config) { c.SOCKS5Proxy = "socks5://" }},
+		{"invalid socks5 proxy host:port", func(c *Config) { c.SOCKS5Proxy = "invalid_no_port" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -592,6 +601,79 @@ func TestValidate(t *testing.T) {
 				t.Error("Validate succeeded, want error")
 			}
 		})
+	}
+}
+
+// TestValidateListenAddr verifies rejection of invalid listen addresses and acceptance of valid ones.
+func TestValidateListenAddr(t *testing.T) {
+	good := Config{
+		ListenAddr:         "127.0.0.1:3457",
+		UpstreamBaseURL:    "https://www.codebuff.com",
+		AuthTokens:         []string{"tok"},
+		RotationInterval:   6 * time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 30 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+	}
+
+	for _, addr := range []string{"127.0.0.1:3457", ":3457", "0.0.0.0:8080", "[::1]:3457", "localhost:1", "127.0.0.1:65535"} {
+		c := good
+		c.ListenAddr = addr
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate(ListenAddr=%q) = %v, want nil", addr, err)
+		}
+	}
+
+	for _, bad := range []string{
+		"127.0.0.1:abc",
+		"127.0.0.1:99999",
+		"127.0.0.1:0",
+		"127.0.0.1:-1",
+		"127.0.0.1:",
+		"3457",
+		"",
+	} {
+		c := good
+		c.ListenAddr = bad
+		if err := c.Validate(); err == nil {
+			t.Errorf("Validate(ListenAddr=%q) succeeded, want error", bad)
+		}
+	}
+}
+
+// TestValidateProxies verifies syntax validation of HTTP_PROXY, SOCKS5_PROXY, and SOCKS5_PROXIES.
+func TestValidateProxies(t *testing.T) {
+	good := Config{
+		ListenAddr:         "127.0.0.1:3457",
+		UpstreamBaseURL:    "https://www.codebuff.com",
+		AuthTokens:         []string{"tok"},
+		RotationInterval:   6 * time.Hour,
+		RequestTimeout:     15 * time.Minute,
+		SessionCallTimeout: 30 * time.Second,
+		RegistryRefresh:    6 * time.Hour,
+	}
+
+	validProxies := []struct {
+		httpProxy    string
+		socks5Proxy  string
+		socksProxies []string
+	}{
+		{httpProxy: "http://127.0.0.1:8080"},
+		{httpProxy: "https://user:pass@proxy.example:8443"},
+		{socks5Proxy: "127.0.0.1:1080"},
+		{socks5Proxy: "socks5://127.0.0.1:1080"},
+		{socks5Proxy: "socks5://user:pass@127.0.0.1:1080"},
+		{socksProxies: []string{"127.0.0.1:1080", "socks5://user:pass@127.0.0.1:1081"}},
+	}
+
+	for _, vp := range validProxies {
+		c := good
+		c.HTTPProxy = vp.httpProxy
+		c.SOCKS5Proxy = vp.socks5Proxy
+		c.SOCKS5Proxies = vp.socksProxies
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate(proxies=%+v) = %v, want nil", vp, err)
+		}
 	}
 }
 

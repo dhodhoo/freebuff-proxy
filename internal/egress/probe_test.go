@@ -176,6 +176,57 @@ func TestSocks5DialerRedactsCredentials(t *testing.T) {
 	}
 }
 
+// TestSocks5DialerContextTimeout verifies that the dialer returned by Socks5Dialer
+// respects context deadline / cancellation.
+func TestSocks5DialerContextTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 1024)
+				// Read until client closes or EOF
+				for {
+					if _, err := c.Read(buf); err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+
+	dialer, err := Socks5Dialer("socks5://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = dialer(ctx, "tcp", "203.0.113.1:80")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("dial succeeded against unresponsive SOCKS5 server")
+	}
+	if elapsed > time.Second {
+		t.Errorf("dial took %v, want fast timeout bounded by 50ms context", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "context deadline exceeded") && !strings.Contains(err.Error(), "i/o timeout") {
+		t.Errorf("expected deadline exceeded error, got: %v", err)
+	}
+}
+
 // poll waits up to timeout for cond to hold, failing the test otherwise.
 func poll(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()

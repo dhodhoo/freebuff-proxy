@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -405,6 +406,66 @@ func (c Config) Validate() error {
 		return fmt.Errorf("PROXY_ROTATION %q must be one of: per-token, round-robin, random", c.ProxyRotation)
 	case c.MaxMessagesPerDay < 0:
 		return errors.New("MAX_MESSAGES_PER_DAY cannot be negative")
+	}
+
+	_, portStr, err := net.SplitHostPort(c.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("LISTEN_ADDR %q is invalid: %w", c.ListenAddr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("LISTEN_ADDR %q has invalid port %q (must be an integer in 1-65535)", c.ListenAddr, portStr)
+	}
+
+	if c.HTTPProxy != "" {
+		u, err := url.Parse(c.HTTPProxy)
+		if err != nil {
+			return fmt.Errorf("HTTP_PROXY %q is not a valid URL: %w", c.HTTPProxy, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("HTTP_PROXY %q must be an http(s) URL", c.HTTPProxy)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("HTTP_PROXY %q has no host", c.HTTPProxy)
+		}
+	}
+
+	if c.SOCKS5Proxy != "" {
+		if strings.Contains(c.SOCKS5Proxy, "://") {
+			u, err := url.Parse(c.SOCKS5Proxy)
+			if err != nil {
+				return fmt.Errorf("SOCKS5_PROXY %q is not a valid URL: %w", c.SOCKS5Proxy, err)
+			}
+			if u.Scheme != "socks5" {
+				return fmt.Errorf("SOCKS5_PROXY %q must use socks5:// scheme", c.SOCKS5Proxy)
+			}
+			if u.Host == "" {
+				return fmt.Errorf("SOCKS5_PROXY %q has no host", c.SOCKS5Proxy)
+			}
+		} else {
+			if _, _, err := net.SplitHostPort(c.SOCKS5Proxy); err != nil {
+				return fmt.Errorf("SOCKS5_PROXY %q is invalid host:port: %w", c.SOCKS5Proxy, err)
+			}
+		}
+	}
+
+	for i, sp := range c.SOCKS5Proxies {
+		if strings.Contains(sp, "://") {
+			u, err := url.Parse(sp)
+			if err != nil {
+				return fmt.Errorf("SOCKS5_PROXIES proxy #%d (%q) is not a valid URL: %w", i+1, sp, err)
+			}
+			if u.Scheme != "socks5" {
+				return fmt.Errorf("SOCKS5_PROXIES proxy #%d (%q) must use socks5:// scheme", i+1, sp)
+			}
+			if u.Host == "" {
+				return fmt.Errorf("SOCKS5_PROXIES proxy #%d (%q) has no host", i+1, sp)
+			}
+		} else {
+			if _, _, err := net.SplitHostPort(sp); err != nil {
+				return fmt.Errorf("SOCKS5_PROXIES proxy #%d (%q) is invalid host:port: %w", i+1, sp, err)
+			}
+		}
 	}
 
 	// HYBRID_MODE deliberately has no constraint: hybrid with zero
