@@ -240,6 +240,44 @@ func TestGetProfileForConnection(t *testing.T) {
 	})
 }
 
+func TestProfileRandomClientHints(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		p := GetProfileForConnection(ProfileRandom)
+		if p.UserAgent == "" {
+			t.Fatal("GetProfileForConnection(ProfileRandom) returned empty User-Agent")
+		}
+		h := http.Header{}
+		ApplyProfileHeaders(h, p)
+		if strings.Contains(p.UserAgent, "Chrome/") || strings.Contains(p.UserAgent, "Edg/") {
+			if p.SecChUA == "" {
+				t.Fatalf("Chromium UA %q had empty SecChUA", p.UserAgent)
+			}
+			if !strings.Contains(p.SecChUA, "Chromium") {
+				t.Fatalf("Chromium UA %q SecChUA = %q, want Chromium brand", p.UserAgent, p.SecChUA)
+			}
+			if p.SecChUAPlatform == "" {
+				t.Fatalf("Chromium UA %q had empty SecChUAPlatform", p.UserAgent)
+			}
+			if got := h.Get("Sec-CH-UA"); got != p.SecChUA {
+				t.Fatalf("header Sec-CH-UA = %q, want %q", got, p.SecChUA)
+			}
+			if got := h.Get("Sec-CH-UA-Mobile"); got != "?0" {
+				t.Fatalf("header Sec-CH-UA-Mobile = %q, want ?0", got)
+			}
+			if got := h.Get("Sec-CH-UA-Platform"); got != p.SecChUAPlatform {
+				t.Fatalf("header Sec-CH-UA-Platform = %q, want %q", got, p.SecChUAPlatform)
+			}
+		} else {
+			if p.SecChUA != "" || p.SecChUAPlatform != "" {
+				t.Fatalf("non-Chromium UA %q has non-empty client hints: %q, %q", p.UserAgent, p.SecChUA, p.SecChUAPlatform)
+			}
+			if got := h.Get("Sec-CH-UA"); got != "" {
+				t.Fatalf("non-Chromium header Sec-CH-UA = %q, want empty", got)
+			}
+		}
+	}
+}
+
 // startTLSStub starts a local TLS server that completes any handshake and
 // answers every request with 200, returning its host:port address.
 func startTLSStub(t *testing.T) string {

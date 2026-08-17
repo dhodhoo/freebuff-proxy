@@ -176,9 +176,33 @@ func GetProfileForConnection(p *Profile) *Profile {
 	if p.ID == ProfileIDRandom {
 		prof := *p
 		prof.UserAgent = RandomUserAgent()
+		prof.SecChUA, prof.SecChUAPlatform = clientHintsForUA(prof.UserAgent)
 		return &prof
 	}
 	return p
+}
+
+// clientHintsForUA returns matching Sec-CH-UA and Sec-CH-UA-Platform for Chromium/Edge user agents.
+func clientHintsForUA(ua string) (secChUA, secChUAPlatform string) {
+	if strings.Contains(ua, "Edg/") {
+		secChUA = `"Not/A)Brand";v="8", "Chromium";v="126", "Microsoft Edge";v="126"`
+	} else if strings.Contains(ua, "Chrome/") {
+		secChUA = `"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"`
+	} else {
+		return "", ""
+	}
+
+	switch {
+	case strings.Contains(ua, "Windows"):
+		secChUAPlatform = `"Windows"`
+	case strings.Contains(ua, "Macintosh") || strings.Contains(ua, "Mac OS"):
+		secChUAPlatform = `"macOS"`
+	case strings.Contains(ua, "Linux") || strings.Contains(ua, "X11"):
+		secChUAPlatform = `"Linux"`
+	default:
+		secChUAPlatform = `"Windows"`
+	}
+	return secChUA, secChUAPlatform
 }
 
 // cryptoRandInt returns a crypto-random integer in [0, n).
