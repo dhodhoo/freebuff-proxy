@@ -674,3 +674,96 @@ func TestClearCooldowns(t *testing.T) {
 		t.Error("ban window not cleared")
 	}
 }
+
+func TestSingleFlightRunAcquisition(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	runs := make([]*Run, concurrency)
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			r, err := mgr.Acquire(context.Background(), agentA)
+			runs[idx] = r
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d failed: %v", i, err)
+		}
+		if runs[i] == nil {
+			t.Fatalf("goroutine %d returned nil run", i)
+		}
+		if runs[i].RunID != "run-0001" {
+			t.Errorf("goroutine %d RunID = %q, want run-0001", i, runs[i].RunID)
+		}
+		mgr.Release(runs[i])
+	}
+
+	started := mock.StartedRunsSnapshot()
+	if len(started) != 1 {
+		t.Fatalf("StartedRuns count = %d, want 1 (single-flight coalesced)", len(started))
+	}
+}
+
+func TestSingleFlightRunRotation(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, 50*time.Millisecond)
+
+	// First acquire
+	r1, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.RunID != "run-0001" {
+		t.Fatalf("first RunID = %q, want run-0001", r1.RunID)
+	}
+	mgr.Release(r1)
+
+	// Wait for rotation interval to pass
+	time.Sleep(70 * time.Millisecond)
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	runs := make([]*Run, concurrency)
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			r, err := mgr.Acquire(context.Background(), agentA)
+			runs[idx] = r
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d failed: %v", i, err)
+		}
+		if runs[i] == nil {
+			t.Fatalf("goroutine %d returned nil run", i)
+		}
+		if runs[i].RunID != "run-0002" {
+			t.Errorf("goroutine %d RunID = %q, want run-0002", i, runs[i].RunID)
+		}
+		mgr.Release(runs[i])
+	}
+
+	started := mock.StartedRunsSnapshot()
+	if len(started) != 2 {
+		t.Fatalf("StartedRuns count = %d, want 2 (initial + 1 coalesced rotation)", len(started))
+	}
+}

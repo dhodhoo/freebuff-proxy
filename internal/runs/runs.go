@@ -15,6 +15,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -51,6 +52,12 @@ type Run struct {
 	finishing bool // FINISH in flight; guarded by the manager mutex
 }
 
+// runFlight coordinates single-flight coalescing for concurrent StartRun calls.
+type runFlight struct {
+	done chan struct{}
+	err  error
+}
+
 // RunSnapshot is a best-effort view of the manager state for healthz.
 type RunSnapshot struct {
 	ActiveRuns    int
@@ -71,8 +78,9 @@ type RunManager struct {
 	rotationInterval time.Duration
 
 	mu            sync.Mutex
-	runs          map[string]*Run // agentID → current run
-	draining      []*Run          // rotated runs awaiting FINISH
+	runs          map[string]*Run       // agentID → current run
+	starting      map[string]*runFlight // agentID → in-flight start
+	draining      []*Run                // rotated runs awaiting FINISH
 	cooldownUntil time.Time
 	// rateLimit is the last 429 rate-limit error applied to this token's
 	// cooldown. It is surfaced by RateLimitError() so exhausted tokens
@@ -105,6 +113,7 @@ func NewRunManager(client *upstream.Client, session *session.Manager, rotationIn
 		session:          session,
 		rotationInterval: rotationInterval,
 		runs:             make(map[string]*Run),
+		starting:         make(map[string]*runFlight),
 	}
 }
 
@@ -498,40 +507,77 @@ func (m *RunManager) Prewarm(ctx context.Context, agentIDs []string) {
 // --- internals ---
 
 // rotate starts a fresh run for agentID, pushing the previous current run
-// (if any) onto the draining list and finishing it asynchronously. The
-// double checks under the lock make concurrent rotators converge on one
-// START when possible.
+// (if any) onto the draining list and finishing it asynchronously. Single-flight
+// coalescing ensures concurrent callers for the same agent wait on a single
+// upstream StartRun call rather than launching duplicate requests.
 func (m *RunManager) rotate(ctx context.Context, agentID string) error {
-	m.mu.Lock()
-	if now := time.Now(); now.Before(m.cooldownUntil) {
-		until := m.cooldownUntil
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		m.mu.Lock()
+		if now := time.Now(); now.Before(m.cooldownUntil) {
+			until := m.cooldownUntil
+			m.mu.Unlock()
+			return fmt.Errorf("token cooling down until %s", until.Format(time.RFC3339))
+		}
+		if run := m.runs[agentID]; run != nil && time.Since(run.StartedAt) < m.rotationInterval {
+			m.mu.Unlock()
+			return nil // a concurrent rotator already refreshed it
+		}
+		if flight, ok := m.starting[agentID]; ok {
+			ch := flight.done
+			m.mu.Unlock()
+			select {
+			case <-ch:
+				if flight.err != nil {
+					if (errors.Is(flight.err, context.Canceled) || errors.Is(flight.err, context.DeadlineExceeded)) && ctx.Err() == nil {
+						// Leader goroutine canceled/timed out, but this waiter's context is still active.
+						// Loop back to try becoming leader.
+						continue
+					}
+					return flight.err
+				}
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		// We are the leader for starting this agent's run.
+		flight := &runFlight{done: make(chan struct{})}
+		if m.starting == nil {
+			m.starting = make(map[string]*runFlight)
+		}
+		m.starting[agentID] = flight
 		m.mu.Unlock()
-		return fmt.Errorf("token cooling down until %s", until.Format(time.RFC3339))
-	}
-	if run := m.runs[agentID]; run != nil && time.Since(run.StartedAt) < m.rotationInterval {
+
+		runID, err := m.client.StartRun(ctx, agentID)
+
+		m.mu.Lock()
+		flight.err = err
+		close(flight.done)
+		delete(m.starting, agentID)
+
+		if err != nil {
+			m.mu.Unlock()
+			return err
+		}
+		slog.Debug("runs: run started", "agent_id", agentID, "run_id", runID)
+
+		oldRun := m.runs[agentID]
+		m.runs[agentID] = &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now()}
+		if oldRun != nil {
+			m.draining = append(m.draining, oldRun)
+		}
 		m.mu.Unlock()
-		return nil // a concurrent rotator already refreshed it
-	}
-	m.mu.Unlock()
 
-	runID, err := m.client.StartRun(ctx, agentID)
-	if err != nil {
-		return err
+		if oldRun != nil {
+			go m.finishIfReady(oldRun)
+		}
+		return nil
 	}
-	slog.Debug("runs: run started", "agent_id", agentID, "run_id", runID)
-
-	m.mu.Lock()
-	oldRun := m.runs[agentID]
-	m.runs[agentID] = &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now()}
-	if oldRun != nil {
-		m.draining = append(m.draining, oldRun)
-	}
-	m.mu.Unlock()
-
-	if oldRun != nil {
-		go m.finishIfReady(oldRun)
-	}
-	return nil
 }
 
 // finishIfReady FINISHes a rotated run once it has no outstanding leases and
