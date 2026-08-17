@@ -572,10 +572,8 @@ func TestAcquireRateLimitCooldowns(t *testing.T) {
 
 func TestAcquireRateLimitBestWindow(t *testing.T) {
 	// Both tokens rate-limited with DIFFERENT windows (per-mock
-	// retryAfterMs): the pool surfaces the longest one — the token that
-	// unblocks last bounds the wait. The previous version served the same
-	// fixed body to both tokens, so the assertion never exercised the
-	// bestRateLimit comparison.
+	// retryAfterMs): the pool surfaces the shortest one — the token that
+	// unblocks earliest bounds the wait.
 	mock0 := testutil.NewMock()
 	defer mock0.Close()
 	mock0.RateLimit = true
@@ -591,11 +589,22 @@ func TestAcquireRateLimitBestWindow(t *testing.T) {
 	if !errors.As(err, &rle) {
 		t.Fatalf("want *upstream.RateLimitError, got %v", err)
 	}
-	if rle.RetryAfter != 5*time.Minute {
-		t.Errorf("RetryAfter = %s, want 5m (longest window wins)", rle.RetryAfter)
+	if rle.RetryAfter != 1*time.Minute {
+		t.Errorf("RetryAfter = %s, want 1m (shortest window wins)", rle.RetryAfter)
 	}
 	if err.Error() == "" || !strings.Contains(err.Error(), "upstream rate limited") {
 		t.Errorf("error = %q, want rate-limit message", err)
+	}
+}
+
+func TestBestRateLimitMinSelection(t *testing.T) {
+	e1 := &upstream.RateLimitError{RetryAfter: 10 * time.Second}
+	e2 := &upstream.RateLimitError{RetryAfter: 2 * time.Second}
+	e3 := &upstream.RateLimitError{RetryAfter: 5 * time.Second}
+
+	best := bestRateLimit([]*upstream.RateLimitError{e1, e2, e3})
+	if best != e2 {
+		t.Errorf("bestRateLimit = %v (RetryAfter: %s), want e2 (RetryAfter: %s)", best, best.RetryAfter, e2.RetryAfter)
 	}
 }
 

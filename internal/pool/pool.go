@@ -939,30 +939,28 @@ func (p *Pool) Chat(ctx context.Context, lease *Lease, opts upstream.ChatOptions
 		}
 		return rc, err
 	}
-	toks := p.toks.Load()
 	// Fixed-token leases dispatch through their backing entry — the
 	// authoritative owner pinned by Acquire. A concurrent RemoveLastToken+
 	// AddToken can leave the lease's Token index out of range (chat would
 	// fail with "invalid lease token") or reused by a DIFFERENT token (chat
 	// would go through the wrong account's client and charge the wrong
 	// usage/error path); the entry is a stable pointer immune to both.
-	// Synthetic leases without an entry keep the historical index path.
-	entry := lease.entry
-	if entry == nil {
-		if lease.Token < 0 || lease.Token >= len(*toks) {
-			return nil, errors.New("pool: chat: invalid lease token")
-		}
-		entry = (*toks)[lease.Token]
-	}
-	rc, err := entry.client.ChatCompletions(ctx, opts, body)
-	if err == nil {
-		// Only chats that actually went upstream count against the daily
-		// cap; errors are not recorded.
-		if lease.entry != nil {
+	if lease.entry != nil {
+		rc, err := lease.entry.client.ChatCompletions(ctx, opts, body)
+		if err == nil {
 			p.recordChatEntry(lease.entry)
-		} else {
-			p.recordChat(lease.Token)
+			p.requestsServed.Add(1)
 		}
+		return rc, err
+	}
+	// Synthetic leases without an entry keep the historical index path.
+	toks := p.toks.Load()
+	if lease.Token < 0 || lease.Token >= len(*toks) {
+		return nil, errors.New("pool: chat: invalid lease token")
+	}
+	rc, err := (*toks)[lease.Token].client.ChatCompletions(ctx, opts, body)
+	if err == nil {
+		p.recordChat(lease.Token)
 		p.requestsServed.Add(1)
 	}
 	return rc, err
@@ -1768,12 +1766,12 @@ func asCountryBlocked(err error) *upstream.CountryBlockedError {
 	return nil
 }
 
-// bestRateLimit picks the rate-limit error with the longest retry
-// window (the token that unblocks last bounds the wait).
+// bestRateLimit picks the rate-limit error with the shortest retry
+// window (the token that unblocks earliest bounds the wait).
 func bestRateLimit(entries []*upstream.RateLimitError) *upstream.RateLimitError {
 	best := entries[0]
 	for _, e := range entries[1:] {
-		if e.RetryAfter > best.RetryAfter {
+		if e.RetryAfter < best.RetryAfter {
 			best = e
 		}
 	}
