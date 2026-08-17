@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,11 +165,13 @@ func TestChatStream(t *testing.T) {
 		t.Fatalf("upstream chat calls = %d, want 1", len(mock.RecordedChatHeaders))
 	}
 	h := mock.RecordedChatHeaders[0]
-	if got := h.Get("x-freebuff-model"); got != modelA {
-		t.Errorf("x-freebuff-model = %q, want %q", got, modelA)
+	// #106: the chat POST carries no model/instance headers — they ride in
+	// the body metadata only.
+	if got := h.Get("x-freebuff-model"); got != "" {
+		t.Errorf("x-freebuff-model = %q on the chat POST, want absent (#106)", got)
 	}
-	if got := h.Get("x-freebuff-instance-id"); got != "inst-abc-123" {
-		t.Errorf("x-freebuff-instance-id = %q, want inst-abc-123", got)
+	if got := h.Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("x-freebuff-instance-id = %q on the chat POST, want absent (#106)", got)
 	}
 	recorded := mock.RecordedChatBodies[0]
 	for _, want := range []string{`"codebuff_metadata"`, `"data_collection":"deny"`, `"stream":true`, `"stop":["cb_easp"]`, `"run_id":"run-0001"`} {
@@ -176,14 +179,18 @@ func TestChatStream(t *testing.T) {
 			t.Errorf("upstream body missing %s: %s", want, recorded)
 		}
 	}
-	// #80+#52: trace_session_id is minted once per run and threaded through
-	// the envelope; client_id is stable per SESSION INSTANCE (derived from
-	// the instance id, #52), not a fresh per-request draw.
+	// #80+#103: trace_session_id is minted once per run and threaded through
+	// the envelope; client_id is a FRESH random 13-char base36 draw per chat
+	// call — never the sess:/run:-prefixed shapes the server fingerprints as
+	// a proxy.
 	if !strings.Contains(recorded, `"trace_session_id":"`) {
 		t.Errorf("upstream body missing trace_session_id: %s", recorded)
 	}
-	if !strings.Contains(recorded, `"client_id":"sess:inst-abc-123"`) {
-		t.Errorf("upstream body missing session-stable client_id sess:inst-abc-123: %s", recorded)
+	if strings.Contains(recorded, `"client_id":"sess:`) || strings.Contains(recorded, `"client_id":"run:`) {
+		t.Errorf("upstream body carries a prefixed client_id: %s", recorded)
+	}
+	if !regexp.MustCompile(`"client_id":"[a-z0-9]{13}"`).MatchString(recorded) {
+		t.Errorf("upstream body missing a 13-char base36 client_id: %s", recorded)
 	}
 }
 
@@ -919,8 +926,16 @@ func TestSmokeDefaultsToFallbackModel(t *testing.T) {
 	if len(mock.RecordedChatHeaders) == 0 {
 		t.Fatal("no upstream chat recorded")
 	}
-	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "deepseek/deepseek-v4-flash" {
-		t.Errorf("smoke probe model = %q, want deepseek/deepseek-v4-flash", got)
+	// #106: the smoke probe is a chat POST — the model rides in the body,
+	// not an x-freebuff-model header.
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "" {
+		t.Errorf("smoke probe chat POST carries x-freebuff-model %q, want absent (#106)", got)
+	}
+	if len(mock.RecordedChatBodies) == 0 {
+		t.Fatal("no upstream chat body recorded")
+	}
+	if !strings.Contains(mock.RecordedChatBodies[0], `"model":"deepseek/deepseek-v4-flash"`) {
+		t.Errorf("smoke probe body missing model deepseek/deepseek-v4-flash: %s", mock.RecordedChatBodies[0])
 	}
 }
 

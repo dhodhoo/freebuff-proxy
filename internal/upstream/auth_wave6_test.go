@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -12,13 +13,14 @@ import (
 	"freebuff-proxy/internal/testutil"
 )
 
-// --- #52: session-stable client_id ------------------------------------------
+// --- #103: fresh random client_id per chat call -----------------------------
 
-// TestInjectEnvelopeSessionStableClientID verifies #52: client_id derives
-// from the SESSION INSTANCE id (stable across all runs of a session), falls
-// back to the run id when no instance is set, and stays stable across
-// requests.
-func TestInjectEnvelopeSessionStableClientID(t *testing.T) {
+// TestInjectEnvelopeFreshRandomClientID verifies #103: client_id is a FRESH
+// random SDK-faithful base36 draw per chat call — never the sess:/run:-
+// prefixed shapes the server fingerprints as a proxy, never wf- prefixed,
+// and never stable across calls. trace_session_id stays per run and
+// freebuff_instance_id stays per session.
+func TestInjectEnvelopeFreshRandomClientID(t *testing.T) {
 	out, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-1", SessionInstanceID: "inst-9", TraceSessionID: "trace-abc"})
 	if err != nil {
 		t.Fatal(err)
@@ -28,15 +30,24 @@ func TestInjectEnvelopeSessionStableClientID(t *testing.T) {
 		t.Fatal(err)
 	}
 	md := sent["codebuff_metadata"].(map[string]any)
-	if md["client_id"] != "sess:inst-9" {
-		t.Errorf("client_id = %v, want sess:inst-9 (stable per session instance)", md["client_id"])
+	clientID, _ := md["client_id"].(string)
+	if !regexp.MustCompile(`^[a-z0-9]{13}$`).MatchString(clientID) {
+		t.Errorf("client_id = %q, want a 13-char base36 draw", clientID)
+	}
+	for _, prefix := range []string{"sess:", "run:", "wf-"} {
+		if strings.HasPrefix(clientID, prefix) {
+			t.Errorf("client_id = %q, must not carry the %q prefix (proxy fingerprint)", clientID, prefix)
+		}
 	}
 	if md["trace_session_id"] != "trace-abc" {
 		t.Errorf("trace_session_id = %v, want trace-abc (per run)", md["trace_session_id"])
 	}
+	if md["freebuff_instance_id"] != "inst-9" {
+		t.Errorf("freebuff_instance_id = %v, want inst-9 (per session)", md["freebuff_instance_id"])
+	}
 
-	// Same session, a DIFFERENT run (rotation): client_id must NOT change.
-	out2, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-2", SessionInstanceID: "inst-9"})
+	// A second call with the SAME run AND session must draw a DIFFERENT id.
+	out2, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-1", SessionInstanceID: "inst-9"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,11 +55,11 @@ func TestInjectEnvelopeSessionStableClientID(t *testing.T) {
 		t.Fatal(err)
 	}
 	md2 := sent["codebuff_metadata"].(map[string]any)
-	if md2["client_id"] != "sess:inst-9" {
-		t.Errorf("client_id = %v after run rotation, want sess:inst-9 (session-stable)", md2["client_id"])
+	if id2, _ := md2["client_id"].(string); id2 == clientID {
+		t.Errorf("client_id = %q on a second call, want a fresh draw per call", id2)
 	}
 
-	// No instance id (disabled session): falls back to the run-derived id.
+	// No instance id (disabled session): still a fresh unprefixed draw.
 	out3, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-3"})
 	if err != nil {
 		t.Fatal(err)
@@ -56,8 +67,37 @@ func TestInjectEnvelopeSessionStableClientID(t *testing.T) {
 	if err := json.Unmarshal(out3, &sent); err != nil {
 		t.Fatal(err)
 	}
-	if md3 := sent["codebuff_metadata"].(map[string]any); md3["client_id"] != "run:run-3" {
-		t.Errorf("client_id = %v without instance, want run:run-3", md3["client_id"])
+	md3 := sent["codebuff_metadata"].(map[string]any)
+	if id3, _ := md3["client_id"].(string); !regexp.MustCompile(`^[a-z0-9]{13}$`).MatchString(id3) || strings.HasPrefix(id3, "run:") {
+		t.Errorf("client_id without instance = %q, want fresh unprefixed 13-char base36", id3)
+	}
+}
+
+// TestInjectEnvelopeStepNumber verifies #113: llm_step_number is injected as
+// a STRING when ChatOptions.StepNumber > 0 and absent when zero.
+func TestInjectEnvelopeStepNumber(t *testing.T) {
+	out, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "r", StepNumber: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(out, &sent); err != nil {
+		t.Fatal(err)
+	}
+	md := sent["codebuff_metadata"].(map[string]any)
+	if md["llm_step_number"] != "3" {
+		t.Errorf("llm_step_number = %v (%T), want %q (string form)", md["llm_step_number"], md["llm_step_number"], "3")
+	}
+
+	out2, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out2, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := sent["codebuff_metadata"].(map[string]any)["llm_step_number"]; present {
+		t.Error("llm_step_number present when StepNumber == 0")
 	}
 }
 

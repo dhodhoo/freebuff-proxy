@@ -266,7 +266,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `SESSION_PERSIST` | `false` | Persist session state AND active agent runs to disk so a restart resumes them instead of re-creating (new daily slot / re-START) |
 | `SESSION_STATE_FILE` | `.freebuff-session-state.json` | Path of the session state file (used when `SESSION_PERSIST=true`; token-keyed, `0600`) |
 | `SESSION_RE_ADMIT_LEAD` | `60s` | Re-admit a session pre-emptively when less than this remains: the request rides the old session while the refresh runs in the background |
-| `SESSION_PROBE_CACHE_TTL` | `15s` | Reuse the last successful session state (skip redundant heartbeat GETs) within this window |
+| `SESSION_PROBE_CACHE_TTL` | `15s` | Reuse the last successful session state (skip redundant session poll GETs) within this window |
 | `SESSION_CREATE_MAX_PARALLEL_GLOBAL` | `128` | Cap on concurrent in-flight session admissions (wait-or-503) |
 | `SESSION_CREATE_MAX_PARALLEL_PER_MODEL` | `32` | Per-model cap on concurrent in-flight session admissions |
 | `RUN_FINISH_QUEUE_SIZE` | `64` | Bounded deferred-FINISH worker queue for rotated/drained runs |

@@ -1,9 +1,10 @@
 package runs
 
 // Wave-3 tests: the bounded deferred-FINISH queue (#90), the draining-list
-// cap/TTL eviction (#55), abandoned-lease finish on client disconnect (#53),
-// context-pruner child runs + step recording (#91), and run persistence
-// across restarts (#40).
+// cap/TTL eviction (#55), abandoned-lease finish on client disconnect
+// (#53/#114), context-pruner child runs (#91) + step recording (#114: steps
+// are batched and sent WITH FINISH), and run persistence across restarts
+// (#40).
 
 import (
 	"context"
@@ -244,9 +245,11 @@ func TestReleaseAbandonedFinishesLastLease(t *testing.T) {
 	// FINISHed (upstream must not keep an abandoned run alive).
 	mgr.ReleaseAbandoned(run)
 
+	// Issue #114: an abandoned run must FINISH as cancelled, not completed —
+	// a gateway with zero cancelled runs looks synthetic.
 	eventually(t, "abandoned run FINISH", func() bool {
 		f, ok := finishedRun(mock, run.RunID)
-		return ok && f.Status == "completed"
+		return ok && f.Status == "cancelled"
 	})
 	mgr.mu.Lock()
 	_, active := mgr.runs[agentA]
@@ -308,7 +311,7 @@ func TestReleaseAbandonedKeepsConcurrentRequests(t *testing.T) {
 	mgr.Shutdown(context.Background())
 }
 
-func TestRecordStepQueued(t *testing.T) {
+func TestRecordStepBatchesWithFinish(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mgr, _ := newTestManager(t, mock, time.Hour)
@@ -317,13 +320,21 @@ func TestRecordStepQueued(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Issue #114: steps are recorded in memory and batched with FINISH —
+	// recording must never hit the network (the CLI has no /steps
+	// endpoint), so the mock sees them only inside the FINISH payload.
 	mgr.RecordStep(run, "chatcmpl-123")
+	mgr.RecordStep(run, "chatcmpl-124")
+	mgr.FinishRun(context.Background(), run)
 
-	eventually(t, "step recorded", func() bool {
-		steps := mock.StepsSnapshot()
-		return len(steps) == 1 && steps[0].RunID == run.RunID &&
-			steps[0].StepNumber == 2 && steps[0].MessageID == "chatcmpl-123" &&
-			steps[0].Status == "completed"
+	eventually(t, "steps ride in FINISH", func() bool {
+		f, ok := finishedRun(mock, run.RunID)
+		if !ok || f.Status != "completed" || f.TotalSteps != 2 || len(f.Steps) != 2 {
+			return false
+		}
+		return f.Steps[0].StepNumber == 1 && f.Steps[0].MessageID != nil && *f.Steps[0].MessageID == "chatcmpl-123" &&
+			f.Steps[1].StepNumber == 2 && f.Steps[1].MessageID != nil && *f.Steps[1].MessageID == "chatcmpl-124" &&
+			f.Steps[1].Status == "completed" && f.Steps[0].StartTime != ""
 	})
 	mgr.Shutdown(context.Background())
 }
@@ -405,7 +416,7 @@ func TestRunPersistenceAdoptAndFinish(t *testing.T) {
 
 	// FINISHing the run must remove it from the store so a third restart
 	// does not resurrect it.
-	mgr2.FinishRun(context.Background(), adopted, 1)
+	mgr2.FinishRun(context.Background(), adopted)
 	eventually(t, "FINISH lands", func() bool {
 		_, ok := finishedRun(mock, adopted.RunID)
 		return ok

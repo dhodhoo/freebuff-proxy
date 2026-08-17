@@ -130,11 +130,13 @@ func TestChatCompletionsEnvelope(t *testing.T) {
 		t.Fatalf("want 1 chat request, got %d / %d", len(headers), len(bodies))
 	}
 	h := headers[0]
-	if got := h.Get("x-freebuff-model"); got != "deepseek/deepseek-v4-flash" {
-		t.Errorf("x-freebuff-model = %q", got)
+	// #106: the chat POST carries NO x-freebuff-model / x-freebuff-instance-id
+	// headers — the model and instance id ride only in the body metadata.
+	if got := h.Get("x-freebuff-model"); got != "" {
+		t.Errorf("x-freebuff-model = %q on the chat POST, want absent (#106)", got)
 	}
-	if got := h.Get("x-freebuff-instance-id"); got != "inst-1" {
-		t.Errorf("x-freebuff-instance-id = %q", got)
+	if got := h.Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("x-freebuff-instance-id = %q on the chat POST, want absent (#106)", got)
 	}
 	if got := h.Get("Authorization"); got != "Bearer tok-a" {
 		t.Errorf("Authorization = %q", got)
@@ -159,9 +161,11 @@ func TestChatCompletionsEnvelope(t *testing.T) {
 	if md["freebuff_instance_id"] != "inst-1" {
 		t.Errorf("freebuff_instance_id = %v", md["freebuff_instance_id"])
 	}
+	// #103: client_id is a FRESH random draw per chat call — never the
+	// sess:-prefixed shape the server fingerprints as a proxy.
 	clientID, _ := md["client_id"].(string)
-	if clientID != "sess:inst-1" {
-		t.Errorf("client_id = %q, want %q (stable per session instance, derived from instance id — #52)", clientID, "sess:inst-1")
+	if !regexp.MustCompile(`^[a-z0-9]{13}$`).MatchString(clientID) || strings.HasPrefix(clientID, "sess:") {
+		t.Errorf("client_id = %q, want a fresh 13-char base36 draw per chat call (#103)", clientID)
 	}
 	provider, ok := sent["provider"].(map[string]any)
 	if !ok || provider["data_collection"] != "deny" {
@@ -675,15 +679,49 @@ func TestStartAndFinishRun(t *testing.T) {
 		t.Errorf("START not recorded: %v", mock.StartedRuns)
 	}
 
-	if err := client.FinishRun(context.Background(), runID, 4); err != nil {
+	msg1 := "msg-1"
+	steps := []RunStep{
+		{ID: "step-1", StepNumber: 1, MessageID: &msg1, Status: "completed", StartTime: "2026-08-18T00:00:00.000Z"},
+		{ID: "step-2", StepNumber: 2, Status: "completed", StartTime: "2026-08-18T00:00:01.000Z"},
+	}
+	if err := client.FinishRun(context.Background(), runID, "completed", len(steps), steps, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(mock.FinishedRuns) != 1 {
 		t.Fatalf("FINISH not recorded: %v", mock.FinishedRuns)
 	}
 	f := mock.FinishedRuns[0]
-	if f.RunID != runID || f.Status != "completed" || f.TotalSteps != 4 {
+	if f.RunID != runID || f.Status != "completed" || f.TotalSteps != 2 {
 		t.Errorf("FINISH payload = %+v", f)
+	}
+	// Issue #114: steps ride IN the FINISH payload (the CLI has no /steps
+	// endpoint) with the CLI step shape: id, stepNumber, messageId
+	// (null-able), status, startTime.
+	if len(f.Steps) != 2 || f.Steps[0].StepNumber != 1 || f.Steps[0].MessageID == nil || *f.Steps[0].MessageID != "msg-1" ||
+		f.Steps[1].StepNumber != 2 || f.Steps[1].MessageID != nil || f.Steps[1].StartTime == "" {
+		t.Errorf("FINISH steps = %+v, want 2 CLI-shaped steps", f.Steps)
+	}
+}
+
+func TestFinishRunErrorTruncation(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+
+	client, _ := New("tok", testConfig(mock.URL(), nil))
+
+	// errorMessage must be truncated to 5000 runes (CLI parity:
+	// truncateString(errorMessage, 5000) in database.ts) — a full Go stack
+	// trace must not blow the cap.
+	long := strings.Repeat("エ", 6000)
+	if err := client.FinishRun(context.Background(), "run-0001", "failed", 0, nil, long); err != nil {
+		t.Fatal(err)
+	}
+	finished := mock.FinishedRunsSnapshot()
+	if len(finished) != 1 || finished[0].RunID != "run-0001" || finished[0].Status != "failed" {
+		t.Fatalf("finished runs = %+v, want run-0001 failed", finished)
+	}
+	if got := len([]rune(finished[0].ErrorMessage)); got != 5000 {
+		t.Errorf("errorMessage runes = %d, want 5000 (truncated)", got)
 	}
 }
 
@@ -806,8 +844,8 @@ func TestCrossHostRedirectStripsToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = sameResp.Body.Close()
-	if got := <-sameKey; got != token {
-		t.Errorf("same-host redirect carried x-codebuff-api-key %q, want %q kept", got, token)
+	if got := <-sameKey; got != "" {
+		t.Errorf("same-host request carried x-codebuff-api-key %q, want absent (client no longer sends it, issue #107)", got)
 	}
 }
 
@@ -1231,8 +1269,10 @@ func TestClassifyDeploymentOutsideHoursRetryable(t *testing.T) {
 
 // TestStealthProfileResolvedOncePerRequest verifies that for TLS_FINGERPRINT
 // auto/random the concrete profile is resolved ONCE per request: newRequest
-// stashes it (and applies its headers), and the dialer reads the same stash
-// for the ClientHello — so headers and TLS fingerprint never mismatch.
+// stashes it, and the dialer reads the same stash for the ClientHello — so
+// the TLS fingerprint always matches the resolved profile. The request
+// carries the CLI UA and NO browser headers (#109): header application is
+// inverted — only the utls ClientHello impersonates the browser.
 func TestStealthProfileResolvedOncePerRequest(t *testing.T) {
 	client, err := New("tok-a", testConfig("", func(c *config.Config) { c.TLSFingerprint = "auto" }))
 	if err != nil {
@@ -1249,9 +1289,15 @@ func TestStealthProfileResolvedOncePerRequest(t *testing.T) {
 	if stashed.ID == stealth.ProfileIDAuto || stashed.ID == stealth.ProfileIDRandom {
 		t.Fatalf("stashed profile %s is not concrete (auto must resolve once)", stashed.ID)
 	}
-	// The browser headers were applied from the SAME concrete profile.
-	if got := req.Header.Get("User-Agent"); got != stashed.UserAgent {
-		t.Errorf("request User-Agent %q != stashed profile User-Agent %q", got, stashed.UserAgent)
+	// The request carries the pinned CLI UA, not the profile's browser UA.
+	if got := req.Header.Get("User-Agent"); got != cliUserAgent {
+		t.Errorf("request User-Agent %q != the CLI UA %q (no browser persona on API calls, #109)", got, cliUserAgent)
+	}
+	for _, hdr := range []string{"Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest",
+		"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"} {
+		if got := req.Header.Get(hdr); got != "" {
+			t.Errorf("%s = %q on an upstream API request, want absent (#109)", hdr, got)
+		}
 	}
 	// The dialer must use the stashed profile for this request's dial.
 	if dial := client.dialProfileFor(req.Context()); dial != stashed {
@@ -1388,15 +1434,21 @@ func TestGetSessionWithOptsHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true, true)
+	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Status != "active" {
 		t.Errorf("status = %q, want active", st.Status)
 	}
-	if gotCompact != "1" || gotHeartbeat != "1" || gotInstance != "inst-1" {
-		t.Errorf("headers: compact=%q, heartbeat=%q, instance=%q", gotCompact, gotHeartbeat, gotInstance)
+	if gotCompact != "1" || gotInstance != "inst-1" {
+		t.Errorf("headers: compact=%q, instance=%q (want 1 / inst-1)", gotCompact, gotInstance)
+	}
+	// Gap #2: the CLI never beats — x-freebuff-heartbeat is Desktop-only
+	// (reference/freebuff freebuff-models.ts:1212-1215), so a compact poll
+	// must NOT carry it.
+	if gotHeartbeat != "" {
+		t.Errorf("x-freebuff-heartbeat = %q, want absent on compact polls", gotHeartbeat)
 	}
 }
 
@@ -1514,8 +1566,9 @@ func newRetryClient(t *testing.T, baseURL string, retries int, fingerprint strin
 	return client, rt
 }
 
-// TestDumpRedactsTokenHeaders verifies the debug dump redacts both the
-// Authorization header and x-codebuff-api-key (which carries the same token).
+// TestDumpRedactsTokenHeaders verifies the debug dump redacts the
+// Authorization header (the only credential on the wire since #107 dropped
+// x-codebuff-api-key; the redaction list still covers it defensively).
 // Regression: dump() only redacted Authorization, so DEBUG_DUMP=true leaked
 // the plaintext token into dump/ files via x-codebuff-api-key.
 func TestDumpRedactsTokenHeaders(t *testing.T) {
@@ -1555,8 +1608,11 @@ func TestDumpRedactsTokenHeaders(t *testing.T) {
 	if !strings.Contains(dump, "Authorization: [redacted]") {
 		t.Errorf("dump file missing redacted Authorization header:\n%s", dump)
 	}
-	if !strings.Contains(dump, "X-Codebuff-Api-Key: [redacted]") {
-		t.Errorf("dump file missing redacted X-Codebuff-Api-Key header:\n%s", dump)
+	// #107: x-codebuff-api-key is no longer sent, so it must not appear in
+	// the dump at all (the defensive redaction list stays for any future
+	// setter).
+	if strings.Contains(strings.ToLower(dump), "x-codebuff-api-key") {
+		t.Errorf("dump file contains an x-codebuff-api-key header line (never sent now):\n%s", dump)
 	}
 }
 
@@ -1744,26 +1800,23 @@ func TestRetryRotatesPinnedFingerprint(t *testing.T) {
 	if id != stealth.ProfileIDSafari18 {
 		t.Errorf("stealthProfile = %s, want safari18 (chrome126 rotated to a distinct JA3)", id)
 	}
-	// The retried request carried the rotated profile's browser headers:
-	// the first attempt used chrome126, the retry re-applied safari18.
+	// Headers stay CLI-shaped across the retry (#109): the fingerprint
+	// rotates at the TLS layer only; no browser persona ever touches the API
+	// request, so there are no Sec-CH-UA/Sec-Fetch-* headers to carry over.
 	if rt.calls.Load() != 2 {
 		t.Fatalf("upstream attempts = %d, want 2", rt.calls.Load())
 	}
-	if got := rt.seenHeaders[0].Get("User-Agent"); got != stealth.ProfileChrome126.UserAgent {
-		t.Errorf("attempt 1 User-Agent = %q, want chrome126", got)
+	for i, wantAttempt := range []string{"attempt 1", "attempt 2 (rotated)"} {
+		if got := rt.seenHeaders[i].Get("User-Agent"); got != cliUserAgent {
+			t.Errorf("%s User-Agent = %q, want the CLI UA %q", wantAttempt, got, cliUserAgent)
+		}
 	}
-	if got := rt.seenHeaders[1].Get("User-Agent"); got != stealth.ProfileSafari18.UserAgent {
-		t.Errorf("attempt 2 User-Agent = %q, want safari18 (rotated)", got)
-	}
-	// The retry rotated to Safari18, which has no Client Hints: the Chromium
-	// Sec-CH-UA* headers from attempt 1 must be GONE, not carried onto a
-	// Safari TLS fingerprint.
-	if got := rt.seenHeaders[0].Get("Sec-CH-UA"); got == "" {
-		t.Error("attempt 1 Sec-CH-UA empty, want chrome126 client hints")
-	}
-	for _, hdr := range []string{"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"} {
-		if got := rt.seenHeaders[1].Get(hdr); got != "" {
-			t.Errorf("attempt 2 %s = %q, want deleted (Safari18 has no Client Hints)", hdr, got)
+	for _, hdr := range []string{"Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform",
+		"Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"} {
+		for i := 0; i < 2; i++ {
+			if got := rt.seenHeaders[i].Get(hdr); got != "" {
+				t.Errorf("attempt %d %s = %q, want absent (no browser headers on API calls, #109)", i+1, hdr, got)
+			}
 		}
 	}
 }
@@ -2195,6 +2248,44 @@ func TestEnsureCliSystemMarkerBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("phrase mid-string in string prepends marker", func(t *testing.T) {
+		// #110: the server gate is a TRIMMED PREFIX test at position 0 — a
+		// system message that merely mentions the phrase mid-string must NOT
+		// suppress the canonical prefix.
+		content := "Please act as " + cliSystemMarkerPhrase + " and be concise."
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": content},
+			map[string]any{"role": "user", "content": "hi"},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("messages = %v, want length 2", msgs)
+		}
+		got := msgs[0].(map[string]any)["content"].(string)
+		if !strings.HasPrefix(got, cliSystemMarker+"\n\n") || !strings.Contains(got, content) {
+			t.Errorf("system content = %q, want marker prepended to the mid-string mention", got)
+		}
+	})
+
+	t.Run("phrase mid-string in structured part prepends marker", func(t *testing.T) {
+		parts := []any{
+			map[string]any{"type": "text", "text": "Remember: " + cliSystemMarkerPhrase + "."},
+		}
+		p := map[string]any{"messages": []any{
+			map[string]any{"role": "system", "content": parts},
+		}}
+		ensureCliSystemMarker(p)
+		msgs := p["messages"].([]any)
+		gotParts, ok := msgs[0].(map[string]any)["content"].([]any)
+		if !ok || len(gotParts) != 2 {
+			t.Fatalf("system parts = %v, want 2 with marker prepended", msgs[0])
+		}
+		if gotParts[0].(map[string]any)["text"] != cliSystemMarker {
+			t.Errorf("marker part = %v, want the CLI marker first", gotParts[0])
+		}
+	})
+
 	t.Run("structured system content array prepends marker", func(t *testing.T) {
 		originalParts := []any{
 			map[string]any{"type": "text", "text": "custom instructions"},
@@ -2452,8 +2543,8 @@ func TestRedirectMultihop(t *testing.T) {
 		if got := <-bKeySeen; got != "" {
 			t.Errorf("intermediate host B received token %q, want stripped", got)
 		}
-		if got := <-aKeySeen; got != token {
-			t.Errorf("loop-back hop to A carried %q, want %q kept", got, token)
+		if got := <-aKeySeen; got != "" {
+			t.Errorf("loop-back hop to A carried %q, want absent (client no longer sends x-codebuff-api-key, issue #107)", got)
 		}
 	})
 
@@ -2894,11 +2985,13 @@ func TestFullChatLifecycleChained(t *testing.T) {
 	if len(mock.RecordedChatHeaders) != 1 {
 		t.Fatalf("recorded chat headers = %d, want 1", len(mock.RecordedChatHeaders))
 	}
-	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-instance-id"); got != st.InstanceID {
-		t.Errorf("chat x-freebuff-instance-id = %q, want %q", got, st.InstanceID)
+	// #106: the chat POST carries no instance/model headers — they ride in
+	// the body metadata only.
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("chat x-freebuff-instance-id = %q, want absent (#106)", got)
 	}
-	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "m" {
-		t.Errorf("chat x-freebuff-model = %q, want m", got)
+	if got := mock.RecordedChatHeaders[0].Get("x-freebuff-model"); got != "" {
+		t.Errorf("chat x-freebuff-model = %q, want absent (#106)", got)
 	}
 	if !mock.BodyContains(`"freebuff_instance_id":"` + st.InstanceID + `"`) {
 		t.Error("chat body missing freebuff_instance_id in codebuff_metadata")
@@ -2907,7 +3000,7 @@ func TestFullChatLifecycleChained(t *testing.T) {
 		t.Error("chat body missing run_id in codebuff_metadata")
 	}
 
-	if err := client.FinishRun(ctx, runID, 3); err != nil {
+	if err := client.FinishRun(ctx, runID, "completed", 3, nil, ""); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
 	if err := client.EndSession(ctx, st.InstanceID); err != nil {
@@ -2926,9 +3019,9 @@ func TestFullChatLifecycleChained(t *testing.T) {
 	}
 }
 
-// TestCompactHeartbeatAbsentTolerant is E2E flow 8: a compact heartbeat poll
-// without quota/offer fields parses cleanly with nil maps.
-func TestCompactHeartbeatAbsentTolerant(t *testing.T) {
+// TestCompactPollAbsentTolerant is E2E flow 8: a compact poll without quota/
+// offer fields parses cleanly with nil maps, and carries no heartbeat header.
+func TestCompactPollAbsentTolerant(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	gotCompact := make(chan string, 1)
@@ -2944,9 +3037,9 @@ func TestCompactHeartbeatAbsentTolerant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true, true)
+	st, err := client.GetSessionWithOpts(context.Background(), "inst-1", true)
 	if err != nil {
-		t.Fatalf("compact heartbeat poll: %v", err)
+		t.Fatalf("compact poll: %v", err)
 	}
 	if st.Status != "active" || st.InstanceID != "inst-1" {
 		t.Errorf("state = %+v, want active inst-1", st)
@@ -2960,8 +3053,8 @@ func TestCompactHeartbeatAbsentTolerant(t *testing.T) {
 	if got := <-gotCompact; got != "1" {
 		t.Errorf("compact header = %q, want 1", got)
 	}
-	if got := <-gotHeartbeat; got != "1" {
-		t.Errorf("heartbeat header = %q, want 1", got)
+	if got := <-gotHeartbeat; got != "" {
+		t.Errorf("heartbeat header = %q, want absent (CLI never beats)", got)
 	}
 }
 
@@ -3006,6 +3099,9 @@ func TestChatCompletionsRetriesCapacityDeferredSameSession(t *testing.T) {
 		mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
 			if calls.Add(1) == 1 {
 				w.Header().Set("Content-Type", "application/json")
+				// #105: a short retry-after — the client must sleep it (floor
+				// 10s) before re-POSTing, not retry immediately.
+				w.Header().Set("Retry-After", "1")
 				w.WriteHeader(http.StatusTooManyRequests)
 				_, _ = io.WriteString(w, deferred)
 				return
@@ -3018,11 +3114,16 @@ func TestChatCompletionsRetriesCapacityDeferredSameSession(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		start := time.Now()
 		rc, err := client.ChatCompletions(context.Background(), ChatOptions{Model: "m", RunID: "r", SessionInstanceID: "inst-1"}, body)
 		if err != nil {
 			t.Fatalf("ChatCompletions after capacity-deferred retry: %v", err)
 		}
 		_ = rc.Close()
+		// The retry-after (1s) must have been honored before the retry POST.
+		if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+			t.Errorf("capacity-deferred retry elapsed %v, want >= the 1s Retry-After sleep (#105)", elapsed)
+		}
 
 		if got := calls.Load(); got != 2 {
 			t.Errorf("upstream chat calls = %d, want 2 (original + same-session retry)", got)
@@ -3033,9 +3134,13 @@ func TestChatCompletionsRetriesCapacityDeferredSameSession(t *testing.T) {
 		if len(mock.RecordedChatHeaders) != 2 {
 			t.Fatalf("recorded %d chat requests, want 2", len(mock.RecordedChatHeaders))
 		}
-		// Same session on the retry: instance id header identical.
-		if got := mock.RecordedChatHeaders[1].Get("x-freebuff-instance-id"); got != "inst-1" {
-			t.Errorf("retry x-freebuff-instance-id = %q, want inst-1 (same session)", got)
+		// Same session on the retry: the instance id rides in the body
+		// metadata, not the chat headers (#106).
+		if got := mock.RecordedChatHeaders[1].Get("x-freebuff-instance-id"); got != "" {
+			t.Errorf("retry x-freebuff-instance-id = %q, want absent (chat headers carry no instance id)", got)
+		}
+		if !strings.Contains(mock.RecordedChatBodies[0], `"freebuff_instance_id":"inst-1"`) {
+			t.Error("chat body missing freebuff_instance_id in codebuff_metadata")
 		}
 		if mock.RecordedChatBodies[0] != mock.RecordedChatBodies[1] {
 			t.Error("retried body differs from original (must be byte-identical)")
@@ -3049,6 +3154,7 @@ func TestChatCompletionsRetriesCapacityDeferredSameSession(t *testing.T) {
 		mock2.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
 			calls2.Add(1)
 			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = io.WriteString(w, deferred)
 		}
@@ -3109,6 +3215,7 @@ func TestChatCompletionsRetriesCapacityDeferredSameSession(t *testing.T) {
 		mock4.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
 			if calls4.Add(1)%2 == 1 { // first call of each request: deferred
 				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "1")
 				w.WriteHeader(http.StatusTooManyRequests)
 				_, _ = io.WriteString(w, deferred)
 				return
@@ -3233,10 +3340,11 @@ func TestChatSendsActingUserID(t *testing.T) {
 	})
 }
 
-// TestInjectEnvelopeTraceSessionIDAndStableClientID verifies #80: the
-// envelope injects trace_session_id when carried by ChatOptions and derives
-// client_id stably from the run id (never a fresh per-request draw).
-func TestInjectEnvelopeTraceSessionIDAndStableClientID(t *testing.T) {
+// TestInjectEnvelopeTraceSessionIDAndFreshClientID verifies #80+#103: the
+// envelope injects trace_session_id when carried by ChatOptions (stable per
+// run) while client_id is a FRESH random draw per call (never derived from
+// the run id).
+func TestInjectEnvelopeTraceSessionIDAndFreshClientID(t *testing.T) {
 	out, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-1", TraceSessionID: "trace-abc"})
 	if err != nil {
 		t.Fatal(err)
@@ -3249,18 +3357,18 @@ func TestInjectEnvelopeTraceSessionIDAndStableClientID(t *testing.T) {
 	if md["trace_session_id"] != "trace-abc" {
 		t.Errorf("trace_session_id = %v, want trace-abc", md["trace_session_id"])
 	}
-	if md["client_id"] != "run:run-1" {
-		t.Errorf("client_id = %v, want run:run-1 (stable per run)", md["client_id"])
+	if id, _ := md["client_id"].(string); !regexp.MustCompile(`^[a-z0-9]{13}$`).MatchString(id) || strings.HasPrefix(id, "run:") {
+		t.Errorf("client_id = %v, want a fresh unprefixed 13-char base36 draw (#103)", md["client_id"])
 	}
-	// Re-injecting the same run yields the same client_id across requests.
+	// Re-injecting the same run yields a DIFFERENT client_id across calls.
 	out2, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{RunID: "run-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var sent2 map[string]any
 	_ = json.Unmarshal(out2, &sent2)
-	if md2 := sent2["codebuff_metadata"].(map[string]any); md2["client_id"] != "run:run-1" {
-		t.Errorf("client_id = %v, want stable run:run-1 across requests", md2["client_id"])
+	if md2 := sent2["codebuff_metadata"].(map[string]any); md2["client_id"] == md["client_id"] {
+		t.Errorf("client_id = %v, want a fresh draw per request (same run)", md2["client_id"])
 	}
 	// Without a run id the SDK-faithful 13-char base36 draw is kept.
 	out3, err := injectEnvelope([]byte(`{"model":"m"}`), "free", ChatOptions{})

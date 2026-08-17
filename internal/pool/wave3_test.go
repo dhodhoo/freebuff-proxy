@@ -2,7 +2,8 @@ package pool
 
 // Wave-3 pool tests: quota-aware token ordering (#85), the session-create
 // admission gate (#86), the local spend ledger (#87), run pre-create at
-// admission (#90a), abandoned-lease finish (#53), and step recording (#91).
+// admission (#90a), abandoned-lease finish (#53/#114), and step recording
+// (#114: steps ride the FINISH payload).
 
 import (
 	"context"
@@ -319,9 +320,11 @@ func TestLeaseAbandonFinishesRun(t *testing.T) {
 	runID := lease.Run.RunID
 	p.LeaseAbandon(lease) // client disconnect
 
+	// Issue #114: an abandoned run must FINISH as cancelled, not completed —
+	// a gateway with zero cancelled runs looks synthetic.
 	eventually(t, "abandoned run FINISH", func() bool {
 		for _, f := range mock.FinishedRunsSnapshot() {
-			if f.RunID == runID && f.Status == "completed" {
+			if f.RunID == runID && f.Status == "cancelled" {
 				return true
 			}
 		}
@@ -358,12 +361,23 @@ func TestRecordRunStepThroughPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Issue #114: steps are appended in memory and batched with FINISH —
+	// the pool path must never hit the (removed) /steps endpoint.
 	p.RecordRunStep(lease, "chatcmpl-9")
-	eventually(t, "step recorded via pool", func() bool {
-		steps := mock.StepsSnapshot()
-		return len(steps) == 1 && steps[0].StepNumber == 2 && steps[0].MessageID == "chatcmpl-9"
-	})
 	p.LeaseRelease(lease)
+	p.Shutdown(context.Background())
+
+	finished := parentFinished(mock)
+	if len(finished) != 1 {
+		t.Fatalf("finished runs = %d, want 1 (parent only)", len(finished))
+	}
+	f := finished[0]
+	if f.Status != "completed" || f.TotalSteps != 1 {
+		t.Errorf("FINISH = %+v, want completed with 1 total step", f)
+	}
+	if len(f.Steps) != 1 || f.Steps[0].StepNumber != 1 || f.Steps[0].MessageID == nil || *f.Steps[0].MessageID != "chatcmpl-9" {
+		t.Errorf("FINISH steps = %+v, want step 1 with message chatcmpl-9", f.Steps)
+	}
 }
 
 // parentFinished filters the mock's FINISH records to parent (non

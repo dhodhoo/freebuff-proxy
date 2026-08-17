@@ -80,7 +80,7 @@ type Config struct {
 	SessionReAdmitLead time.Duration
 	// SessionProbeCacheTTL is how long the last successful session state is
 	// reused before a fresh upstream poll (issue #60, SESSION_PROBE_CACHE_TTL
-	// default 15s): heartbeat GETs within the TTL are skipped.
+	// default 15s): session poll GETs within the TTL are skipped.
 	SessionProbeCacheTTL time.Duration
 	// WebhookURL fires best-effort alert POSTs when the token pool is
 	// exhausted or a token is classified banned (issue #48, WEBHOOK_URL;

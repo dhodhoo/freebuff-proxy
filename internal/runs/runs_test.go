@@ -110,11 +110,18 @@ func TestFinishRunDropsFromActive(t *testing.T) {
 	}
 	mgr.Release(run)
 
-	mgr.FinishRun(context.Background(), run, 3)
+	// Issue #114: record 3 completed steps — totalSteps must come from the
+	// recorded steps (preferred over the request-count fallback) and the
+	// steps must ride IN the FINISH payload.
+	for i := 0; i < 3; i++ {
+		mgr.RecordStep(run, "")
+	}
+	mgr.FinishRun(context.Background(), run)
 
 	eventually(t, "FINISH payload", func() bool {
 		f, ok := finishedRun(mock, "run-0001")
-		return ok && f.Status == "completed" && f.TotalSteps == 3
+		return ok && f.Status == "completed" && f.TotalSteps == 3 && len(f.Steps) == 3 &&
+			f.Steps[0].StepNumber == 1 && f.Steps[2].StepNumber == 3
 	})
 
 	// Dropped from active: the next acquire must START afresh.

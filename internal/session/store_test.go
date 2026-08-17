@@ -84,7 +84,11 @@ func TestStoreDropsExpiredGrace(t *testing.T) {
 	}
 }
 
-func TestShutdownKeepsSessionWhenPersist(t *testing.T) {
+// TestShutdownDeletesEvenWhenPersist verifies gap #13: shutdown DELETEs the
+// upstream slot even with persistence enabled, while the store entry
+// survives the DELETE for restart-resume (pollPersisted re-adopts when the
+// DELETE did not take effect, or drops the dead entry and re-POSTs fresh).
+func TestShutdownDeletesEvenWhenPersist(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	store := NewStore(filepath.Join(t.TempDir(), "state.json"))
@@ -100,8 +104,8 @@ func TestShutdownKeepsSessionWhenPersist(t *testing.T) {
 	if err := mgr.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if mock.SessionEnds != 0 {
-		t.Errorf("SessionEnds = %d, want 0 (session kept alive for restart)", mock.SessionEnds)
+	if mock.SessionEnds != 1 {
+		t.Errorf("SessionEnds = %d, want 1 (DELETE on exit even when persisting)", mock.SessionEnds)
 	}
 	if got := store.Load(mgr.key); got == nil || got.instanceID != "inst-abc-123" {
 		t.Errorf("store after Shutdown = %+v, want active inst-abc-123", got)
@@ -129,7 +133,9 @@ func TestResumePersistedOnRestart(t *testing.T) {
 	defer mock.Close()
 	path := filepath.Join(t.TempDir(), "state.json")
 
-	// First process: create a session and shut down (keeps it alive).
+	// First process: create a session and shut down. Shutdown DELETEs the
+	// upstream slot (gap #13) but keeps the store entry, so a restart can
+	// still probe it via pollPersisted.
 	mgr1 := newTestManagerWithStore(t, mock, NewStore(path))
 	if _, err := mgr1.EnsureSession(context.Background()); err != nil {
 		t.Fatal(err)
@@ -141,7 +147,10 @@ func TestResumePersistedOnRestart(t *testing.T) {
 		t.Fatalf("SessionCreates after first process = %d, want 1", mock.SessionCreates)
 	}
 
-	// Second process (same token → same store key): must resume, not create.
+	// Second process (same token → same store key): pollPersisted probes the
+	// persisted slot. This mock's DELETE is stateless (the instance still
+	// answers active), so the slot is resumed and no new quota is burned —
+	// the same path that re-POSTs fresh when the DELETE took effect upstream.
 	mgr2 := newTestManagerWithStore(t, mock, NewStore(path))
 	instance, err := mgr2.EnsureSession(context.Background())
 	if err != nil {

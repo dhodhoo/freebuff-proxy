@@ -1961,6 +1961,10 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	if err != nil {
 		phases.Since(phasetiming.TotalMS, start)
 		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err), phases.All())
+		// Issue #114: a chat that died on a terminal upstream error must
+		// not leave its run FINISHing as completed — report it honestly
+		// (nil-safe: an acquire failure leaves no lease).
+		s.pool.MarkRunFailed(lease)
 		s.writeError(w, r, err)
 		return
 	}
@@ -2007,6 +2011,11 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	chatStart := time.Now()
 	stats := &relayStats{}
 	relay(ctx, w, up, stats, chatStart)
+	// Issue #114: record the completed chat as a run step — steps are
+	// batched in memory and sent WITH FINISH (the CLI has no /steps
+	// endpoint). The response message id is not extracted from the stream;
+	// the CLI step schema allows a null messageId.
+	s.pool.RecordRunStep(lease, "")
 	phases.Since(phasetiming.TotalMS, start)
 	ms := time.Since(start).Milliseconds()
 	s.logger.Info(kind+" done", chatDoneAttrs(model, lease.AgentID, stream, ms, stats.chunks, stats.bytes, reasoningEffort)...)
@@ -2128,6 +2137,12 @@ func (s *Server) chatAttempt(
 		RunID:             lease.Run.RunID,
 		SessionInstanceID: lease.SessionInstanceID,
 		TraceSessionID:    lease.Run.TraceSessionID,
+		// Issue #113: stamp the run's 1-based per-chat step counter so
+		// codebuff_metadata["llm_step_number"] matches the CLI (each chat
+		// call is one agent step; run-agent-step.ts increments per step).
+		// Incremented once per chatAttempt — the retry-once loop below
+		// retries the SAME step.
+		StepNumber: int(lease.Run.NextStepNumber()),
 	}
 
 	released := false
@@ -2233,6 +2248,12 @@ func (s *Server) chatAttempt(
 			}
 		}
 		opts.Model = effectiveModel
+		if lease.Run.RunID != opts.RunID {
+			// The retry landed on a FRESH run (run-invalid path): the new
+			// run's step counter starts at 1 — stamp its number so
+			// llm_step_number stays per-run like the CLI.
+			opts.StepNumber = int(lease.Run.NextStepNumber())
+		}
 		opts.RunID = lease.Run.RunID
 		opts.SessionInstanceID = lease.SessionInstanceID
 	}

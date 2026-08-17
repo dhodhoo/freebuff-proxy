@@ -447,6 +447,12 @@ type ChatOptions struct {
 	// CLI (run.ts: previousRun?.traceSessionId ?? randomUUID). Injected as
 	// codebuff_metadata["trace_session_id"] when set.
 	TraceSessionID string
+	// StepNumber is the 1-based per-run agent step counter (CLI parity:
+	// llm_step_number is merged on every chat call, String(n);
+	// reference/freebuff agent-runtime run-agent-step.ts:1175-1177).
+	// Injected as codebuff_metadata["llm_step_number"] when > 0; the run
+	// manager sets it per chat call at the server construction sites.
+	StepNumber int
 }
 
 // Client speaks the codebuff.com wire protocol for a single token.
@@ -459,7 +465,6 @@ type Client struct {
 	requestTimeout     time.Duration
 	sessionCallTimeout time.Duration
 	requestJitter      time.Duration
-	cliVersion         string
 	costMode           string
 	userID             string // optional x-freebuff-acting-user-id (USER_ID; CLI parity)
 	debugDump          bool
@@ -523,14 +528,16 @@ func (c *Client) TokenKey() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// cliUserAgent mirrors the official CLI / SDK user agent. The upstream
-// free-tier gate (403 free_mode_cli_required) keys on the CLI request
-// envelope (x-freebuff-* headers, codebuff_metadata, forced streaming and
-// the cb_easp stop sentinel — see the package comment), NOT the User-Agent,
-// so the stealth path may carry a browser UA matched to its TLS fingerprint
-// without tripping the gate. This constant is applied on the non-stealth
-// path so the request signature stays identical on every request.
-const cliUserAgent = "ai-sdk/openai-compatible/0.10.7/codebuff"
+// cliUserAgent mirrors the official CLI chat user agent: the pinned
+// @codebuff/llm-providers version, NOT the CLI_VERSION knob
+// (reference/freebuff model-provider.ts:150; llm-providers package.json
+// 1.0.0). The upstream free-tier gate (403 free_mode_cli_required) keys on
+// the CLI request envelope (x-freebuff-* headers, codebuff_metadata, forced
+// streaming and the cb_easp stop sentinel — see the package comment), but
+// the server still fingerprints the UA, and 0.10.7 (the SDK version) is
+// never emitted by a real CLI. Every upstream API call (chat + session +
+// agent-runs) sends this UA — no browser persona (#108/#109).
+const cliUserAgent = "ai-sdk/openai-compatible/1.0.0/codebuff"
 
 // New builds the client for one token.
 func New(token string, cfg *config.Config) (*Client, error) {
@@ -550,11 +557,6 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		return nil, errors.New("upstream: nil config")
 	}
 
-	cliVer := cfg.CLIVersion
-	if cliVer == "" {
-		cliVer = "0.10.7"
-	}
-
 	c := &Client{
 		token:                 token,
 		tokenIndex:            tokenIndex,
@@ -562,7 +564,6 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		requestTimeout:        cfg.RequestTimeout,
 		sessionCallTimeout:    cfg.SessionCallTimeout,
 		requestJitter:         cfg.RequestJitter,
-		cliVersion:            cliVer,
 		costMode:              cfg.CostMode,
 		userID:                cfg.UserID,
 		debugDump:             cfg.DebugDump,
@@ -663,11 +664,12 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 				return errors.New("too many redirects")
 			}
 			// Go strips Authorization/Cookie on cross-host redirects but not
-			// x-codebuff-api-key, which carries the same raw token. Drop both
-			// when the redirect target is a different host OR downgrades the
-			// scheme https->http (same host, plaintext) so the token never
-			// leaks to a redirect target; same-scheme same-host redirects
-			// (e.g. CDN or bare-host -> www) keep their credentials.
+			// x-codebuff-api-key, which carried the same raw token (defensive —
+			// newRequest no longer sets it, #107). Drop both when the redirect
+			// target is a different host OR downgrades the scheme https->http
+			// (same host, plaintext) so the token never leaks to a redirect
+			// target; same-scheme same-host redirects (e.g. CDN or bare-host
+			// -> www) keep their credentials.
 			if !strings.EqualFold(via[0].URL.Host, req.URL.Host) ||
 				(strings.EqualFold(via[0].URL.Scheme, "https") && strings.EqualFold(req.URL.Scheme, "http")) {
 				req.Header.Del("Authorization")
@@ -730,10 +732,11 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 			req = req.WithContext(reqCtx)
 		}
 		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set("x-freebuff-model", opts.Model)
-		if opts.SessionInstanceID != "" {
-			req.Header.Set("x-freebuff-instance-id", opts.SessionInstanceID)
-		}
+		// The chat POST carries NO x-freebuff-model / x-freebuff-instance-id
+		// headers (#106): the official CLI sends exactly Authorization + the
+		// ai-sdk UA (+ optional acting-user-id) on chat
+		// (reference/freebuff model-provider.ts:146-152); the model and
+		// instance id ride only in the body metadata (injectEnvelope).
 		if c.userID != "" {
 			// The official CLI sends the acting user id on every chat call and
 			// the free-mode gate expects it
@@ -754,6 +757,25 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 			if isCapacityDeferred(cerr) && capacityDeferredAttempts < c.transientRetriesLimit {
 				capacityDeferredAttempts++
 				c.capacityDeferredRetries.Add(1) // lifetime metric
+				// #105: the free-tier capacity queue asks the client to WAIT
+				// before retrying — the AI SDK absorbs the deferral silently,
+				// honoring retry-after with a 10s default
+				// (reference/freebuff sdk model-provider.ts:41-49,62-81). Sleep
+				// the parsed retry-after (floor 10s) so the same-session retry
+				// does not re-POST immediately (amplification); ctx
+				// cancellation aborts the sleep like every other upstream wait.
+				ra := 10 * time.Second
+				var cde *CapacityDeferredError
+				if errors.As(cerr, &cde) && cde.RetryAfter > 0 {
+					ra = cde.RetryAfter
+				}
+				timer := time.NewTimer(ra)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, ctx.Err()
+				}
 				continue
 			}
 			return nil, cerr
@@ -783,11 +805,15 @@ func (c *Client) CreateSessionForModel(ctx context.Context, model string) (*Sess
 // 404 maps to Status "ended" (the session vanished upstream; the session
 // manager re-creates it). Only a CREATE 404 maps to "disabled".
 func (c *Client) GetSession(ctx context.Context, instanceID string) (*SessionState, error) {
-	return c.GetSessionWithOpts(ctx, instanceID, false, false)
+	return c.GetSessionWithOpts(ctx, instanceID, false)
 }
 
-// GetSessionWithOpts polls /api/v1/freebuff/session with optional compact or heartbeat headers.
-func (c *Client) GetSessionWithOpts(ctx context.Context, instanceID string, compact, heartbeat bool) (*SessionState, error) {
+// GetSessionWithOpts polls /api/v1/freebuff/session with an optional compact
+// response header. There is deliberately NO heartbeat option: the CLI never
+// sends x-freebuff-heartbeat (Desktop-only, reference/freebuff
+// freebuff-models.ts:1212-1215); liveness comes from the recurring compact
+// GET itself (gap #2).
+func (c *Client) GetSessionWithOpts(ctx context.Context, instanceID string, compact bool) (*SessionState, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "/api/v1/freebuff/session", nil)
 	if err != nil {
 		return nil, err
@@ -797,9 +823,6 @@ func (c *Client) GetSessionWithOpts(ctx context.Context, instanceID string, comp
 	}
 	if compact {
 		req.Header.Set("x-freebuff-compact-session", "1")
-	}
-	if heartbeat {
-		req.Header.Set("x-freebuff-heartbeat", "1")
 	}
 	return c.sessionCall(req)
 }
@@ -907,18 +930,59 @@ func (c *Client) StartRun(ctx context.Context, agentID string) (string, error) {
 	return parsed.RunID, nil
 }
 
-// FinishRun POSTs /api/v1/agent-runs with action FINISH, marking the run
-// completed with step accounting (mirrors the official CLI payload).
-func (c *Client) FinishRun(ctx context.Context, runID string, totalSteps int) error {
-	payload, _ := json.Marshal(map[string]any{
+// RunStep is one agent-run step, batched in memory and sent WITH FINISH
+// (issue #114, CLI parity: reference/freebuff/sdk/src/impl/database.ts
+// pendingAgentStepSchema — the CLI has NO /steps endpoint, so steps ride
+// the FINISH payload). The proxy records one step per completed chat call.
+type RunStep struct {
+	// ID is a per-step UUID minted at record time.
+	ID string `json:"id"`
+	// StepNumber is the 1-based per-run step index (sequential 1,2,3…).
+	StepNumber int `json:"stepNumber"`
+	// Credits is always 0 for the proxy (the upstream account owns spend).
+	Credits int `json:"credits,omitempty"`
+	// ChildRunIDs is empty for proxy-recorded steps (child runs are
+	// separate runs, not steps).
+	ChildRunIDs []string `json:"childRunIds,omitempty"`
+	// MessageID is the completed chat response id; null when the stream
+	// never carried one (the CLI schema allows a null messageId).
+	MessageID *string `json:"messageId"`
+	// Status mirrors the CLI step lifecycle; proxy-recorded steps are
+	// always "completed" (recorded only after a successful chat).
+	Status string `json:"status,omitempty"`
+	// StartTime is the step start instant, RFC3339Nano UTC.
+	StartTime string `json:"startTime"`
+}
+
+// FinishRun POSTs /api/v1/agent-runs with action FINISH, reporting the
+// run's honest terminal status and its completed steps (issue #114, CLI
+// parity: reference/freebuff/sdk/src/impl/database.ts finishAgentRun — the
+// full payload is sent in ONE request; there is no /steps endpoint).
+// totalSteps is the step count the manager reports (len(steps) preferred,
+// falling back to the request count when no steps were recorded);
+// errorMessage is omitted when empty and truncated to 5000 runes otherwise,
+// exactly like the CLI's truncateString(errorMessage, 5000).
+func (c *Client) FinishRun(ctx context.Context, runID, status string, totalSteps int, steps []RunStep, errorMessage string) error {
+	if steps == nil {
+		steps = []RunStep{}
+	}
+	payload := map[string]any{
 		"action":        "FINISH",
 		"runId":         runID,
-		"status":        "completed",
+		"status":        status,
 		"totalSteps":    totalSteps,
 		"directCredits": 0,
 		"totalCredits":  0,
-	})
-	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/agent-runs", payload)
+		"steps":         steps,
+	}
+	if errorMessage != "" {
+		payload["errorMessage"] = truncateRunes(errorMessage, 5000)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/agent-runs", body)
 	if err != nil {
 		return err
 	}
@@ -929,9 +993,9 @@ func (c *Client) FinishRun(ctx context.Context, runID string, totalSteps int) er
 	}
 	defer releaseCancel(cancel)
 	defer func() { _ = resp.Body.Close() }()
-	body := drainBody(resp.Body)
+	bodyStr := drainBody(resp.Body)
 	if resp.StatusCode >= 400 {
-		return c.classify(resp.StatusCode, body, resp.Header)
+		return c.classify(resp.StatusCode, bodyStr, resp.Header)
 	}
 	return nil
 }
@@ -972,45 +1036,6 @@ func (c *Client) StartChildRun(ctx context.Context, parentRunID string) (string,
 		return "", fmt.Errorf("upstream: child START response missing runId: %q", truncate(body, 200))
 	}
 	return parsed.RunID, nil
-}
-
-// RecordRunStep POSTs /api/v1/agent-runs/{runID}/steps with stepNumber 2
-// accounting (issue #91, CLI parity:
-// reference/freebuff-reverse .../http.go recordRunStep). Best-effort: the
-// server fires it through the bounded finish queue and failures are logged,
-// never surfaced. messageID is the completed chat response id ("" when the
-// stream never carried one); startTime anchors the step.
-func (c *Client) RecordRunStep(ctx context.Context, runID, messageID string, startTime time.Time) error {
-	body := map[string]any{
-		"stepNumber":  2,
-		"credits":     0,
-		"childRunIds": []any{},
-		"messageId":   nil,
-		"status":      "completed",
-		"startTime":   startTime.UTC().Format(time.RFC3339Nano),
-	}
-	if messageID != "" {
-		body["messageId"] = messageID
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/agent-runs/"+runID+"/steps", payload)
-	if err != nil {
-		return err
-	}
-	resp, cancel, err := c.do(req, c.sessionCallTimeout)
-	if err != nil {
-		return err
-	}
-	defer releaseCancel(cancel)
-	defer func() { _ = resp.Body.Close() }()
-	bodyStr := drainBody(resp.Body)
-	if resp.StatusCode >= 400 {
-		return c.classify(resp.StatusCode, bodyStr, resp.Header)
-	}
-	return nil
 }
 
 // --- internals ---
@@ -1206,30 +1231,30 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 		return nil, fmt.Errorf("upstream: build %s %s: %w", method, path, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("x-codebuff-api-key", c.token)
 	if c.authOnly {
 		// Token-less login-flow client (#62/#66): never send an empty
 		// credential pair — the /api/auth/cli/* endpoints take the login
 		// User-Agent instead (see authLoginRequest).
 		req.Header.Del("Authorization")
-		req.Header.Del("x-codebuff-api-key")
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// The official CLI sends the pinned llm-providers ai-sdk UA on chat and
+	// NO browser headers on any API path (bare Bun fetch) (#108/#109 fix
+	// option (a)): the utls ClientHello impersonation stays, the browser
+	// header persona does not. x-codebuff-api-key is never sent — Bearer is
+	// the only credential (#107, reference/freebuff codebuff-api.ts:337-345).
+	req.Header.Set("User-Agent", cliUserAgent)
 	ctx = req.Context()
 	if profile := c.currentStealthProfile(); profile != nil {
 		// Resolve the concrete profile ONCE per request and stash it: the
-		// dialer reads the stash for the ClientHello, so the browser headers
-		// applied here always match the TLS fingerprint. Pinned profiles
-		// resolve to themselves; auto/random get one concrete draw.
+		// dialer reads the stash for the ClientHello, so the TLS fingerprint
+		// matches the profile. Pinned profiles resolve to themselves;
+		// auto/random get one concrete draw. Only SanitizeHeaders runs here
+		// (protective strip of proxy-identifying headers) — the profile's
+		// browser headers are deliberately NOT applied to upstream API calls.
 		connProf := stealth.GetProfileForConnection(profile)
 		ctx = withStealthProfile(ctx, connProf)
-		stealth.SanitizeAndApply(req.Header, connProf)
-	} else {
-		ver := c.cliVersion
-		if ver == "" {
-			ver = "0.10.7"
-		}
-		req.Header.Set("User-Agent", fmt.Sprintf("ai-sdk/openai-compatible/%s/codebuff", ver))
+		stealth.SanitizeHeaders(req.Header)
 	}
 	if ctx != req.Context() {
 		req = req.WithContext(ctx)
@@ -1341,11 +1366,11 @@ func (c *Client) currentStealthProfile() *stealth.Profile {
 
 // dialProfileFor returns the stealth profile the transport dialer should use
 // for a connection under ctx. For ProfileAuto/ProfileRandom the concrete
-// profile stashed by newRequest wins, so the ClientHello matches the browser
-// headers applied to that request; a bare context (no stash) resolves per
+// profile stashed by newRequest wins, so the ClientHello matches the profile
+// resolved for that request; a bare context (no stash) resolves per
 // connection as before. For pinned profiles the current c.stealthProfile is
-// authoritative: the retry loop swaps it (and re-applies headers) ahead of a
-// retry, so the stash would be stale.
+// authoritative: the retry loop swaps it ahead of a retry, so the stash
+// would be stale.
 func (c *Client) dialProfileFor(ctx context.Context) *stealth.Profile {
 	profile := c.currentStealthProfile()
 	if profile != nil && (profile.ID == stealth.ProfileIDAuto || profile.ID == stealth.ProfileIDRandom) {
@@ -1537,10 +1562,12 @@ var retryProfileRotation = []struct {
 }
 
 // rotateStealthProfileForRetry swaps the pinned TLS fingerprint to a
-// different profile before a retry and re-applies its browser headers to req,
-// so the retried connection does not repeat the fingerprint that just failed.
-// random/auto already rotate per connection and are left alone. No-op when
-// retries are disabled or no fingerprint is pinned.
+// different profile before a retry so the retried connection does not repeat
+// the fingerprint that just failed. The request keeps its CLI headers —
+// only proxy-identifying headers are re-stripped; no browser persona is
+// applied on API paths (#109). random/auto already rotate per connection and
+// are left alone. No-op when retries are disabled or no fingerprint is
+// pinned.
 func (c *Client) rotateStealthProfileForRetry(req *http.Request) {
 	c.profileMu.Lock()
 	defer c.profileMu.Unlock()
@@ -1557,7 +1584,7 @@ func (c *Client) rotateStealthProfileForRetry(req *http.Request) {
 	}
 	c.stealthProfile = next
 	c.fingerprintRotations.Add(1)
-	stealth.SanitizeAndApply(req.Header, next)
+	stealth.SanitizeHeaders(req.Header)
 }
 
 // nextStealthProfile returns the profile to rotate to after cur: the next
@@ -1689,6 +1716,10 @@ const (
 	cliSystemMarkerPhrase = "You are Buffy, the strategic coding assistant"
 )
 
+// ensureCliSystemMarker guarantees the canonical "You are Buffy…" opening at
+// byte position 0 of the first system message (the free-mode gate's trimmed
+// prefix test — see the check loop below). It prepends the marker rather
+// than replacing, so custom system instructions survive.
 func ensureCliSystemMarker(payload map[string]any) {
 	rawMsgs, ok := payload["messages"].([]any)
 	if !ok || len(rawMsgs) == 0 {
@@ -1704,13 +1735,18 @@ func ensureCliSystemMarker(payload map[string]any) {
 			continue
 		}
 		if msg["role"] == "system" {
-			if content, ok := msg["content"].(string); ok && strings.Contains(content, cliSystemMarkerPhrase) {
+			// The server gate is a TRIMMED PREFIX test at position 0
+			// (hasFreebuffRootSystemPromptOpening, free-agents.ts:617-645),
+			// hardened against the prepend-and-cancel proxy trick: a message
+			// that merely mentions the phrase mid-string must NOT suppress
+			// the canonical prefix (#110).
+			if content, ok := msg["content"].(string); ok && strings.HasPrefix(strings.TrimSpace(content), cliSystemMarkerPhrase) {
 				return // already present
 			}
 			if parts, ok := msg["content"].([]any); ok {
 				for _, p := range parts {
 					if partMap, ok := p.(map[string]any); ok {
-						if txt, ok := partMap["text"].(string); ok && strings.Contains(txt, cliSystemMarkerPhrase) {
+						if txt, ok := partMap["text"].(string); ok && strings.HasPrefix(strings.TrimSpace(txt), cliSystemMarkerPhrase) {
 							return // already present
 						}
 					}
@@ -1761,30 +1797,28 @@ func injectEnvelope(body []byte, costMode string, opts ChatOptions) ([]byte, err
 
 	ensureCliSystemMarker(payload)
 
-	// client_id is stable PER SESSION INSTANCE (derived from the instance
-	// id) so upstream traces correlate the whole session lifetime — the
-	// hardest identity signal the SDK keys on (issue #52 extension of #80,
-	// which made it stable per run). With no instance id (disabled session)
-	// it falls back to the run id, then to a fresh SDK-faithful draw.
-	// trace_session_id remains per run (minted once by the run manager,
-	// reused across the run's requests; run.ts: previousRun?.traceSessionId
-	// ?? randomUUID, proxy-freebuff lib/runs.js:43-46).
-	clientID := generateClientID()
-	switch {
-	case opts.SessionInstanceID != "":
-		clientID = "sess:" + opts.SessionInstanceID
-	case opts.RunID != "":
-		clientID = "run:" + opts.RunID
-	}
+	// client_id is a FRESH random SDK-faithful draw per chat call — never
+	// the sess:/run:-prefixed shapes the server fingerprints as a proxy
+	// (#103; reference/freebuff run.ts:646
+	// Math.random().toString(36).substring(2,15), cf-worker-signals.ts
+	// ^wf-[a-z0-9]{8}$). trace_session_id remains per run (minted once by
+	// the run manager, reused across the run's requests; run.ts:
+	// previousRun?.traceSessionId ?? randomUUID, proxy-freebuff
+	// lib/runs.js:43-46) and freebuff_instance_id stays per session.
 	metadata := map[string]any{
 		"run_id":    opts.RunID,
-		"client_id": clientID,
+		"client_id": generateClientID(),
 	}
 	if opts.TraceSessionID != "" {
 		metadata["trace_session_id"] = opts.TraceSessionID
 	}
 	if opts.SessionInstanceID != "" {
 		metadata["freebuff_instance_id"] = opts.SessionInstanceID
+	}
+	// llm_step_number is the 1-based per-run agent step, String(n) on the
+	// wire (#113; reference/freebuff run-agent-step.ts:1175-1177).
+	if opts.StepNumber > 0 {
+		metadata["llm_step_number"] = strconv.Itoa(opts.StepNumber)
 	}
 	if costMode != "" {
 		metadata["cost_mode"] = costMode
@@ -2206,6 +2240,21 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// truncateRunes truncates s to at most max runes without an ellipsis. The
+// CLI's FINISH errorMessage cap is 5000 chars (truncateString in
+// reference/freebuff/sdk/src/impl/database.ts), applied on the whole
+// payload — a full Go stack trace must not blow the cap.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
 }
 
 // dump writes a debug record to dump/ when enabled.

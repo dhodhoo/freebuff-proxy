@@ -948,8 +948,9 @@ func TestExtractReasoningEffort(t *testing.T) {
 }
 
 func TestNormalizeRequestReasoningEffort(t *testing.T) {
-	// DeepSeek models (#101): nested reasoning.effort "max" is clamped (#65)
-	// and translated into the thinking block, replacing reasoning_effort.
+	// DeepSeek models (#111): nested reasoning.effort "max" is clamped (#65)
+	// and sent as PLAIN reasoning_effort — no client-side thinking block; the
+	// DeepSeek thinking translation is server-side.
 	body := map[string]any{
 		"model":     "deepseek/deepseek-v4-flash",
 		"messages":  []any{map[string]any{"role": "user", "content": "hello"}},
@@ -960,18 +961,11 @@ func TestNormalizeRequestReasoningEffort(t *testing.T) {
 		t.Fatalf("NormalizeRequest: %v", err)
 	}
 	got := decode(t, out)
-	if _, ok := got["reasoning_effort"]; ok {
-		t.Errorf("reasoning_effort kept for deepseek model: %v", got["reasoning_effort"])
+	if gotEff, ok := got["reasoning_effort"].(string); !ok || gotEff != "max" {
+		t.Errorf("reasoning_effort = %v, want \"max\"", got["reasoning_effort"])
 	}
-	thinking, ok := got["thinking"].(map[string]any)
-	if !ok {
-		t.Fatalf("thinking block missing for deepseek model: %v", got)
-	}
-	if thinking["type"] != "enabled" {
-		t.Errorf("thinking.type = %v, want enabled", thinking["type"])
-	}
-	if thinking["reasoning_effort"] != "max" {
-		t.Errorf("thinking.reasoning_effort = %v, want max", thinking["reasoning_effort"])
+	if _, ok := got["thinking"]; ok {
+		t.Error("thinking block emitted for deepseek model")
 	}
 
 	// Non-DeepSeek models keep reasoning_effort (clamped to the model's
@@ -1602,25 +1596,25 @@ func TestNormalizeRequestCacheControlInjection(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #101 — DeepSeek thinking-block translation.
+// Issue #111 — plain reasoning_effort on DeepSeek routes (no thinking block).
 // ---------------------------------------------------------------------------
 
-func TestDeepSeekThinkingTranslation(t *testing.T) {
+func TestDeepSeekPlainReasoningEffort(t *testing.T) {
 	cases := []struct {
-		name     string
-		model    string
-		effort   string
-		wantType string
-		wantEff  string
+		name   string
+		model  string
+		effort string
+		want   string
 	}{
-		{"flash low maps to high", "deepseek/deepseek-v4-flash", "low", "enabled", "high"},
-		{"flash medium clamps down to low then high", "deepseek/deepseek-v4-flash", "medium", "enabled", "high"},
-		{"flash high stays high", "deepseek/deepseek-v4-flash", "high", "enabled", "high"},
-		{"flash max stays max", "deepseek/deepseek-v4-flash", "max", "enabled", "max"},
-		{"flash xhigh clamps down to high", "deepseek/deepseek-v4-flash", "xhigh", "enabled", "high"},
-		{"pro low clamps up to high", "deepseek/deepseek-v4-pro", "low", "enabled", "high"},
-		{"pro max stays max", "deepseek/deepseek-v4-pro", "max", "enabled", "max"},
-		{"bare model id tolerated", "deepseek-v4-flash", "max", "enabled", "max"},
+		{"flash low stays low", "deepseek/deepseek-v4-flash", "low", "low"},
+		{"flash medium rewrites to high", "deepseek/deepseek-v4-flash", "medium", "high"},
+		{"flash high stays high", "deepseek/deepseek-v4-flash", "high", "high"},
+		{"flash max stays max", "deepseek/deepseek-v4-flash", "max", "max"},
+		{"flash xhigh clamps down to high", "deepseek/deepseek-v4-flash", "xhigh", "high"},
+		{"pro low stays low", "deepseek/deepseek-v4-pro", "low", "low"},
+		{"pro medium rewrites to high", "deepseek/deepseek-v4-pro", "medium", "high"},
+		{"pro max stays max", "deepseek/deepseek-v4-pro", "max", "max"},
+		{"bare model id tolerated", "deepseek-v4-flash", "max", "max"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1634,23 +1628,16 @@ func TestDeepSeekThinkingTranslation(t *testing.T) {
 				t.Fatalf("NormalizeRequest: %v", err)
 			}
 			got := decode(t, out)
-			if _, ok := got["reasoning_effort"]; ok {
-				t.Errorf("reasoning_effort kept for deepseek model: %v", got["reasoning_effort"])
+			if gotEff, ok := got["reasoning_effort"].(string); !ok || gotEff != tc.want {
+				t.Errorf("reasoning_effort = %v, want %q", got["reasoning_effort"], tc.want)
 			}
-			thinking, ok := got["thinking"].(map[string]any)
-			if !ok {
-				t.Fatalf("thinking block missing: %v", got)
-			}
-			if thinking["type"] != tc.wantType {
-				t.Errorf("thinking.type = %v, want %q", thinking["type"], tc.wantType)
-			}
-			if thinking["reasoning_effort"] != tc.wantEff {
-				t.Errorf("thinking.reasoning_effort = %v, want %q", thinking["reasoning_effort"], tc.wantEff)
+			if _, ok := got["thinking"]; ok {
+				t.Errorf("thinking block emitted for deepseek model: %v", got["thinking"])
 			}
 		})
 	}
 
-	t.Run("reasoning.enabled=false disables thinking", func(t *testing.T) {
+	t.Run("reasoning.enabled=false suppresses effort", func(t *testing.T) {
 		body := map[string]any{
 			"model":     "deepseek/deepseek-v4-flash",
 			"messages":  []any{map[string]any{"role": "user", "content": "hi"}},
@@ -1661,18 +1648,31 @@ func TestDeepSeekThinkingTranslation(t *testing.T) {
 			t.Fatalf("NormalizeRequest: %v", err)
 		}
 		got := decode(t, out)
-		thinking, ok := got["thinking"].(map[string]any)
-		if !ok {
-			t.Fatalf("thinking block missing: %v", got)
-		}
-		if thinking["type"] != "disabled" {
-			t.Errorf("thinking.type = %v, want disabled", thinking["type"])
-		}
-		if _, hasEff := thinking["reasoning_effort"]; hasEff {
-			t.Errorf("disabled thinking carries an effort: %v", thinking)
-		}
 		if _, ok := got["reasoning_effort"]; ok {
-			t.Error("reasoning_effort kept alongside disabled thinking")
+			t.Error("reasoning_effort kept alongside reasoning.enabled=false")
+		}
+		if _, ok := got["thinking"]; ok {
+			t.Error("thinking block emitted alongside reasoning.enabled=false")
+		}
+	})
+
+	t.Run("thinking.type=disabled suppresses effort", func(t *testing.T) {
+		body := map[string]any{
+			"model":            "deepseek/deepseek-v4-flash",
+			"messages":         []any{map[string]any{"role": "user", "content": "hi"}},
+			"reasoning_effort": "max",
+			"thinking":         map[string]any{"type": "disabled"},
+		}
+		out, err := NormalizeRequest(mustJSON(t, body), "")
+		if err != nil {
+			t.Fatalf("NormalizeRequest: %v", err)
+		}
+		got := decode(t, out)
+		if _, ok := got["reasoning_effort"]; ok {
+			t.Error("reasoning_effort kept alongside thinking.type=disabled")
+		}
+		if _, ok := got["thinking"]; ok {
+			t.Error("thinking block emitted alongside thinking.type=disabled")
 		}
 	})
 
@@ -1726,8 +1726,16 @@ func TestEffortsForModel(t *testing.T) {
 	if got := effortsForModel("deepseek/deepseek-v4-flash"); !reflect.DeepEqual(got, []string{"low", "high", "max"}) {
 		t.Errorf("flash efforts = %v", got)
 	}
-	if got := effortsForModel("deepseek/deepseek-v4-pro"); !reflect.DeepEqual(got, []string{"high", "max"}) {
+	if got := effortsForModel("deepseek/deepseek-v4-pro"); !reflect.DeepEqual(got, []string{"low", "high", "max"}) {
 		t.Errorf("pro efforts = %v", got)
+	}
+	// Luna EFFORTS_THROUGH_MAX includes xhigh; muse EFFORTS_THROUGH_XHIGH
+	// includes minimal (08/13 catalog).
+	if got := effortsForModel("openai/gpt-5.6-luna"); !reflect.DeepEqual(got, []string{"low", "medium", "high", "xhigh", "max"}) {
+		t.Errorf("luna efforts = %v", got)
+	}
+	if got := effortsForModel("meta/muse-spark-1.2-contributor"); !reflect.DeepEqual(got, []string{"minimal", "low", "medium", "high", "xhigh"}) {
+		t.Errorf("muse efforts = %v", got)
 	}
 	// Unlisted models get the full ladder (no clamping).
 	if got := effortsForModel("minimax/minimax-m3"); !reflect.DeepEqual(got, reasoningLadder[:]) {
@@ -1764,9 +1772,22 @@ func TestNormalizeRequestEffortClamp(t *testing.T) {
 		return decode(t, out)["reasoning_effort"].(string)
 	}
 
-	// gpt-5.6-luna tops out at max: xhigh clamps down to high.
-	if got := effortFor("openai/gpt-5.6-luna", "xhigh"); got != "high" {
-		t.Errorf("gpt-5.6-luna xhigh = %q, want high", got)
+	// gpt-5.6-luna EFFORTS_THROUGH_MAX includes xhigh: it passes through.
+	if got := effortFor("openai/gpt-5.6-luna", "xhigh"); got != "xhigh" {
+		t.Errorf("gpt-5.6-luna xhigh = %q, want xhigh", got)
+	}
+	// muse-spark EFFORTS_THROUGH_XHIGH includes minimal: it passes through.
+	if got := effortFor("meta/muse-spark-1.2-contributor", "minimal"); got != "minimal" {
+		t.Errorf("muse-spark minimal = %q, want minimal", got)
+	}
+	// deepseek-v4-pro gained low on 08/13: it passes through unclamped.
+	if got := effortFor("deepseek/deepseek-v4-pro", "low"); got != "low" {
+		t.Errorf("deepseek-v4-pro low = %q, want low", got)
+	}
+	// medium on a DeepSeek route rewrites to high (resolveFreebuffReasoningEffort),
+	// never down to low.
+	if got := effortFor("deepseek/deepseek-v4-flash", "medium"); got != "high" {
+		t.Errorf("deepseek-v4-flash medium = %q, want high", got)
 	}
 	// Unlisted models pass every rung through.
 	if got := effortFor("minimax/minimax-m3", "ultra"); got != "ultra" {
