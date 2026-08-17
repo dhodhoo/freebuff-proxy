@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 
 	"freebuff-proxy/internal/convert"
 	"freebuff-proxy/internal/phasetiming"
+	"freebuff-proxy/internal/tokenestimate"
 )
 
 // --- Anthropic Messages API (/v1/messages) ---
@@ -110,8 +112,20 @@ func (s *Server) handleMessagesCountTokens(w http.ResponseWriter, r *http.Reques
 		}
 		return
 	}
+	// Decode with UseNumber so integers in tool schemas round-trip
+	// byte-identically through CountJSON instead of losing precision as
+	// float64 (numbers > 2^53 would otherwise shift the estimate).
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
 	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
+	if err := dec.Decode(&raw); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest,
+			"request body must be a valid JSON object", "invalid_request_error", "invalid_json", 0)
+		return
+	}
+	// json.Decoder stops after the first value; reject trailing garbage the
+	// way json.Unmarshal would.
+	if err := dec.Decode(&json.RawMessage{}); !errors.Is(err, io.EOF) {
 		s.writeJSONError(w, http.StatusBadRequest,
 			"request body must be a valid JSON object", "invalid_request_error", "invalid_json", 0)
 		return
@@ -139,6 +153,13 @@ func (s *Server) handleMessagesCountTokens(w http.ResponseWriter, r *http.Reques
 	}
 	count, err := s.tokenEstimator.CountAnthropicRequest(raw)
 	if err != nil {
+		// Document blocks get their own code: the body is valid JSON, so
+		// invalid_json would mislead clients that key on the code.
+		if errors.Is(err, tokenestimate.ErrDocument) {
+			s.writeJSONError(w, http.StatusBadRequest,
+				err.Error(), "invalid_request_error", "unsupported_content", 0)
+			return
+		}
 		s.writeJSONError(w, http.StatusBadRequest,
 			"invalid messages request: "+err.Error(), "invalid_request_error", "invalid_json", 0)
 		return

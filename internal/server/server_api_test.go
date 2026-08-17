@@ -770,7 +770,7 @@ func TestMessagesCountTokensInvalidJSON(t *testing.T) {
 	defer mock.Close()
 	ts, _ := newTestServer(t, nil, mock)
 
-	for _, body := range []string{`{not json`, `[]`, `"x"`, ``} {
+	for _, body := range []string{`{not json`, `[]`, `"x"`, ``, `{"model":"x"} trailing`} {
 		resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", []byte(body), nil)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("body %q status = %d, want 400: %s", body, resp.StatusCode, truncate(string(data), 200))
@@ -835,8 +835,35 @@ func TestMessagesCountTokensDocumentRejected(t *testing.T) {
 	if err := json.Unmarshal(data, &out); err != nil {
 		t.Fatalf("error body not JSON: %v", err)
 	}
-	if out.Error.Code != "invalid_json" {
-		t.Errorf("code = %q, want invalid_json", out.Error.Code)
+	if out.Error.Code != "unsupported_content" {
+		t.Errorf("code = %q, want unsupported_content (valid JSON, so invalid_json would mislead)", out.Error.Code)
+	}
+	if mock.Requests != 0 {
+		t.Errorf("upstream requests = %d, want 0", mock.Requests)
+	}
+}
+
+// TestMessagesCountTokensSystemImageFlat pins the flat image cost through the
+// handler for image parts in the top-level system array: 1600/image, never a
+// function of base64 length (regression: the system array used to fall back
+// to JSON counting and tokenize the base64 as text, quadratically — a 256KiB
+// payload cost ~87s of CPU).
+func TestMessagesCountTokensSystemImageFlat(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	body := `{"model":"` + modelA + `","system":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + strings.Repeat("QUJD", (128<<10)/3) + `"}}],"messages":[{"role":"user","content":"hi"}]}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/messages/count_tokens", []byte(body), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	var out countTokensResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if out.InputTokens != 1600+8+1 { // system image + message overhead + "hi"
+		t.Errorf("input_tokens = %d, want %d (flat 1600, base64 never tokenized)", out.InputTokens, 1600+8+1)
 	}
 	if mock.Requests != 0 {
 		t.Errorf("upstream requests = %d, want 0", mock.Requests)

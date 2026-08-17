@@ -2,7 +2,7 @@ package tokenestimate_test
 
 // Golden values in this file were computed with the independent Python
 // reference (OpenAI tiktoken 0.13.0, o200k_base, allowed_special="all",
-// floor(raw * 1.35)) — see token_ref/reference.py in the starter root. Go
+// floor(raw * 1.35)) — see scripts/token_ref/reference.py in the repo. Go
 // counts are asserted against those numbers so the estimator's o200k_base
 // tokenization is cross-validated against the reference implementation.
 
@@ -24,7 +24,7 @@ func mustNew(t *testing.T) *tokenestimate.Estimator {
 }
 
 func TestCountTextGolden(t *testing.T) {
-	// Values from token_ref/reference.py: floor(raw * 1.35), o200k_base.
+	// Values from scripts/token_ref/reference.py: floor(raw * 1.35), o200k_base.
 	const codeFixture = `func (e *Estimator) CountText(text string) int {
 	if text == "" {
 		return 0
@@ -63,14 +63,23 @@ func TestCountTextGolden(t *testing.T) {
 // markers. tiktoken-go/tokenizer has no special-token encoder: markers are
 // BPE-encoded as regular text instead of collapsing to one token (the Python
 // reference with allowed_special="all" yields 1 for <|endoftext|>). The
-// estimator must not panic and must stay deterministic; the exact overcount
-// is a documented deviation of the local port.
+// exact values below are the deterministic over-count of the local port
+// (9 for the endof* markers, 8 for fim_*); a change here means the tokenizer
+// behavior changed and the values must be re-derived from the reference.
 func TestCountTextSpecialMarkers(t *testing.T) {
 	e := mustNew(t)
-	for _, s := range []string{"<|endoftext|>", "<|endofprompt|>", "<|fim_prefix|>"} {
+	cases := map[string]int{
+		"<|endoftext|>":   9,
+		"<|endofprompt|>": 9,
+		"<|endofmask|>":   9,
+		"<|fim_prefix|>":  8,
+		"<|fim_suffix|>":  8,
+		"<|fim_middle|>":  8,
+	}
+	for s, want := range cases {
 		first := e.CountText(s)
-		if first < 1 {
-			t.Errorf("CountText(%q) = %d, want >= 1", s, first)
+		if first != want {
+			t.Errorf("CountText(%q) = %d, want %d (documented over-count)", s, first, want)
 		}
 		if second := e.CountText(s); second != first {
 			t.Errorf("CountText(%q) not deterministic: %d then %d", s, first, second)
@@ -197,6 +206,41 @@ func TestCountAnthropicRequestImageFlat(t *testing.T) {
 		}
 		if want := 8 + tc.images*1600; got != want {
 			t.Errorf("%s: count = %d, want %d", tc.name, got, want)
+		}
+	}
+}
+
+// TestCountAnthropicRequestSystemImageFlat pins that image parts inside the
+// top-level system array bill the same flat 1600 as every other image path —
+// and, critically, that the base64 payload is never tokenized: the count must
+// be identical for a 24-byte and a 128KiB payload (regression: this used to
+// fall through to the JSON fallback and BPE-count the base64 as text,
+// quadratic in payload size — ~87s and ~236k tokens for 256KiB).
+func TestCountAnthropicRequestSystemImageFlat(t *testing.T) {
+	e := mustNew(t)
+	systemReq := func(data string) map[string]any {
+		return map[string]any{
+			"system": []any{imagePart("base64", data)},
+			"messages": []any{
+				map[string]any{"role": "user", "content": "hi"},
+			},
+		}
+	}
+	short := systemReq("aGVsbG8=")
+	long := systemReq(strings.Repeat("QUJD", (128<<10)/3)) // 128KiB of base64
+	for _, tc := range []struct {
+		name string
+		req  map[string]any
+	}{
+		{"short base64", short},
+		{"long base64", long},
+	} {
+		got, err := e.CountAnthropicRequest(tc.req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if want := 1600 + 8 + 1; got != want { // system image + message overhead + "hi"
+			t.Errorf("%s: count = %d, want %d (flat 1600, base64 never tokenized)", tc.name, got, want)
 		}
 	}
 }

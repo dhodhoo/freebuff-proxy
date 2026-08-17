@@ -9,9 +9,10 @@
 // markers (<|endoftext|> etc.) with allowedSpecial="all", collapsing each
 // to a single token. tiktoken-go/tokenizer declares a special-token map but
 // never consults it during tokenization, so those markers are BPE-encoded
-// as ordinary text and therefore conservatively over-counted. The counts
-// stay deterministic and never panic; the exact value is pinned by
-// TestCountTextSpecialMarkers.
+// as ordinary text and therefore conservatively over-counted: 9 tokens for
+// <|endoftext|>/<|endofprompt|>/<|endofmask|> and 8 for the <|fim_*|>
+// markers, versus 1 in the Python reference. The counts are deterministic
+// and never panic; the exact values are pinned by TestCountTextSpecialMarkers.
 //
 // The result is an estimate for Anthropic-compatible clients, not a
 // provider-exact token count.
@@ -47,10 +48,11 @@ const (
 	fallbackDivisor = 3
 )
 
-// errDocument is returned when a document block is present: the proxy's
+// ErrDocument is returned when a document block is present: the proxy's
 // /v1/messages conversion does not consume documents, so this estimator
-// refuses to guess a PDF token count instead of faking accuracy.
-var errDocument = errors.New("document blocks are not supported by this proxy")
+// refuses to guess a PDF token count instead of faking accuracy. The server
+// maps it to a distinct 400 code (unsupported_content).
+var ErrDocument = errors.New("document blocks are not supported by this proxy")
 
 // Estimator counts text with a process-shared o200k_base codec. The codec is
 // created once; Count/Encode only read its vocabulary, so the instance is
@@ -67,6 +69,12 @@ var (
 
 // New returns an Estimator backed by a shared o200k_base codec (vocabulary
 // embedded in the binary; no network access).
+//
+// The codec is process-wide: only Count (and Encode) are safe for concurrent
+// use. tiktoken-go's Codec.Decode lazily builds a reverse-vocabulary map
+// without a lock and crashes the process (concurrent map read/map write) when
+// called concurrently — never add a Decode call site here. If decoding is
+// ever needed, pre-warm it once under this sync.Once.
 func New() (*Estimator, error) {
 	codecOnce.Do(func() {
 		codec, codecErr = tokenizer.Get(tokenizer.O200kBase)
@@ -161,8 +169,13 @@ func (e *Estimator) countSystem(system any) (int, error) {
 			switch strings.ToLower(asString(part["type"])) {
 			case "text":
 				total += e.CountText(asString(part["text"]))
+			case "image":
+				// Billed flat like every other image path; the base64 payload
+				// is never tokenized (and never reaches the model: the
+				// conversion drops non-text system parts).
+				total += imageTokenEstimate
 			case "document":
-				return 0, errDocument
+				return 0, ErrDocument
 			default:
 				total += e.CountJSON(part)
 			}
@@ -224,7 +237,7 @@ func (e *Estimator) countContentPart(part map[string]any) (int, error) {
 	case "image":
 		return imageTokenEstimate, nil
 	case "document":
-		return 0, errDocument
+		return 0, ErrDocument
 	default:
 		return e.CountJSON(part), nil
 	}
@@ -255,7 +268,7 @@ func (e *Estimator) countToolResultContent(content any) (int, error) {
 				case "image":
 					total += imageTokenEstimate
 				case "document":
-					return 0, errDocument
+					return 0, ErrDocument
 				default:
 					total += e.CountJSON(item)
 				}
