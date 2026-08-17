@@ -663,3 +663,23 @@ func TestRenderSmokeResultFragment(t *testing.T) {
 		}
 	}
 }
+
+// TestConfigPageHTTPProxyMasked verifies that basic auth passwords embedded in
+// HTTP_PROXY are masked in the effective config data and never exposed on the page.
+func TestConfigPageHTTPProxyMasked(t *testing.T) {
+	ts, _ := pageServer(t, 1, "config", func(c *config.Config) {
+		c.HTTPProxy = "http://alice:secretPassword123@proxy.internal:8080"
+	}, nil)
+	resp, err := http.Get(ts.URL + "/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	page := string(mustReadAll(t, resp))
+	if strings.Contains(page, "secretPassword123") {
+		t.Errorf("config page exposed raw HTTP_PROXY password: %s", page)
+	}
+	if !strings.Contains(page, "http://alice:***@proxy.internal:8080") {
+		t.Errorf("config page missing masked HTTP_PROXY in: %s", page)
+	}
+}

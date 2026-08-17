@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -718,11 +719,37 @@ func (d *Dashboard) configData() configData {
 		{Key: "CLI_VERSION", Value: cfg.CLIVersion},
 		{Key: "MODEL_ALIASES", Value: fmt.Sprintf("%d alias(es)", len(cfg.ModelAliases)), Secret: true},
 		{Key: "TRANSIENT_RETRIES", Value: strconv.Itoa(cfg.TransientRetries)},
-		{Key: "HTTP_PROXY", Value: cfg.HTTPProxy},
+		{Key: "HTTP_PROXY", Value: maskProxyURL(cfg.HTTPProxy)},
 		{Key: "SOCKS5_PROXY", Value: boolWord(cfg.SOCKS5Proxy != ""), Secret: true},
 		{Key: "SOCKS5_PROXIES", Value: fmt.Sprintf("%d proxy(es)", len(cfg.SOCKS5Proxies)), Secret: true},
 	}
 	return cd
+}
+
+// maskProxyURL masks any embedded basic auth password in raw proxy URL.
+func maskProxyURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	if _, hasPass := u.User.Password(); hasPass {
+		schemeIdx := strings.Index(raw, "://")
+		if schemeIdx >= 0 {
+			rest := raw[schemeIdx+3:]
+			if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+				userinfo := rest[:at]
+				if colon := strings.IndexByte(userinfo, ':'); colon >= 0 {
+					return raw[:schemeIdx+3+colon+1] + "***" + rest[at:]
+				}
+			}
+		}
+		u.User = url.UserPassword(u.User.Username(), "***")
+		return u.String()
+	}
+	return raw
 }
 
 func boolWord(v bool) string {
