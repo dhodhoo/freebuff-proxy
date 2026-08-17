@@ -46,6 +46,7 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose (debug) logging")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	showDoctor := flag.Bool("doctor", false, "run environment and configuration diagnostics")
+	probeTokens := flag.Bool("probe-tokens", false, "-doctor: also run per-token session-handshake probes (each creates and ends one upstream session, consuming daily session allowance)")
 	showUpdate := flag.Bool("update", false, "check for and download the latest release update")
 	showSetup := flag.Bool("setup", false, "run interactive client configuration helper")
 	testToken := flag.Bool("test-token", false, "probe the first configured token with a real session handshake and exit 0/1")
@@ -64,7 +65,7 @@ func main() {
 		runTokenTest(*configPath)
 	}
 	if *showDoctor {
-		runDoctor(*configPath)
+		runDoctor(*configPath, *probeTokens)
 	}
 	if *showUpdate {
 		runUpdate()

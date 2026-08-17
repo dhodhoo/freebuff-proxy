@@ -51,7 +51,8 @@
   </form>
   <div id="setup-smoke"></div>
   <div class="token-actions-bar">
-    <button class="action-btn" hx-post="/admin/diag" hx-target="#setup-diag" hx-swap="innerHTML">Full diagnostics</button>
+    <label class="diag-probe"><input type="checkbox" id="diag-probe" name="probe_tokens" value="true"> Probe tokens (consumes daily session slots)</label>
+    <button class="action-btn" hx-post="/admin/diag" hx-include="#diag-probe" hx-target="#setup-diag" hx-swap="innerHTML">Full diagnostics</button>
   </div>
   <div id="setup-diag"></div>
 </article>

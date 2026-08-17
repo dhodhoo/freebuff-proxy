@@ -133,6 +133,7 @@ func runTokenTest(configPath string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+	fmt.Fprintln(os.Stderr, "freebuff-proxy: -test-token: this creates and ends one upstream session, consuming daily session allowance")
 	st, err := client.CreateSessionForModel(ctx, model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "freebuff-proxy: -test-token: token rejected upstream: %v\n", err)
@@ -145,7 +146,7 @@ func runTokenTest(configPath string) {
 	os.Exit(0)
 }
 
-func runDoctor(configPath string) {
+func runDoctor(configPath string, probeTokens bool) {
 	fmt.Println("freebuff-proxy doctor diagnostic tool")
 	fmt.Println("=====================================")
 
@@ -246,30 +247,40 @@ func runDoctor(configPath string) {
 
 	// Token validity probe: one real session handshake per configured token,
 	// through the same client path the pool uses. This is the check that
-	// catches expired/revoked tokens before the first chat 401s.
+	// catches expired/revoked tokens before the first chat 401s. Each probe
+	// creates and ends an upstream session, consuming daily session allowance
+	// (restricted cohorts get ~1 session/day), so it is opt-in via
+	// -probe-tokens: plain -doctor never touches the upstream session API.
 	if !cfg.BridgeMode() {
-		probe := probeModel(reg)
-		if probe == "" {
-			warn("Cannot probe tokens: registry has no models")
+		if !probeTokens {
+			if len(cfg.AuthTokens) > 0 {
+				warn("Per-token session probes skipped (each consumes a daily session slot). Re-run with -probe-tokens to validate tokens with a real handshake.")
+			}
 		} else {
-			for i, tok := range cfg.AuthTokens {
-				clientCfg := cfg
-				client, err := upstream.New(tok, &clientCfg)
-				if err != nil {
-					fail(fmt.Sprintf("Token #%d: cannot build client: %v", i+1, err))
-					continue
+			warn(fmt.Sprintf("Probing %d token(s): each probe creates and ends an upstream session, consuming daily session allowance.", len(cfg.AuthTokens)))
+			probe := probeModel(reg)
+			if probe == "" {
+				warn("Cannot probe tokens: registry has no models")
+			} else {
+				for i, tok := range cfg.AuthTokens {
+					clientCfg := cfg
+					client, err := upstream.New(tok, &clientCfg)
+					if err != nil {
+						fail(fmt.Sprintf("Token #%d: cannot build client: %v", i+1, err))
+						continue
+					}
+					probeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+					st, err := client.CreateSessionForModel(probeCtx, probe)
+					cancel()
+					if err != nil {
+						fail(fmt.Sprintf("Token #%d validity probe failed: %v (re-run the upstream CLI to refresh the token)", i+1, err))
+						continue
+					}
+					endCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = client.EndSession(endCtx, st.InstanceID)
+					cancel()
+					ok(fmt.Sprintf("Token #%d validity probe succeeded (session handshake)", i+1))
 				}
-				probeCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-				st, err := client.CreateSessionForModel(probeCtx, probe)
-				cancel()
-				if err != nil {
-					fail(fmt.Sprintf("Token #%d validity probe failed: %v (re-run the upstream CLI to refresh the token)", i+1, err))
-					continue
-				}
-				endCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = client.EndSession(endCtx, st.InstanceID)
-				cancel()
-				ok(fmt.Sprintf("Token #%d validity probe succeeded (session handshake)", i+1))
 			}
 		}
 	}

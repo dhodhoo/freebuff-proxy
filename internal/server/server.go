@@ -1136,7 +1136,10 @@ func dialTarget(host string) string {
 
 // handleDiag runs the dashboard diagnostics: config state, upstream
 // reachability (DNS + TLS), registry health, and per-token validity probes —
-// the same checks -doctor performs, rendered as a fragment.
+// the same checks -doctor performs, rendered as a fragment. The per-token
+// probes each consume a daily session slot, so they only run when the
+// request opts in with probe_tokens=true; otherwise a skipped warning is
+// rendered.
 func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 	checks := []dashboard.DiagCheck{}
 
@@ -1180,21 +1183,32 @@ func (s *Server) handleDiag(w http.ResponseWriter, r *http.Request) {
 
 	checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Model registry: %d models", s.reg.ModelCount())})
 
-	// Per-token validity probes (pooled and hybrid-with-tokens modes).
+	// Per-token validity probes (pooled and hybrid-with-tokens modes). Each
+	// probe creates and ends an upstream session, consuming daily session
+	// allowance (restricted cohorts get ~1 session/day), so they are opt-in:
+	// only a probe_tokens=true request runs them (the setup wizard's "Probe
+	// tokens" checkbox). Plain diag requests skip the probes with a warning.
+	probeOptIn := r.FormValue("probe_tokens") == "true" || r.URL.Query().Get("probe_tokens") == "true"
 	if !cfg.BridgeMode() {
-		probe := probeModel(s.reg)
-		if probe == "" {
-			checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Cannot probe tokens: registry has no models"})
+		if !probeOptIn {
+			if len(s.pool.PoolSnapshot().Tokens) > 0 {
+				checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Per-token validity probes skipped (each consumes a daily session slot). Tick 'Probe tokens' to run them."})
+			}
 		} else {
-			for _, snap := range s.pool.PoolSnapshot().Tokens {
-				idx := snap.Token
-				probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
-				_, err := s.pool.TestToken(probeCtx, idx, probe)
-				probeCancel()
-				if err != nil {
-					checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
-				} else {
-					checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Token #%d validity probe succeeded", idx+1)})
+			probe := probeModel(s.reg)
+			if probe == "" {
+				checks = append(checks, dashboard.DiagCheck{Warn: true, Message: "Cannot probe tokens: registry has no models"})
+			} else {
+				for _, snap := range s.pool.PoolSnapshot().Tokens {
+					idx := snap.Token
+					probeCtx, probeCancel := context.WithTimeout(r.Context(), 8*time.Second)
+					_, err := s.pool.TestToken(probeCtx, idx, probe)
+					probeCancel()
+					if err != nil {
+						checks = append(checks, dashboard.DiagCheck{Message: fmt.Sprintf("Token #%d validity probe failed: %v", idx+1, err)})
+					} else {
+						checks = append(checks, dashboard.DiagCheck{OK: true, Message: fmt.Sprintf("Token #%d validity probe succeeded", idx+1)})
+					}
 				}
 			}
 		}

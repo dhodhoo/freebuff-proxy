@@ -230,7 +230,7 @@ func TestDoctorTargetPort(t *testing.T) {
 func TestRunDoctorBrokenConfigExits1(t *testing.T) {
 	if os.Getenv("GO_WANT_DOCTOR_HELPER") == "1" {
 		testutil.UnsetConfigEnv(t)
-		runDoctor(filepath.Join(t.TempDir(), "missing-config.json"))
+		runDoctor(filepath.Join(t.TempDir(), "missing-config.json"), false)
 		return // unreachable: runDoctor os.Exit(1)s
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestRunDoctorBrokenConfigExits1$")
