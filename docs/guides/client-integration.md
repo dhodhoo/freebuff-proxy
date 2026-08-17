@@ -11,7 +11,7 @@ Any OpenAI-compatible client works: OpenCode, pi, 9router, LiteLLM, or your own 
 
 ## Bridge Mode vs Pooled Mode
 
-+ **Pooled Mode (Default):** Set `AUTH_TOKENS=token1,token2` in the proxy's `.env`. The proxy drains keys one at a time: it prefers the token with a live session and only moves on when one is rate-limited, never aggressively rotating healthy keys. Clients can use any placeholder API key.
++ **Pooled Mode:** Set `AUTH_TOKENS=token1,token2` in the proxy's `.env`. The proxy drains keys one at a time: it prefers the token with a live session and only moves on when one is rate-limited, never aggressively rotating healthy keys. Clients can use any placeholder API key. (Not the out-of-the-box default: with `AUTH_TOKENS` unset the proxy starts in bridge mode — unless a CLI token is auto-discovered.)
 + **Bridge Mode (Routers & Multi-User):** Leave `AUTH_TOKENS=` empty in `.env`. The proxy acts as a zero-storage relay. **API Routers ([9router](9router-integration.md), OmniRouter, One API, LiteLLM) send actual FreeBuff tokens in `Authorization: Bearer <freebuff-token>`.** The proxy lazily creates sessions per client token with LRU caching, rate limits, and health tracking; cached bridge entries are visible in `GET /healthz`.
 ---
 

@@ -32,7 +32,7 @@ curl http://127.0.0.1:3457/healthz
 | :--- | :--- | :--- |
 | **Name** | `freebuff` | Display label |
 | **Prefix** | `freebuff` | Model prefix (e.g. `freebuff/deepseek/deepseek-v4-flash`) |
-| **API Type** | **Chat Completions** | ⚠️ **Do NOT select Responses API** |
+| **API Type** | **Chat Completions** | Responses API is also supported; Chat Completions is the tested default |
 | **Base URL** | `http://127.0.0.1:3457/v1` | *See Docker table below if 9router runs in a container* |
 | **API Key (Check)** | `not-needed` *(or your `cb_...` token)* | Used by the green **Check** validation button |
 | **Model ID** | *(leave empty)* | Proxy provides its own `/v1/models` catalog |
@@ -121,10 +121,10 @@ Go to 9router **Chat** tab, select provider `freebuff` and model `freebuff/deeps
 
 | Symptom | Root Cause | Solution |
 | :--- | :--- | :--- |
-| **Every request returns 404** | API Type was accidentally set to **Responses API**. | Edit the provider node and change API Type to **Chat Completions**. |
+| **Every request returns 404** | Old proxy binary without `/v1/responses` or `/v1/messages`, or an unsupported endpoint such as `/v1/embeddings` (400 `unsupported_endpoint`). | Upgrade to the latest release. Chat Completions, Responses, and Messages all work on v0.9.8+. |
 | **Connection Refused on Base URL** | Proxy is not running or bound only to loopback inside Docker. | Run `curl http://127.0.0.1:3457/healthz`. In Docker, ensure `LISTEN_ADDR=:3457`. |
 | **"URL not allowed" during Check** | 9router SSRF guard blocks private IPs when accessed from remote browser. | Ignore the check and click **Create** anyway, then add the API Key in the next modal. |
-| **401 Invalid API Key** | Token in `.env` or 9router connection is expired or invalid. | Regenerate a token via `.\scripts\gen-token.cmd` (or `./scripts/gen-token.sh`). |
+| **502 `upstream_auth_rejected`** | Token in `.env` or the 9router connection is expired or invalid. | Regenerate a token via `.\scripts\gen-token.cmd` (or `./scripts/gen-token.sh`). |
 | **429 Rate Limited** | Daily account quota exhausted (resets at Pacific Midnight / 07:00 UTC). | In Bridge mode, 9router will auto-fallback to your next key. |
 | **Truncated Reasoning / Tool Calls** | Model ran out of token generation budget. | Increase `max_tokens` (≥ 4000) in your client settings. |
 

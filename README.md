@@ -85,7 +85,7 @@ For a guided walkthrough, read [Getting Started](docs/guides/getting-started.md)
 
 ## Features
 
-- **OpenAI-Compatible API**: `POST /v1/chat/completions` (stream + non-stream), `GET /v1/models`, `GET /healthz`, Prometheus `GET /metrics`, and hot config reload via `POST /admin/reload`.
+- **OpenAI-Compatible API**: `POST /v1/chat/completions` (stream + non-stream), `POST /v1/responses`, `POST /v1/messages` (Anthropic shape) + `/v1/messages/count_tokens`, `POST /v1/embeddings` (unsupported → `400 unsupported_endpoint`), `GET /v1/models`, `GET /healthz`, Prometheus `GET /metrics`, and hot config reload via `POST /admin/reload`.
 - **Admin Dashboard**: embedded single-binary web UI at `http://<host>:3457/admin`: live overview with a one-click smoke test (a real chat through the pool), runtime token management (add/remove/test on the live pool, persisted to `.env`, no restart), a pooled↔bridge mode switch, a three-step setup wizard with full diagnostics, a `.env` config editor with validation and hot-reload, a log viewer, and metrics sparklines. Login via `ADMIN_TOKEN`; htmx-driven, zero build step.
 - **Dynamic Reasoning Effort**: OpenAI `reasoning_effort` (`low`/`medium`/`high`/`max`) and Codex/Anthropic `reasoning.effort` are normalized and mapped to upstream reasoning engines.
 - **Session & Run Lifecycle**: Upstream session handshakes, model-lock recovery (`DELETE` → re-`POST`), grace draining, and idle-run finishing, all automatic.
@@ -193,7 +193,7 @@ cp .env.example .env
 # SAFE_MODE=true            ← default (set false to disable)
 ```
 
-Leave `AUTH_TOKENS=` empty for **bridge mode** (clients bring their own tokens). Not sure which to pick? One user with a few accounts → pooled mode; a shared router serving many users → bridge mode. See [Key Concepts](#key-concepts). `config.example.json` shows the equivalent JSON config file, loaded with `-config`; see the [Configuration Reference](#configuration-reference) for every key.
+Leave `AUTH_TOKENS=` empty for **bridge mode** (clients bring their own tokens). Not sure which to pick? One user with a few accounts → pooled mode; a shared router serving many users → bridge mode. See [Key Concepts](#key-concepts). `config.example.json` shows the common keys in JSON form, loaded with `-config`; the [Configuration Reference](#configuration-reference) below documents every key.
 
 ### 4. Run & Verify
 
@@ -224,6 +224,7 @@ curl http://127.0.0.1:3457/healthz
 | `-update` | Self-update from the latest GitHub release (SHA-256 verified against `checksums.txt`) |
 | `-setup` | Interactive client setup (detects installed clients) |
 | `-yes` | Auto-confirm `-setup` prompts |
+| `-refresh-token N` | Re-authenticate token #N in `.env` via the headless GitHub login flow and exit. Interactive: prints a login URL and polls. With `-yes` and `GITHUB_USER` / `GITHUB_PASSWORD` / `GITHUB_TOTP` set: protocol login |
 | `-install-service` | Register the current binary as a background service and start it: Task Scheduler on Windows (per-user, no admin), systemd `--user` unit on Linux, launchd LaunchAgent on macOS. Runs from the executable's directory so `.env` resolves, and auto-starts on logon/boot |
 | `-uninstall-service` | Stop and unregister the background service (idempotent) |
 | `-service-status` | Check whether the service is registered and running; exits `0` when registered, `1` when not (scriptable) |
@@ -263,7 +264,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `SAFE_MODE` | `true` | Apply anti-ban presets (see below; set `false` to disable) |
 | `REQUEST_JITTER` | `0s` | Random delay range `[0, REQUEST_JITTER)` before upstream calls (`SAFE_MODE` sets 2s when unset) |
 | `CLI_VERSION` | `0.10.7` | Upstream CLI version string used in the request envelope |
-| `MODEL_ALIASES` | `""` | Map aliases to real model IDs, e.g. `gpt-4o:deepseek/deepseek-v4-flash` |
+| `MODEL_ALIASES` | `""` | Map aliases to real model IDs, e.g. `gpt-4o:deepseek/deepseek-v4-pro`. When unset, built-in aliases apply: `deepseek-chat` → `deepseek/deepseek-v4-flash`, `gpt-4o` → `deepseek/deepseek-v4-pro`, `claude-3-5-sonnet` → `anthropic/claude-fable-5`. An explicit value (even empty) suppresses all defaults |
 | `TRANSIENT_RETRIES` | `1` | Max additional attempts after a transient transport failure; `0` disables |
 | `SESSION_PERSIST` | `false` | Persist session state AND active agent runs to disk so a restart resumes them instead of re-creating (new daily slot / re-START) |
 | `SESSION_STATE_FILE` | `.freebuff-session-state.json` | Path of the session state file (used when `SESSION_PERSIST=true`; token-keyed, `0600`) |
@@ -275,6 +276,16 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `RUN_FINISH_INLINE_TIMEOUT` | `250ms` | Synchronous inline FINISH fallback bound when the finish queue is full |
 | `RUNS_DRAIN_QUEUE_CAP` | `64` | Draining-runs list cap; older entries are force-dropped (FINISH is best-effort) |
 | `RUNS_DRAIN_TTL` | `10m` | Draining-runs TTL eviction window |
+| `STABLE_EGRESS` | `true` | Pin each token+model to one hash-stable proxy for the session lifetime (`false` = legacy per-token binding; an explicit `PROXY_ROTATION` still wins) |
+| `HTTP2_UPSTREAM` | `true` | Negotiate HTTP/2 with the upstream so the ALPN matches real browsers; `false` forces HTTP/1.1 |
+| `PROXY_HEALTH_INTERVAL` | `1m` | Probe configured SOCKS5 proxies on this interval |
+| `PROXY_HEALTH_MAX_FAILURES` | `3` | Mark a proxy out-of-rotation after this many consecutive failures |
+| `FALLBACK_MODEL` | `""` | Model to use once the requested premium model's queue wait passes `FALLBACK_AFTER_MS` |
+| `FALLBACK_AFTER_MS` | `10000` | Queue-wait threshold (ms) before falling back to `FALLBACK_MODEL` |
+| `CORS_ALLOWED_ORIGIN` | `*` | `Access-Control-Allow-Origin` for `/v1/*` responses |
+| `ADOPT_CLI_SESSION` | `false` | Adopt the upstream CLI's active session instead of creating a new one |
+| `WAITING_ROOM_CHAIN` | `false` | Chain queued waiting-room requests across tokens instead of erroring |
+| `WEBHOOK_URL` | `""` | Notify this URL when a run finishes (POST) |
 
 When `SESSION_PERSIST=true`, the state file stores a SHA-256 hash of each
 active token plus its session metadata (instance id, expiry, tier/country)
@@ -318,9 +329,10 @@ opt out). It enables essential anti-ban protections and presets:
   `session_model_mismatch`). The requested model id is correlated with the egress IP's
   resolved geo, so a premium model request from a VPN/hosting IP is a suspicious,
   ToS-prohibited combination.
-- **Know the difference between a quota and a ban.** `429` (quota/waiting room, resets at
+- **Know the difference between a quota and a ban.** `429` (quota, resets at
   Pacific midnight) is the normal end-of-day signal; the proxy locks the token locally and
-  answers in `<1ms`, and routers fail over. Only `403` with `banned` / `country_blocked`
+  answers in `<1ms`, and routers fail over. `503` with `waiting_room` is the queued-waiting-room
+  signal (also transient). Only `403` with `banned` / `country_blocked`
   means the account itself is gone: stop using it and move to a fresh established account.
 - **For ~24h of continuous coding, budget 4-5 keys.** Each FreeBuff account has a daily
   session quota (≈6 sessions on the limited tier, ≈5 premium sessions/day). One key ≈ one
@@ -362,7 +374,7 @@ opt out). It enables essential anti-ban protections and presets:
 
 The proxy ships with an embedded web dashboard: same single binary, no extra process, no build step (htmx + Pico are vendored into the binary). Open `http://127.0.0.1:3457/admin` (or your `LISTEN_ADDR`).
 
-- **Login**: enter your `ADMIN_TOKEN` on the login page. It is the same value as the bearer token for `POST /admin/reload`. Without `ADMIN_TOKEN` the dashboard is open (matching `/admin/reload`'s legacy behavior; a startup warning is logged). But the **sensitive routes require a loopback client** in that mode: Config and Logs (secrets), the token actions, the smoke test, diagnostics, and the mode switch. So a remotely reachable proxy cannot leak or rewrite its `.env`, mutate the pool, or switch modes. Failed logins are rate-limited per IP (5 fails → 1 minute lockout), and the session cookie is `HttpOnly` + `SameSite=Strict` (+ `Secure` when the proxy listens beyond loopback).
+- **Login**: enter your `ADMIN_TOKEN` on the login page. It is the same value as the bearer token for `POST /admin/reload`. Without `ADMIN_TOKEN` the dashboard is open (matching `/admin/reload`'s legacy behavior; a startup warning is logged). But the **sensitive routes require a loopback client** in that mode: Config and Logs (secrets), the token actions, the smoke test, diagnostics, and the mode switch. So a remotely reachable proxy cannot leak or rewrite its `.env`, mutate the pool, or switch modes. Failed logins are rate-limited per IP (5 fails → 1 minute lockout), and the session cookie is `HttpOnly` + `SameSite=Strict` (+ `Secure` when the login arrived over TLS or `X-Forwarded-Proto: https`).
 - **Overview**: live relay state (pooled/bridge mode, model count, uptime, safe mode) with per-token cards: session status, ban/429 risk level, usage vs `MAX_MESSAGES_PER_DAY`, transient-retry counters, plus a **smoke test** that sends one real chat through the pool (status, latency, preview). Polls every 5s.
 - **Tokens**: per-token session detail + the live per-model session quota table (limit/recent/period/reset/entitlement) with **usage bars and reset countdowns**; per-token **Unlock** (clears cooldown/ban), **Finish runs**, and **Test** (zero-cost validity probe). The pool is **runtime-mutable**: an **Add-token** form, **Remove last**, **Test all**, and **Switch to bridge mode** take effect immediately and are persisted to `AUTH_TOKENS` in `.env`, no restart. Polls every 30s.
 - **Models**: the live catalog with upstream agent mappings and `MODEL_ALIASES`.

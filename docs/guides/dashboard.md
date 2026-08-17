@@ -12,8 +12,8 @@ page unless `ADMIN_TOKEN` is unset.
 
 | Setting | Behavior |
 |---|---|
-| `ADMIN_TOKEN` set | Login required: `ADMIN_TOKEN` is both the bearer token for `/admin/reload` and the login password. Enter it on the login page; a signed `HttpOnly` + `SameSite=Strict` cookie unlocks the dashboard for 24h (`Secure` is added automatically when the proxy listens beyond loopback). Failed logins are rate-limited per IP (5 fails → 1 minute lockout). |
-| `ADMIN_TOKEN` unset | Dashboard is open (legacy behavior, matching `/admin/reload`). A startup warning reminds you to set it if the proxy is reachable beyond loopback. The **sensitive routes additionally require a loopback client** in this mode: Config and Logs (secrets), the token actions (add/remove/test/test-all), the smoke test, diagnostics, and the mode switch, so a remotely reachable proxy cannot leak or rewrite its `.env`, mutate the pool, or switch modes without the token. |
+| `ADMIN_TOKEN` set | Login required: `ADMIN_TOKEN` is both the bearer token for `/admin/reload` and the login password. Enter it on the login page; a signed `HttpOnly` + `SameSite=Strict` cookie unlocks the dashboard for 24h (`Secure` is added only when the login arrived over TLS or `X-Forwarded-Proto: https` — the listen address does not matter). Failed logins are rate-limited per IP (5 fails → 1 minute lockout). |
+| `ADMIN_TOKEN` unset | Dashboard is open (legacy behavior, matching `/admin/reload`); a startup warning notes the token is unset, and the in-page banner reminds you to set it when the proxy is reachable beyond loopback. The **sensitive routes additionally require a loopback client** in this mode: Config and Logs (secrets), the token actions (add/remove/test/test-all), the smoke test, diagnostics, the mode switch, and the login-wizard/playground endpoints, so a remotely reachable proxy cannot leak or rewrite its `.env`, mutate the pool, or switch modes without the token. |
 
 The session cookie is stateless (HMAC-signed expiry, per-process random key):
 restarting the proxy signs everyone out, which is the safe default.
@@ -75,12 +75,19 @@ restarting the proxy signs everyone out, which is the safe default.
   3. **Connect your client**: copy-paste snippets generated from the
      effective config (base URL, mode, key hint, first catalog model),
      plus the full model list as chips.
+- **Playground**: a chat box that sends real requests through the pool
+  (`POST /admin/playground/chat`), useful for testing a model pick without
+  a client. Gated like the other sensitive routes.
+- **Login wizard**: on the Setup page, add a token via the headless login
+  flow (`POST /admin/login/start` → poll `GET /admin/login/status`): the
+  proxy starts the upstream login, shows the auth URL and short code, and
+  stores the token once the poll confirms it.
 - **Logs**: the last 200 records from an in-memory ring that mirrors the
   process logger (stderr and any `LOG_FILE` still receive everything). No log
   file, no docker access needed. Refreshes every 3s.
-- **Metrics**: sampled counter trends (requests, transient retries,
-  fingerprint rotations) as server-rendered SVG sparklines. The full Prometheus
-  exposition with per-token gauges stays at `/metrics`.
+- **Metrics**: sampled counter trends (requests and transient retries as
+  server-rendered SVG sparklines; fingerprint rotations as a bare value). The
+  full Prometheus exposition with per-token gauges stays at `/metrics`.
 
 ## Docker caveat
 
@@ -91,8 +98,9 @@ directory, so in Docker, prefer environment variables in `docker-compose.yml`
 The runtime token actions (Add token, Remove last, mode switch) persist to the
 same `./.env` path, so they only survive restarts when `.env` is bind-mounted
 (the live pool change still applies immediately). The read-only pages
-(Overview/Tokens/Logs/Metrics), the smoke test, and diagnostics work fine in
-Docker.
+(Overview/Models/Traces/Logs/Metrics), the smoke test, and diagnostics work
+fine in Docker. The Tokens page works too, but its mutating actions persist
+to `./.env`, which only survives restarts when bind-mounted.
 
 ## Hardening
 

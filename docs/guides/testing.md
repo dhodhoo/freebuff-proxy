@@ -28,9 +28,10 @@ Start by confirming you have a real build and it can see its config.
 What you want to see:
 
 - `-version` prints a version string. `dev` means a build without release
-  metadata, which is normal for `go run` or a hand-built binary; a tagged
-  release prints `v0.9.8` style. If you built from a release archive and
-  it says `dev`, that is cosmetic, not a fault.
+  metadata, which is normal for `go run` or a hand-built binary. Release
+  archives are built with the version baked in, so a downloaded release
+  always prints its tag (e.g. `v0.9.8`); if a release binary says `dev`,
+  something is off with the build.
 - `-doctor` prints a line per check, `[ok]` or `[FAIL]`, then exits. It
   probes every configured token with a zero-cost GET request (no session
   slot consumed) and reports each as `[ok]` or `[FAIL]`. A clean
@@ -141,10 +142,9 @@ Same header rule as above: add `Authorization: Bearer cb_...` in bridge
 mode.
 
 Healthy: lines of `data: {"id":"chatcmpl-...","choices":[{"delta":{...}}]}` arriving over time, ending with `data: [DONE]`. If you get one big blob
-at the end, streaming is broken. If you get `data: ..."error":` inside
-the stream instead of `[DONE]`, the failure happened mid-generation and
-the proxy forwarded the upstream error as an `upstream_error` event;
-that is the proxy working correctly, not a bug in it.
+at the end, streaming is broken. If the upstream stream dies mid-generation,
+the proxy emits an error chunk and still terminates with `data: [DONE]`;
+an error *without* the terminator means the proxy itself failed mid-relay.
 
 ### Responses API and Anthropic messages
 
@@ -178,22 +178,25 @@ alive".
 ./freebuff-proxy -test-token
 ```
 
-Exit 0 with `token OK` means the token authenticates. Non-zero with a
-message means the config failed to load (fix `.env`) or the upstream
-rejected the token. A `429` here is quota exhaustion, which is expected
-late in a day; it is not a ban and resets at Pacific midnight. A `403`
-with `status: banned` is the terminal case: that account is gone, use
-another.
+Exit 0 with `token OK` means the token authenticates. Any failure (bad
+token, quota 429, banned 403) exits 1 with a message, so a quota-spent
+account reports as failure — the exit code is about *can this token work
+right now*, not about blame. A `429` is quota exhaustion, expected late in
+a day, not a ban; it resets at Pacific midnight. A `403` with
+`status: banned` may carry a resume time (the ban is temporary when the
+upstream provides one); `403 country_blocked` means the egress region is
+refused. Neither is something you can fix by restarting the proxy.
 
 ### The full diagnostics
 
 `-doctor` checks local state (config validity, environment, port
-bindings, TLS fingerprint selection) and then probes every configured
-token with a zero-cost GET request. Those probes do not claim a session
-and do not consume a daily slot, which is why they always run: the old
-session-handshake probes cost a slot per run, so they were gated behind a
-flag; the GET probe removed that cost entirely. The only case that skips
-probing is bridge mode, where the proxy holds no tokens to check.
+bindings, DNS + TLS reachability of the upstream) and then probes every
+configured token with a zero-cost GET request. Those probes do not claim
+a session and do not consume a daily slot, which is why they always run:
+the old session-handshake probes cost a slot per run, so they were gated
+behind a flag; the GET probe removed that cost entirely. The only case
+that skips probing is bridge mode, where the proxy holds no tokens to
+check.
 
 ```
 ./freebuff-proxy -doctor
@@ -240,7 +243,9 @@ Windows:
 .\freebuff-proxy.exe -service-status
 ```
 
-The status command exits 0 when registered and running. Registration uses
+The status command exits 0 when the service is *registered* (running or
+not), 1 when not registered at all — it is a registration check, not a
+liveness check. Registration uses
 Task Scheduler at logon with limited privileges; you see the task under
 `schtasks /query /tn "freebuff-proxy"` if you want to inspect it.
 `-uninstall-service` reverses it.
@@ -269,10 +274,13 @@ resumed on restart instead of recreated, which avoids burning a fresh
 session slot; that is the knob to test if you run long sessions.
 
 The config page in the dashboard and `POST /admin/reload` reload `.env`
-without restarting. After a reload, the overview should show the new
-token count. If you changed `AUTH_TOKENS`, the pool is construction-fixed
-for the session: token add/remove takes a full restart, and the UI says
-so.
+without restarting. What a reload applies: registry aliases and the
+runtime knobs (session-create caps, re-admit lead, probe-cache TTL). What
+it does not do: change the pool's token list — editing `AUTH_TOKENS` in
+`.env` and reloading does not add or remove pooled tokens; that needs a
+restart. The dashboard's Tokens page is the live path instead: Add-token,
+Remove last, and mode switch take effect immediately and persist to
+`AUTH_TOKENS` in `.env` (surviving a restart), no restart needed.
 
 Self-update is `./freebuff-proxy -update`, which checks GitHub and
 replaces the binary with the latest release. It skips the swap if the
@@ -288,14 +296,16 @@ proxy classifies upstream responses deliberately.
 | Status | Code | Meaning | Your move |
 |---|---|---|---|
 | 401 | `missing_bearer_token` | Bridge mode: you sent no token | Add `Authorization: Bearer cb_...` |
-| 402 | `out of credits` | `COST_MODE` is not `free` (or upstream billing) | Set `COST_MODE=free`; fresh accounts 402 when routed as paid |
-| 403 | `status: banned` | Account banned, terminal | Stop using that account; check egress for VPN/proxy signals |
+| 402 | `out of credits` | Upstream billing state (paid routing) | A wrong `COST_MODE` in `.env` is a **startup config error**, not a runtime 402: the proxy refuses to start with anything but `free` or unset. A live 402 comes from the upstream account itself |
+| 403 | `account_banned` | Account banned upstream (temporary when a resume time is provided) | Stop using that account; check egress for VPN/proxy signals; wait for the resume time if set |
+| 403 | `country_blocked` | Egress region refused by upstream | Route through an allowed region or configure `SOCKS5_PROXY` |
 | 429 | quota / rate limit | Daily quota spent, resets Pacific midnight | Wait, or add a token |
 | 429 | `ip_capped` | Too many distinct users on one egress IP | Rotate the account or the IP |
 | 5xx | upstream error | FreeBuff side, transient | Retry later; check `TRANSIENT_RETRIES` behavior in logs |
 
 The distinction that matters most: **429 is a quota, not a ban**. A
-banned account is 403 and terminal. Panicking over a 429 and rotating
+banned account is 403 and may resume later (the upstream supplies a
+resume time when the ban is temporary). Panicking over a 429 and rotating
 egress aggressively is how accounts get flagged; the proxy's job is to
 sit still on quota days.
 
@@ -313,8 +323,9 @@ or one glance.
 6. Dashboard overview → tokens listed, risk cards render, no ERROR spam
    in logs.
 7. Logs show startup banner with `auth_tokens=N` matching your `.env`.
-8. `-test-token` exits 0 with `token OK` (or a quota 429, which is
-   expected and not a failure).
+8. `-test-token` exits 0 with `token OK`. (A quota 429 exits 1 — that is
+   a quota day, not a proxy fault; the checklist then reads as "healthy
+   but quota-spent".)
 
 If all eight pass, the proxy is doing its job. Remaining weirdness is
 upstream or account-side: a quota day, a regional model pick that got

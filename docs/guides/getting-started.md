@@ -127,8 +127,8 @@ Run `./freebuff-proxy -doctor` to diagnose problems automatically.
 
 | Error / Symptom | Cause & Fix |
 |---|---|
-| `502` + `403 free_mode_cli_required` | The request was missing the CLI system prompt marker or envelope. The proxy injects this automatically. Update to the latest version. |
-| `502` + `401 Invalid API key` | Token in `.env` is expired or invalid. Catch it before the first chat: `./freebuff-proxy -test-token` (or `-doctor`) probes the token with a zero-cost GET request and fails with a clear message. Then re-run `freebuff` to log in and update `AUTH_TOKENS`, or swap the token live on the dashboard Tokens page (no restart). |
+| `403` + `free_mode_cli_required` | The request was missing the CLI system prompt marker or envelope. The proxy injects this automatically. Update to the latest version. |
+| `502` + `upstream_auth_rejected` | Token in `.env` is expired or invalid. Catch it before the first chat: `./freebuff-proxy -test-token` (or `-doctor`) probes the token with a zero-cost GET request and fails with a clear message. Then re-run `freebuff` to log in and update `AUTH_TOKENS`, or swap the token live on the dashboard Tokens page (no restart). |
 | Connection refused | Proxy is not running, or in Docker without `LISTEN_ADDR=:3457`. |
 | `403 account_banned` | Account suspended upstream. Token is dead; use a new established account. |
 
