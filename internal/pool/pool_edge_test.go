@@ -708,8 +708,18 @@ func TestFinishTokenRuns(t *testing.T) {
 		t.Errorf("ActiveRuns = %d, want 0 after FinishTokenRuns", got)
 	}
 	finished := mock.FinishedRunsSnapshot()
-	if len(finished) != 1 || finished[0].Status != "completed" {
-		t.Errorf("finished runs = %v, want 1 completed", finished)
+	// Issue #91: each run START also creates+FINISHes a context-pruner child
+	// run (best-effort, async), so the raw finished count includes the
+	// child. Assert the PARENT run was FINISHed with status completed
+	// (race-stable — the child may or may not have landed yet).
+	parentFinished := false
+	for _, f := range finished {
+		if f.RunID == "run-0001" && f.Status == "completed" {
+			parentFinished = true
+		}
+	}
+	if !parentFinished {
+		t.Errorf("finished runs = %v, want run-0001 completed", finished)
 	}
 
 	// Out-of-range tokens error without panicking.

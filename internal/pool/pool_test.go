@@ -118,8 +118,9 @@ func TestRoundRobinDistribution(t *testing.T) {
 	// Both tokens created the run for the agent exactly once (runs survive
 	// session invalidation).
 	for i, mock := range []*testutil.MockUpstream{mock0, mock1} {
-		if len(mock.StartedRuns) != 1 || mock.StartedRuns[0] != agentA {
-			t.Errorf("mock%d started runs = %v, want [%s]", i, mock.StartedRuns, agentA)
+		started := mock.StartedRunsSnapshot()
+		if len(started) != 1 || started[0] != agentA {
+			t.Errorf("mock%d started runs = %v, want [%s]", i, started, agentA)
 		}
 		if len(parentFinished(mock)) != 0 {
 			t.Errorf("mock%d finished runs = %v, want none", i, parentFinished(mock))
@@ -489,8 +490,8 @@ func TestInvalidateRunRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.LeaseRelease(lease)
-	if len(mock.StartedRuns) != 1 {
-		t.Fatalf("started runs = %v, want 1", mock.StartedRuns)
+	if started := mock.StartedRunsSnapshot(); len(started) != 1 {
+		t.Fatalf("started runs = %v, want 1", started)
 	}
 
 	p.InvalidateRun(lease.Token, lease.AgentID)
@@ -499,11 +500,20 @@ func TestInvalidateRunRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.LeaseRelease(lease2)
-	if len(mock.StartedRuns) != 2 {
-		t.Errorf("started runs = %d, want 2 (restart after invalidate)", len(mock.StartedRuns))
+	if started := mock.StartedRunsSnapshot(); len(started) != 2 {
+		t.Errorf("started runs = %d, want 2 (restart after invalidate)", len(started))
 	}
-	if len(mock.FinishedRuns) != 0 {
-		t.Errorf("finished runs = %v, want none (invalidated run is not FINISHed)", mock.FinishedRuns)
+	// Issue #91: run STARTs create+FINISH a context-pruner child run
+	// (best-effort, async), so FinishedRuns may contain child-run FINISHes.
+	// The assertion that matters: the INVALIDATED parent run must NOT be
+	// FINISHed (Invalidate deletes it without an upstream FINISH) — filter
+	// out child-run entries for a race-stable check.
+	for _, f := range mock.FinishedRunsSnapshot() {
+		if strings.HasPrefix(f.RunID, "child-run-") {
+			continue
+		}
+		t.Errorf("finished runs = %v, want no parent FINISH (invalidated run is not FINISHed)", mock.FinishedRunsSnapshot())
+		break
 	}
 
 	// Out-of-range tokens are ignored without panicking.
@@ -1111,9 +1121,11 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 		t.Fatalf("started runs = %v, want 1", got)
 	}
 
-	// Not idle yet: a maintain pass runs normally (no FINISH).
+	// Not idle yet: a maintain pass runs normally (no FINISH). Filter the
+	// context-pruner child runs (issue #91) — their async FINISH may land
+	// at any point and must not count as a parent-run finish.
 	p.maintainTick(context.Background())
-	if got := mock.FinishedRunsSnapshot(); len(got) != 0 {
+	if got := parentFinished(mock); len(got) != 0 {
 		t.Fatalf("finished runs = %v before idle, want none", got)
 	}
 
@@ -1133,8 +1145,8 @@ func TestIdleRotationFinishesRuns(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		p.maintainTick(context.Background())
 	}
-	if got := mock.FinishedRunsSnapshot(); len(got) != 1 {
-		t.Errorf("finished runs = %v, want still 1 (dormant while idle)", got)
+	if got := parentFinished(mock); len(got) != 1 {
+		t.Errorf("finished runs = %v, want still 1 parent (dormant while idle)", got)
 	}
 	if got := mock.StartedRunsSnapshot(); len(got) != 1 {
 		t.Errorf("started runs = %v, want still 1", got)
