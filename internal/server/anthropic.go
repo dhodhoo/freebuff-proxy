@@ -90,15 +90,62 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMessagesCountTokens answers POST /v1/messages/count_tokens with a
-// structured unsupported error. Documented choice: the proxy does not
-// bundle a tokenizer (zero new dependencies), and a rough estimate would
-// mislead Claude clients' context management — so counting is refused
-// explicitly (501, code count_tokens_unsupported) rather than answered
-// with wrong numbers. Chat itself works via POST /v1/messages.
+// local estimate of the request's input tokens. The estimate mirrors the
+// FreeBuff upstream context estimator (o200k_base tokenization scaled by its
+// multiplier, per-message overhead, flat image cost, structured tool
+// counting) and is fully local: no session, quota, or upstream call. The
+// result is an estimate for context planning, not a provider-exact token
+// count — Anthropic documents its own count endpoint the same way.
 func (s *Server) handleMessagesCountTokens(w http.ResponseWriter, r *http.Request) {
-	s.writeJSONError(w, http.StatusNotImplemented,
-		"count_tokens is not supported: this proxy serves chat completions only and does not bundle a tokenizer, so an estimate would mislead context management. POST /v1/messages works for chat; token counts are unavailable.",
-		"unsupported_endpoint", "count_tokens_unsupported", 0)
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.writeJSONError(w, http.StatusRequestEntityTooLarge,
+				"request body exceeds the 32MB limit", "invalid_request_error", "content_too_large", 0)
+		} else {
+			s.writeJSONError(w, http.StatusBadRequest,
+				"failed to read request body: "+err.Error(), "invalid_request_error", "invalid_json", 0)
+		}
+		return
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest,
+			"request body must be a valid JSON object", "invalid_request_error", "invalid_json", 0)
+		return
+	}
+	rawModel, _ := raw["model"].(string)
+	if rawModel == "" {
+		s.writeJSONError(w, http.StatusBadRequest,
+			"missing required field \"model\"; available: "+strings.Join(s.reg.Models(), ", "),
+			"invalid_request_error", "model_not_found", 0)
+		return
+	}
+	// Reject unknown models the way the chat path does (registry
+	// ErrModelNotFound → 400 model_not_found) without acquiring a session
+	// or touching upstream.
+	if _, err := s.reg.AgentForModel(rawModel); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest,
+			err.Error()+"; available: "+strings.Join(s.reg.Models(), ", "),
+			"invalid_request_error", "model_not_found", 0)
+		return
+	}
+	if s.tokenEstimator == nil {
+		s.writeJSONError(w, http.StatusInternalServerError,
+			"token estimator unavailable", "server_error", "estimator_unavailable", 0)
+		return
+	}
+	count, err := s.tokenEstimator.CountAnthropicRequest(raw)
+	if err != nil {
+		s.writeJSONError(w, http.StatusBadRequest,
+			"invalid messages request: "+err.Error(), "invalid_request_error", "invalid_json", 0)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": count})
 }
 
 // --- request conversion ---
