@@ -94,7 +94,7 @@ For a guided walkthrough, read [Getting Started](docs/guides/getting-started.md)
 - **TLS Stealth & Egress Proxies**: `HTTP_PROXY` / `SOCKS5_PROXY`, per-token SOCKS5 routing (`SOCKS5_PROXIES`, bound by token index), and browser TLS fingerprinting via uTLS (Chrome, Firefox, Safari, Edge).
 - **Subagent-Ready Concurrency**: Single-flight session refresh prevents race conditions during high-volume tool-calling loops.
 - **Safe Mode**: On by default: anti-ban presets (TLS stealth, header sanitization, jitter, idle rotation).
-- **Operational Tooling**: `-doctor` diagnostics with a real session-handshake validity probe per token, `-test-token` (exit 0/1 for installers and scripts), `-setup` interactive client configuration, and a SHA-256-verified `-update` self-updater.
+- **Operational Tooling**: `-doctor` diagnostics (config, port, DNS/TLS, registry; per-token session probes opt-in via `-probe-tokens` because each consumes a daily session slot), `-test-token` (real handshake on the first token, exit 0/1 for installers and scripts), `-setup` interactive client configuration, and a SHA-256-verified `-update` self-updater.
 - **Quota Transparency**: Live per-model quota (from the upstream `rateLimitsByModel` admission payload) is surfaced in `GET /healthz` (per-token `quota` map) and `GET /metrics` (`freebuff_proxy_quota_recent` / `freebuff_proxy_quota_limit` gauges).
 
 ## How It Works
@@ -205,8 +205,9 @@ Check health and run diagnostics:
 
 ```bash
 curl http://127.0.0.1:3457/healthz
-./freebuff-proxy -doctor       # config, port, DNS/TLS, registry + per-token session probes
-./freebuff-proxy -test-token   # real session handshake on the first token; exit 0/1
+./freebuff-proxy -doctor        # config, port, DNS/TLS, registry (probes are opt-in)
+./freebuff-proxy -doctor -probe-tokens   # also run per-token session probes (each consumes a daily session slot)
+./freebuff-proxy -test-token    # real session handshake on the first token (consumes one slot); exit 0/1
 ```
 
 ---
@@ -219,8 +220,9 @@ curl http://127.0.0.1:3457/healthz
 | `-config <path>` | Load an optional JSON config file (keys mirror env names) |
 | `-v` | Verbose (debug) logging |
 | `-version` | Print version and exit |
-| `-doctor` | Run configuration and environment diagnostics: config, port, DNS/TLS reachability, model registry, and a real session-handshake validity probe per token |
-| `-test-token` | Probe the first configured token with a real upstream session handshake; prints `token OK` and exits `0`, or exits `1` (for installers/scripts) |
+| `-doctor` | Run configuration and environment diagnostics: config, port, DNS/TLS reachability, model registry (per-token session probes are opt-in via `-probe-tokens`) |
+| `-probe-tokens` | With `-doctor`: also run per-token session-handshake probes (each creates and ends one upstream session, consuming daily session allowance) |
+| `-test-token` | Probe the first configured token with a real upstream session handshake (creates and ends one session, consuming daily session allowance); prints `token OK` and exits `0`, or exits `1` (for installers/scripts) |
 | `-update` | Self-update from the latest GitHub release (SHA-256 verified against `checksums.txt`) |
 | `-setup` | Interactive client setup (detects installed clients) |
 | `-yes` | Auto-confirm `-setup` prompts |
@@ -340,7 +342,7 @@ opt out). It enables essential anti-ban protections and presets:
 | `GET/POST /admin/login` | none | Dashboard login: constant-time `ADMIN_TOKEN` check, per-IP rate limit, `HttpOnly` + `SameSite=Strict` session cookie |
 | `POST /admin/config` | session cookie | Validate and persist the `.env` file, then hot-reload the config (rolls back on rejection) |
 | `POST /admin/smoke` | session cookie (loopback when `ADMIN_TOKEN` unset) | One real chat through the pool: reports model, token, latency, and a content preview (bridge mode needs a client token in the payload) |
-| `POST /admin/diag` | session cookie (loopback when `ADMIN_TOKEN` unset) | Dashboard diagnostics (same checks as `-doctor`): config state, DNS + TCP reachability, registry count, per-token validity probes |
+| `POST /admin/diag` | session cookie (loopback when `ADMIN_TOKEN` unset) | Dashboard diagnostics (same checks as `-doctor`): config state, DNS + TCP reachability, registry count; per-token validity probes run only when the request sets `probe_tokens=true` (each consumes a daily session slot) |
 | `POST /admin/mode` | session cookie (loopback when `ADMIN_TOKEN` unset) | Runtime pooled↔bridge↔hybrid switch; `{"mode":"bridge"}` empties the pool and clears `AUTH_TOKENS` in `.env`, `{"mode":"hybrid"}` enables per-client relay alongside the pool |
 | `POST /admin/tokens/...` | session cookie (loopback when `ADMIN_TOKEN` unset) | Runtime pool management: `/add`, `/remove` (last token), `/test-all`, and per-token `/test`, `/unlock`, `/finish`, persisted to `.env` |
 
@@ -353,7 +355,7 @@ The proxy ships with an embedded web dashboard: same single binary, no extra pro
 - **Tokens**: per-token session detail + the live per-model session quota table (limit/recent/period/reset/entitlement) with **usage bars and reset countdowns**; per-token **Unlock** (clears cooldown/ban), **Finish runs**, and **Test** (real upstream session probe). The pool is **runtime-mutable**: an **Add-token** form, **Remove last**, **Test all**, and **Switch to bridge mode** take effect immediately and are persisted to `AUTH_TOKENS` in `.env`, no restart. Polls every 30s.
 - **Models**: the live catalog with upstream agent mappings and `MODEL_ALIASES`.
 - **Traces**: recent chat requests and their routing outcome (token, model, status, duration, error class), the observability view for ban-avoidance debugging. Polls every 3s.
-- **Setup**: a three-step wizard: (1) add/remove/test tokens, (2) verify with a **smoke test** and **Full diagnostics** (`-doctor`-style checks: config state, DNS + TCP reachability, registry count, per-token validity), (3) copy-paste client snippets generated from the effective config.
+- **Setup**: a three-step wizard: (1) add/remove/test tokens, (2) verify with a **smoke test** and **Full diagnostics** (`-doctor`-style checks: config state, DNS + TCP reachability, registry count; per-token validity probes run only when the **Probe tokens** checkbox is ticked), (3) copy-paste client snippets generated from the effective config.
 - **Config**: edit the proxy's `.env` file in place. Save runs the same validation as startup (durations, URLs, `Validate`) and hot-reloads; invalid input is rejected with the file rolled back. The effective-value table shows secrets redacted to set/unset + counts.
 - **Logs**: the last 200 records from an in-memory ring (no log file or docker needed), level-colored, polling every 3s.
 - **Metrics**: sampled counter trends as server-rendered sparklines; the full Prometheus exposition stays at `/metrics`.
