@@ -249,6 +249,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `SESSION_CALL_TIMEOUT` | `30s` | Session call timeout |
 | `REGISTRY_REFRESH` | `6h` | Model catalog refresh interval |
 | `COST_MODE` | `free` | `free` (free-tier) or paid billing mode |
+| `USER_ID` | `""` | Optional FreeBuff account id; sent on every chat call as `x-freebuff-acting-user-id` (the real CLI sends it and the free-mode gate expects it). Empty = header omitted |
 | `TLS_FINGERPRINT` | `auto` | `auto`, `chrome120`, `chrome126`, `safari17`, `safari18`, `firefox120`, `firefox128`, `edge126`, `random` |
 | `HTTP_PROXY` | `""` | Outbound HTTP proxy for upstream requests |
 | `SOCKS5_PROXY` | `""` | Outbound SOCKS5 proxy for upstream requests |

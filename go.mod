@@ -13,4 +13,5 @@ require (
 require (
 	github.com/xyproto/randomstring v1.2.0 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 )
