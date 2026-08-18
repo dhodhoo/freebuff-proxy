@@ -23,14 +23,14 @@ import (
 
 // Test models must map to agents with EXCLUSIVE ownership in the registry
 // FALLBACK map (see internal/registry/registry_test.go expectedFallback):
-// the five base2-free models are first-seen-assigned to the generic
-// base2-free agent, while glm-5.2 and laguna-s-2.1 are owned by their
-// dedicated one-model agents. Tests pin the offline (fallback) state.
+// the five base2-free models are root-mapped to their per-model agents, while
+// glm-5.2 and claude-fable-5 are owned by their dedicated one-model agents.
+// Tests pin the offline (fallback) state.
 const (
 	modelA = "z-ai/glm-5.2"
-	modelB = "poolside/laguna-s-2.1"
+	modelB = "anthropic/claude-fable-5"
 	agentA = "base2-free-glm"
-	agentB = "base2-free-laguna-s-2-1"
+	agentB = "base2-free-fable"
 )
 
 // newTestPool wires one mock upstream per token through real clients and

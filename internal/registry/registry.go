@@ -73,37 +73,71 @@ var LimitedTierModels = map[string]bool{
 }
 
 // fallbackAgents is the hardcoded model→agent fallback used when the sources
-// are unreachable. Ported verbatim from registry.js (lines 14-41), entry
-// order preserved: first-seen assignment decides which agent owns models that
-// appear in several entries (e.g. the gemini helpers all list the same two
-// models; file-picker-max comes first).
+// are unreachable. It mirrors the CURRENT upstream FREE_MODE_AGENT_MODELS
+// exactly: the rows below are the verbatim parse of the pinned snapshot
+// (testdata/upstream/free-agents.ts, copied from
+// reference/freebuff/common/src/constants — the RE-verified installed CLI
+// binary), entry order preserved. Rows upstream retired (laguna-s-2.1,
+// ling-3.0-flash, greg-2-ultra, greg-2-super) are absent: advertising a dead
+// model id in the offline fallback surfaces it via /v1/models and trips
+// upstream 403 free_mode_invalid_agent_model (issue #121). Upstream changes
+// update BOTH the pinned snapshot and this table together; the parity test
+// (TestFallbackParityWithPinnedUpstream) fails on drift.
 var fallbackAgents = []agentModels{
 	{agent: "base2-free", models: []string{
-		"deepseek/deepseek-v4-pro",
-		"deepseek/deepseek-v4-flash",
 		"minimax/minimax-m3",
 		"openai/gpt-5.6-luna",
+		"deepseek/deepseek-v4-pro",
+		"deepseek/deepseek-v4-flash",
 		"mimo/mimo-v2.5",
 	}},
-	{agent: "base2-free-minimax-m3", models: []string{"minimax/minimax-m3"}},
-	{agent: "base2-free-luna", models: []string{"openai/gpt-5.6-luna"}},
 	{agent: "base2-free-deepseek", models: []string{"deepseek/deepseek-v4-pro"}},
 	{agent: "base2-free-deepseek-flash", models: []string{"deepseek/deepseek-v4-flash"}},
 	{agent: "base2-free-mimo", models: []string{"mimo/mimo-v2.5"}},
+	{agent: "base2-free-minimax-m3", models: []string{"minimax/minimax-m3"}},
+	{agent: "base2-free-luna", models: []string{"openai/gpt-5.6-luna"}},
 	{agent: "base2-free-glm", models: []string{"z-ai/glm-5.2"}},
-	{agent: "base2-free-laguna-s-2-1", models: []string{"poolside/laguna-s-2.1"}},
-	{agent: "base2-free-laguna-s-2-1-openrouter", models: []string{"openrouter/poolside/laguna-s-2.1"}},
-	{agent: "base2-free-ling-3-flash", models: []string{"inclusionai/ling-3.0-flash:free"}},
-	{agent: "base2-free-greg-2-ultra", models: []string{"crof/greg-2-ultra"}},
-	{agent: "base2-free-greg-2-super", models: []string{"crof/greg-2-super"}},
+	{agent: "base2-free-kimi-k3-eco", models: []string{"crof/kimi-k3-eco"}},
+	{agent: "base2-free-deepseek-pro-max", models: []string{"deepseek/deepseek-v4-pro-max"}},
+	{agent: "base2-free-deepseek-flash-max", models: []string{"deepseek/deepseek-v4-flash-max"}},
+	{agent: "base2-free-luna-max", models: []string{"openai/gpt-5.6-luna-max"}},
+	{agent: "base2-free-muse-spark", models: []string{"meta/muse-spark-1.2-contributor"}},
 	{agent: "base2-free-fable", models: []string{"anthropic/claude-fable-5"}},
+	{agent: "base2-free-cloud-planner", models: []string{"deepseek/deepseek-v4-flash"}},
+	{agent: "base2-free-cloud-planner-limited", models: []string{"deepseek/deepseek-v4-flash"}},
 	{agent: "file-picker", models: []string{"google/gemini-2.5-flash-lite"}},
-	{agent: "file-picker-max", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
-	{agent: "file-lister", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
-	{agent: "researcher-web", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
-	{agent: "researcher-docs", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
-	{agent: "basher", models: []string{"google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"}},
+	{agent: "file-picker-max", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "file-lister", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "researcher-web", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "researcher-docs", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "browser-use", models: []string{"google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite"}},
+	{agent: "tmux-cli", models: []string{"deepseek/deepseek-v4-flash"}},
+	{agent: "code-reviewer-minimax-m3", models: []string{"minimax/minimax-m3"}},
+	{agent: "code-reviewer-luna", models: []string{"openai/gpt-5.6-luna"}},
+	{agent: "code-reviewer-deepseek", models: []string{"deepseek/deepseek-v4-pro"}},
+	{agent: "code-reviewer-deepseek-flash", models: []string{"deepseek/deepseek-v4-flash"}},
+	{agent: "code-reviewer-mimo", models: []string{"mimo/mimo-v2.5"}},
+	{agent: "code-reviewer-glm", models: []string{"z-ai/glm-5.2"}},
+	{agent: "code-reviewer-fable", models: []string{"anthropic/claude-fable-5"}},
 	{agent: "code-reviewer-lite", models: []string{"deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "mimo/mimo-v2.5"}},
+}
+
+// fallbackRootByModel mirrors upstream FREEBUFF_ROOT_AGENT_ID_BY_MODEL (pinned
+// free-agents.ts): the per-model roots win over first-seen assignment, exactly
+// like a live refresh (parseRootAgentMap + buildModelMapping). Without it the
+// fallback collapses the five base models onto the generic base2-free agent,
+// so a fallback-state request for a second base model would reuse a session
+// admitted for another model and trip upstream session_model_mismatch.
+var fallbackRootByModel = map[string]string{
+	"mimo/mimo-v2.5":                  "base2-free-mimo",
+	"minimax/minimax-m3":              "base2-free-minimax-m3",
+	"openai/gpt-5.6-luna":             "base2-free-luna",
+	"deepseek/deepseek-v4-pro":        "base2-free-deepseek",
+	"deepseek/deepseek-v4-flash":      "base2-free-deepseek-flash",
+	"z-ai/glm-5.2":                    "base2-free-glm",
+	"crof/kimi-k3-eco":                "base2-free-kimi-k3-eco",
+	"anthropic/claude-fable-5":        "base2-free-fable",
+	"meta/muse-spark-1.2-contributor": "base2-free-muse-spark",
 }
 
 // ErrModelNotFound is returned by AgentForModel for models absent from the
@@ -244,9 +278,11 @@ func (r *Registry) LastAttemptedSources() []string {
 
 // LoadFallback replaces the registry state with the hardcoded fallback map,
 // giving an offline-first model list at boot (and after every failed refresh
-// the previous state — initially the fallback — is retained).
+// the previous state — initially the fallback — is retained). The root map is
+// applied exactly like a live refresh, so fallback routing matches live
+// routing model-for-model.
 func (r *Registry) LoadFallback() {
-	modelToAgent, allModels := buildModelMapping(fallbackAgents, map[string]string{})
+	modelToAgent, allModels := buildModelMapping(fallbackAgents, fallbackRootByModel)
 	agents := make([]agentModels, len(fallbackAgents))
 	for i, entry := range fallbackAgents {
 		agents[i] = agentModels{agent: entry.agent, models: slices.Clone(entry.models)}
