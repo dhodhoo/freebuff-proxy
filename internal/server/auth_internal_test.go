@@ -478,7 +478,7 @@ func TestWriteErrorModelIPLimited(t *testing.T) {
 		RetryAfter: 5 * time.Minute,
 		Body:       `{"status":"session_model_mismatch","message":"model z-ai/glm-5.2 is limited on this IP"}`,
 	}
-	status, body := errorResponse(t, err)
+	status, _, body := errorResponse(t, err)
 	if status != http.StatusConflict {
 		t.Errorf("status = %d, want 409", status)
 	}

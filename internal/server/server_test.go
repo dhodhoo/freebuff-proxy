@@ -315,6 +315,56 @@ func TestChatFeedsSpendLedger(t *testing.T) {
 	}
 }
 
+// TestHealthzSpend pins the /healthz spend surface (issue #122): the ledger
+// buckets fed by the chat feeder, the advisory MAX_SPEND_PER_DAY ceiling
+// (SpendLimit), the capped SpendPct, and the SpendLimited refusal counter.
+func TestHealthzSpend(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-s1", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-s1", 1, `"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}`))
+	ts, _ := newTestServerCfg(t, nil, func(c *config.Config) { c.MaxSpendPerDay = 100 }, mock)
+
+	req := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", []byte(req), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	resp, data = doJSON(t, http.MethodGet, ts.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	var out struct {
+		Tokens []struct {
+			Spend24h     int64 `json:"Spend24h"`
+			SpendDay     int64 `json:"SpendDay"`
+			SpendLimit   int64 `json:"SpendLimit"`
+			SpendPct     int   `json:"SpendPct"`
+			SpendLimited int   `json:"SpendLimited"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("healthz is not JSON: %v: %s", err, data)
+	}
+	if len(out.Tokens) != 1 {
+		t.Fatalf("tokens = %d, want 1", len(out.Tokens))
+	}
+	tok := out.Tokens[0]
+	if tok.Spend24h != 13 || tok.SpendDay != 13 {
+		t.Errorf("healthz spend = %d/%d, want 13/13 (usage 11+2)", tok.Spend24h, tok.SpendDay)
+	}
+	if tok.SpendLimit != 100 {
+		t.Errorf("SpendLimit = %d, want 100 (MAX_SPEND_PER_DAY)", tok.SpendLimit)
+	}
+	if tok.SpendPct != 13 {
+		t.Errorf("SpendPct = %d, want 13 (13 of 100)", tok.SpendPct)
+	}
+	if tok.SpendLimited != 0 {
+		t.Errorf("SpendLimited = %d, want 0 (no upstream spend_limited refusals)", tok.SpendLimited)
+	}
+}
+
 func TestWaitingRoom503ThenRetry(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()

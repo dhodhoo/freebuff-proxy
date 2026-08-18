@@ -2668,9 +2668,21 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			"Messages24h":          snap.Messages24h,
 			"DailyLimit":           snap.DailyLimit,
 			"UsagePct":             snap.UsagePct,
-			"RiskLevel":            snap.RiskLevel,
-			"tier":                 snap.TierAccess,
-			"country":              snap.CountryCode,
+			// Spend ledger (issue #87/#122): Pacific-day/week/month buckets
+			// plus the advisory MAX_SPEND_PER_DAY ceiling (SpendLimit/
+			// SpendPct, informational — the upstream $ ceilings are
+			// server-enforced) and the spend_limited refusal counter.
+			"Spend24h":      snap.Spend24h,
+			"SpendDay":      snap.SpendDay,
+			"SpendWeek":     snap.SpendWeek,
+			"SpendMonth":    snap.SpendMonth,
+			"SpendDayStart": snap.SpendDayStart,
+			"SpendLimit":    snap.SpendLimit,
+			"SpendPct":      snap.SpendPct,
+			"SpendLimited":  snap.SpendLimited,
+			"RiskLevel":     snap.RiskLevel,
+			"tier":          snap.TierAccess,
+			"country":       snap.CountryCode,
 		}
 		if len(snap.QuotaByModel) > 0 {
 			quota := make(map[string]any, len(snap.QuotaByModel))

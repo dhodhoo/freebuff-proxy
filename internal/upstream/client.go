@@ -2098,7 +2098,6 @@ func classifyError(status int, body string, hdr http.Header) error {
 		// session slot. The server marks the refusal and the pool registry
 		// cools the (egress, model) pairing instead.
 		return &LimitedIpError{RetryAfter: retryAfter, Body: truncate(body, 200)}
-	case containsAny(lower, "freebuff_update_required", "session_superseded",
 	case containsAny(lower, "session_superseded"):
 		// #119: 409 session_superseded is a TERMINAL gate rejection
 		// (endsTheSession:true — another instance took over the account;

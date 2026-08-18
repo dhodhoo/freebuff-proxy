@@ -51,6 +51,7 @@ type Config struct {
 	LogFile               string
 	LogLevel              string            // "" (use -v/default) or debug|info|warn|error
 	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
+	MaxSpendPerDay        int64             // 0 = unlimited: ADVISORY per-token Pacific-day spend ceiling in ledger units (tokens from upstream usage blocks; issue #122). Never blocks — the upstream $ ceilings ($15 full / $5 limited / $0.50 restricted, compose by minimum, server-enforced) are the real gate. Surfaced as SpendLimit/SpendPct on /healthz so operator comparisons align with the Pacific-midnight reset.
 	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
 	SafeMode              bool              // true = apply recommended anti-ban safe defaults
 	HybridMode            bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
@@ -184,6 +185,7 @@ type rawConfig struct {
 	LogFile                          string `json:"LOG_FILE"`
 	LogLevel                         string `json:"LOG_LEVEL"`
 	MaxMessagesPerDay                *int   `json:"MAX_MESSAGES_PER_DAY"`
+	MaxSpendPerDay                   *int   `json:"MAX_SPEND_PER_DAY"`
 	IdleRotationTimeout              string `json:"IDLE_ROTATION_TIMEOUT"`
 	SafeMode                         bool   `json:"SAFE_MODE"`
 	HybridMode                       bool   `json:"HYBRID_MODE"`
@@ -221,6 +223,7 @@ func defaultRawConfig() rawConfig {
 		RegistryRefresh:                  "6h",
 		CostMode:                         "free", // free-tier mode; omission routes requests as PAID and fresh free accounts get 402 "Out of credits" (upstream check: cost_mode !== 'free' → billing)
 		MaxMessagesPerDay:                nil,
+		MaxSpendPerDay:                   nil,   // 0 = unlimited advisory spend ceiling (never enforced)
 		IdleRotationTimeout:              "",    // "" = disabled (unset → SAFE_MODE preset may fill)
 		SafeMode:                         true,  // anti-ban presets on by default; set SAFE_MODE=false to disable
 		HybridMode:                       false, // relay client tokens AND serve the pool (off by default)
@@ -377,6 +380,7 @@ func Load(configPath string) (Config, error) {
 	overrideString(&raw.LogFile, "LOG_FILE")
 	overrideString(&raw.LogLevel, "LOG_LEVEL")
 	overrideInt(&raw.MaxMessagesPerDay, "MAX_MESSAGES_PER_DAY")
+	overrideInt(&raw.MaxSpendPerDay, "MAX_SPEND_PER_DAY")
 	overrideString(&raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
 	overrideBool(&raw.SafeMode, "SAFE_MODE")
 	overrideBool(&raw.HybridMode, "HYBRID_MODE")
@@ -521,6 +525,16 @@ func Load(configPath string) (Config, error) {
 		maxMessagesPerDay = *raw.MaxMessagesPerDay
 	}
 
+	// MAX_SPEND_PER_DAY (issue #122): advisory per-token Pacific-day spend
+	// ceiling in ledger units, default 0 (unlimited). Deliberately NOT
+	// enforced — the upstream $ ceilings are server-side and the proxy
+	// cannot know the account's restricted cohort; surfaced as
+	// SpendLimit/SpendPct on /healthz.
+	maxSpendPerDay := int64(0)
+	if raw.MaxSpendPerDay != nil {
+		maxSpendPerDay = int64(*raw.MaxSpendPerDay)
+	}
+
 	// TRANSIENT_RETRIES: nil defaults to 1 (one additional attempt after a
 	// transient transport failure); an explicit 0 disables retries.
 	transientRetries := 1
@@ -591,6 +605,7 @@ func Load(configPath string) (Config, error) {
 		LogFile:                          strings.TrimSpace(raw.LogFile),
 		LogLevel:                         strings.TrimSpace(raw.LogLevel),
 		MaxMessagesPerDay:                maxMessagesPerDay,
+		MaxSpendPerDay:                   maxSpendPerDay,
 		IdleRotationTimeout:              idleRotationTimeout,
 		SafeMode:                         raw.SafeMode,
 		HybridMode:                       raw.HybridMode,
@@ -741,6 +756,8 @@ func (c Config) Validate() error {
 		return errors.New(`COST_MODE must be "free" or unset -- any other value (e.g. a typo) routes requests as PAID and fresh free accounts get 402 "Out of credits"`)
 	case c.MaxMessagesPerDay < 0:
 		return errors.New("MAX_MESSAGES_PER_DAY cannot be negative")
+	case c.MaxSpendPerDay < 0:
+		return errors.New("MAX_SPEND_PER_DAY cannot be negative")
 	}
 
 	if c.WebhookURL != "" {
@@ -904,6 +921,7 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideStringFrom(&raw.LogFile, get, "LOG_FILE")
 	overrideStringFrom(&raw.LogLevel, get, "LOG_LEVEL")
 	overrideIntFrom(&raw.MaxMessagesPerDay, get, "MAX_MESSAGES_PER_DAY")
+	overrideIntFrom(&raw.MaxSpendPerDay, get, "MAX_SPEND_PER_DAY")
 	overrideStringFrom(&raw.IdleRotationTimeout, get, "IDLE_ROTATION_TIMEOUT")
 	// The remaining keys mirror the real-environment override set in Load.
 	// AUTO_DISCOVER_TOKEN is intentionally env-only (it controls the .env

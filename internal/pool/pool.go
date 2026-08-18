@@ -147,10 +147,10 @@ type TokenSnapshot struct {
 	UsagePct             int    // percentage of daily limit used (0 when unlimited)
 	RiskLevel            string // "low", "moderate", "high", "critical" account safety indicator (#6)
 	// Spend24h / SpendDay / SpendWeek / SpendMonth are the local per-token
-	// spend ledger (issue #87): tokens spent in the rolling 24h window, the
-	// Pacific-midnight day bucket (issue #122) and the UTC week/month
-	// buckets (with rollover). Fed by pool.RecordSpend from chat usage
-	// blocks; surfaced next to Messages24h.
+	// spend ledger (issue #87/#122): tokens spent in the rolling 24h window
+	// and the current Pacific day/week/month buckets (with rollover —
+	// boundaries are America/Los_Angeles wall-clock, DST-correct). Fed by
+	// pool.RecordSpend from chat usage blocks; surfaced next to Messages24h.
 	Spend24h        int64
 	SpendDay        int64
 	SpendWeek       int64
@@ -158,6 +158,16 @@ type TokenSnapshot struct {
 	SpendDayStart   time.Time
 	SpendWeekStart  time.Time
 	SpendMonthStart time.Time
+	// SpendLimit is the configured MAX_SPEND_PER_DAY ADVISORY ceiling in
+	// ledger units (0 = unlimited). Never enforced: the upstream $ ceilings
+	// ($15 full / $5 limited / $0.50 restricted, server-enforced, issue
+	// #122) are the real gate and the proxy cannot know the account's
+	// restricted cohort. SpendPct is the Pacific-day bucket's percentage of
+	// SpendLimit (0 when unlimited). SpendLimited counts upstream
+	// spend_limited refusals observed for this token since process start.
+	SpendLimit   int64
+	SpendPct     int
+	SpendLimited int
 	// TierAccess / CountryCode / CountryBlockReason are the token's last
 	// known upstream session tier and region-block state. CountryBlockReason
 	// is non-empty when the account (or its egress region) is blocked;
@@ -664,6 +674,15 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			if rle := asRateLimit(err); rle != nil {
 				tok.runs.CooldownRateLimit(rle)
 				rateLimited = append(rateLimited, rle)
+				// Issue #122: the fresh-admission spend ceiling is the
+				// upstream's primary spend gate, so an admission-path
+				// spend_limited counts on the ledger too (same counter as
+				// the chat-path refusal in CooldownTokenRateLimit).
+				if rle.Status == "spend_limited" {
+					p.spendMu.Lock()
+					p.recordSpendLimited(idx)
+					p.spendMu.Unlock()
+				}
 			}
 			if ice := asIpCapped(err); ice != nil {
 				tok.runs.CooldownIpCapped(ice)
@@ -721,6 +740,13 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			if rle := asRateLimit(err); rle != nil {
 				tok.runs.CooldownRateLimit(rle)
 				rateLimited = append(rateLimited, rle)
+				// Issue #122: count run-start spend_limited refusals on the
+				// ledger (same counter as the chat-path refusal).
+				if rle.Status == "spend_limited" {
+					p.spendMu.Lock()
+					p.recordSpendLimited(idx)
+					p.spendMu.Unlock()
+				}
 			}
 			if ice := asIpCapped(err); ice != nil {
 				tok.runs.CooldownIpCapped(ice)
@@ -1047,6 +1073,14 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		}
 		if rle := asRateLimit(err); rle != nil {
 			entry.runs.CooldownRateLimit(rle)
+			// Issue #122: count admission-path spend_limited refusals on
+			// the bridge entry's ledger (same counter as the chat-path
+			// refusal in CooldownBridgeRateLimit).
+			if rle.Status == "spend_limited" {
+				p.bridgeMu.Lock()
+				p.bridgeRecordSpendLimited(entry)
+				p.bridgeMu.Unlock()
+			}
 		}
 		if ice := asIpCapped(err); ice != nil {
 			entry.runs.CooldownIpCapped(ice)
@@ -1071,6 +1105,13 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		}
 		if rle := asRateLimit(err); rle != nil {
 			entry.runs.CooldownRateLimit(rle)
+			// Issue #122: count run-start spend_limited refusals on the
+			// bridge entry's ledger (same counter as the chat-path refusal).
+			if rle.Status == "spend_limited" {
+				p.bridgeMu.Lock()
+				p.bridgeRecordSpendLimited(entry)
+				p.bridgeMu.Unlock()
+			}
 		}
 		if ice := asIpCapped(err); ice != nil {
 			entry.runs.CooldownIpCapped(ice)
@@ -1311,13 +1352,20 @@ func (p *Pool) CooldownToken(token int, d time.Duration) {
 
 // CooldownTokenRateLimit applies a rate-limit cooldown to token
 // (remembered so Acquire surfaces 429 + Retry-After during the window).
-// Out-of-range tokens are ignored.
+// Out-of-range tokens are ignored. When the refusal is spend_limited
+// (issue #122), the event is also counted on the token's spend ledger —
+// the $ ceiling is server-enforced, so the ledger only records the event.
 func (p *Pool) CooldownTokenRateLimit(token int, rle *upstream.RateLimitError) {
 	toks := p.toks.Load()
 	if token < 0 || token >= len(*toks) || rle == nil {
 		return
 	}
 	(*toks)[token].runs.CooldownRateLimit(rle)
+	if rle.Status == "spend_limited" {
+		p.spendMu.Lock()
+		p.recordSpendLimited(token)
+		p.spendMu.Unlock()
+	}
 }
 
 // CooldownTokenIpCapped applies an ip_capped cooldown to token via
@@ -1385,12 +1433,20 @@ func (p *Pool) CooldownBridge(lease *Lease, d time.Duration) {
 }
 
 // CooldownBridgeRateLimit applies a rate-limit cooldown to the bridge entry
-// (remembered so AcquireBridge surfaces 429 + Retry-After).
+// (remembered so AcquireBridge surfaces 429 + Retry-After). When the refusal
+// is spend_limited (issue #122), the event is also counted on the entry's
+// spend ledger — the $ ceiling is server-enforced, so the ledger only
+// records the event.
 func (p *Pool) CooldownBridgeRateLimit(lease *Lease, rle *upstream.RateLimitError) {
 	if lease == nil || lease.Bridge == nil || rle == nil {
 		return
 	}
 	lease.Bridge.runs.CooldownRateLimit(rle)
+	if rle.Status == "spend_limited" {
+		p.bridgeMu.Lock()
+		p.bridgeRecordSpendLimited(lease.Bridge)
+		p.bridgeMu.Unlock()
+	}
 }
 
 // CooldownBridgeIpCapped applies an ip_capped cooldown to the bridge entry
@@ -1558,6 +1614,7 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 	toks := p.toks.Load()
 	out := make([]TokenSnapshot, 0, len(*toks))
 	dailyLimit := p.cfg.Load().MaxMessagesPerDay
+	spendLimit := p.cfg.Load().MaxSpendPerDay
 	for i, tok := range *toks {
 		rs := tok.runs.Snapshot()
 		ss := tok.session.Snapshot()
@@ -1608,6 +1665,17 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 
 		spend := p.spendSnapshot(i)
 
+		// Advisory spend ceiling (issue #122): the Pacific-day bucket vs
+		// MAX_SPEND_PER_DAY, capped at 100% like UsagePct. Informational only —
+		// the upstream $ ceilings are server-enforced.
+		spendPct := 0
+		if spendLimit > 0 {
+			spendPct = int((spend.Day * 100) / spendLimit)
+			if spendPct > 100 {
+				spendPct = 100
+			}
+		}
+
 		out = append(out, TokenSnapshot{
 			Token:                   i,
 			CooldownUntil:           rs.CooldownUntil,
@@ -1637,6 +1705,9 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 			SpendDayStart:           spend.DayStart,
 			SpendWeekStart:          spend.WeekStart,
 			SpendMonthStart:         spend.MonthStart,
+			SpendLimit:              spendLimit,
+			SpendPct:                spendPct,
+			SpendLimited:            spend.SpendLimited,
 		})
 	}
 	return out
