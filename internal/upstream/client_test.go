@@ -3564,3 +3564,53 @@ func TestDeviceOSWireContract(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyLoadSheddingAndPeakHours pins issue #133: 429 bodies with the
+// load-saturation and peak-hours markers classify as bounded cooldowns with
+// distinct statuses — never the Pacific-midnight lock parseRateLimit would
+// apply to a no-timestamp 429.
+func TestClassifyLoadSheddingAndPeakHours(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantStatus  string
+		wantCooldwn time.Duration
+	}{
+		{"load saturation", `{"status":"insufficient_quota","message":"The current group's upstream load is saturated, please try again later (request id: 42)"}`, "load_shedding", LoadShedCooldown},
+		{"limit burst rate", `{"status":"limit_burst_rate","message":"upstream load saturated, try again later"}`, "load_shedding", LoadShedCooldown},
+		{"peak hours", `{"status":"rate_limited","message":"Usage is temporarily limited during peak hours, when upstream model prices double"}`, "peak_hours", PeakHoursCooldown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := classifyError(http.StatusTooManyRequests, tt.body, http.Header{})
+			var rle *RateLimitError
+			if !errors.As(err, &rle) {
+				t.Fatalf("classifyError = %T %v, want *RateLimitError", err, err)
+			}
+			if rle.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q", rle.Status, tt.wantStatus)
+			}
+			if rle.RetryAfter != tt.wantCooldwn {
+				t.Errorf("RetryAfter = %v, want %v (bounded, not midnight)", rle.RetryAfter, tt.wantCooldwn)
+			}
+			if !rle.ResetAt.IsZero() {
+				t.Errorf("ResetAt = %v, want zero (no Pacific-midnight lock)", rle.ResetAt)
+			}
+		})
+	}
+
+	// The daily-cap path is untouched: a plain rate_limited 429 without the
+	// markers still goes through parseRateLimit's midnight default.
+	err := classifyError(http.StatusTooManyRequests, `{"status":"rate_limited","message":"daily quota"}`+`
+`, http.Header{})
+	var rle *RateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("plain 429 = %T %v, want *RateLimitError", err, err)
+	}
+	if rle.Status != "" && rle.Status == "load_shedding" {
+		t.Error("plain 429 misclassified as load_shedding")
+	}
+	if rle.ResetAt.IsZero() {
+		t.Error("plain no-timestamp 429 lost the Pacific-midnight lock")
+	}
+}

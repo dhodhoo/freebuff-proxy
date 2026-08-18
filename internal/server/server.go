@@ -1989,7 +1989,7 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 		up, lease, err = s.chatAttempt(ctx, model, normalized,
 			acquire,
 			s.pool.Chat,
-			func(l *pool.Lease) { s.pool.InvalidateSession(l.Token) },
+			func(l *pool.Lease) { s.pool.InvalidateSession(l.Token, l.SessionInstanceID) },
 			func(l *pool.Lease, agentID string) { s.pool.InvalidateRun(l.Token, agentID) },
 			func(l *pool.Lease) { s.pool.CooldownToken(l.Token, runs.DefaultCooldown) },
 			func(l *pool.Lease, be *upstream.BanError) { s.pool.CooldownTokenBan(l.Token, be) },
@@ -2981,6 +2981,17 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		}
 	case errors.As(err, &rle):
 		status, code = http.StatusTooManyRequests, "rate_limited"
+		switch rle.Status {
+		case "load_shedding":
+			// #133: upstream load saturation — minutes-scale transient with
+			// a bounded cooldown; surfaced honestly instead of the daily-cap
+			// "rate_limited" hint.
+			code = "load_shedding"
+		case "peak_hours":
+			// #133: upstream peak-hours pricing window — bounded cooldown,
+			// not a quota lock.
+			code = "peak_hours"
+		}
 		message, retryAfter = rle.Error(), rle.RetryAfter
 		if !rle.ResetAt.IsZero() && rle.ResetAt.After(time.Now()) {
 			retryAfter = time.Until(rle.ResetAt)

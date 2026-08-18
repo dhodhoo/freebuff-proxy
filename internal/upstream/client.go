@@ -2150,6 +2150,27 @@ func classifyError(status int, body string, hdr http.Header) error {
 		return fmt.Errorf("%w: %s%s", ErrSessionInvalid, truncate(body, 200), retryDetail(retryAfter))
 	case status == http.StatusBadRequest && containsAny(lower, "runid not found", "runid not running"):
 		return fmt.Errorf("%w: %s", ErrRunInvalid, truncate(body, 200))
+	case status == http.StatusTooManyRequests && containsAny(lower, "insufficient_quota", "limit_burst_rate"):
+		// #133: upstream load saturation ("The current group's upstream
+		// load is saturated, please try again later"). No Retry-After in
+		// the body — parseRateLimit would lock the token until Pacific
+		// midnight on what is a minutes-scale transient. Bounded cooldown,
+		// distinct code, no midnight lock.
+		return &RateLimitError{
+			Status:     "load_shedding",
+			RetryAfter: LoadShedCooldown,
+			Body:       truncate(body, 200),
+		}
+	case status == http.StatusTooManyRequests && containsAny(lower, "peak hours"):
+		// #133: "Usage is temporarily limited during peak hours, when
+		// upstream model prices double…". The peak end is unknowable from
+		// the body: bounded conservative cooldown instead of locking the
+		// token until Pacific midnight (the peak is hours, not a day).
+		return &RateLimitError{
+			Status:     "peak_hours",
+			RetryAfter: PeakHoursCooldown,
+			Body:       truncate(body, 200),
+		}
 	case status == http.StatusTooManyRequests || containsAny(lower, "rate_limited", "spend_limited"):
 		return parseRateLimit(body, parseRetryAfter(hdr))
 	default:
@@ -2292,6 +2313,18 @@ func isCapacityDeferred(err error) bool {
 	var cde *CapacityDeferredError
 	return errors.As(err, &cde)
 }
+
+// LoadShedCooldown bounds a 429 load-saturation refusal (issue #133): the
+// upstream sheds load for minutes, not a day, so the token re-probes after
+// ~90s instead of being locked until Pacific midnight by the no-timestamp
+// parseRateLimit default.
+const LoadShedCooldown = 90 * time.Second
+
+// PeakHoursCooldown bounds a 429 peak-hours refusal (issue #133): the peak
+// window lasts hours and its end is not in the body; 30 minutes is a
+// conservative floor that re-probes long before the daily-cap lock would
+// have lifted.
+const PeakHoursCooldown = 30 * time.Minute
 
 // parseRateLimit builds a RateLimitError from a 429 body, extracting
 // retryAfterMs/resetAt/limit/recentCount best-effort across multiple JSON schemas.

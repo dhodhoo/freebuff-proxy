@@ -526,3 +526,39 @@ func TestWriteErrorBareModelIPLimitedSentinel(t *testing.T) {
 		t.Errorf("Retry-After = %q, want none for bare sentinel", got)
 	}
 }
+
+// TestWriteErrorLoadSheddingAndPeakHours pins issue #133: load-saturation
+// and peak-hours 429s surface with honest codes and bounded Retry-After, so
+// routers show the right hint instead of "daily message cap or rate limit
+// reached".
+func TestWriteErrorLoadSheddingAndPeakHours(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantCode     string
+		wantRetryMin time.Duration
+		wantRetryMax time.Duration
+	}{
+		{"load_shedding", &upstream.RateLimitError{Status: "load_shedding", RetryAfter: upstream.LoadShedCooldown, Body: "load saturated"}, "load_shedding", 60 * time.Second, 120 * time.Second},
+		{"peak_hours", &upstream.RateLimitError{Status: "peak_hours", RetryAfter: upstream.PeakHoursCooldown, Body: "peak hours"}, "peak_hours", 25 * time.Minute, 35 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, _, body := errorResponse(t, tt.err)
+			if status != http.StatusTooManyRequests {
+				t.Errorf("status = %d, want 429", status)
+			}
+			if body.Error.Code != tt.wantCode {
+				t.Errorf("code = %q, want %q", body.Error.Code, tt.wantCode)
+			}
+			s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			s.writeError(w, r, tt.err)
+			got, _ := time.ParseDuration(w.Header().Get("Retry-After") + "s")
+			if got < tt.wantRetryMin || got > tt.wantRetryMax {
+				t.Errorf("Retry-After = %v, want within [%v, %v] (bounded)", got, tt.wantRetryMin, tt.wantRetryMax)
+			}
+		})
+	}
+}

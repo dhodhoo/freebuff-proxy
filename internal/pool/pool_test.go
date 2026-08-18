@@ -98,8 +98,11 @@ func TestRoundRobinDistribution(t *testing.T) {
 	const n = 6
 	got := make([]int, n)
 	for i := 0; i < n; i++ {
-		p.InvalidateSession(0)
-		p.InvalidateSession(1)
+		// Unconditional invalidation (test intent: force the cold path) —
+		// the pool's InvalidateSession is now instance-guarded (#132).
+		toks := p.toks.Load()
+		(*toks)[0].session.Invalidate()
+		(*toks)[1].session.Invalidate()
 		lease, err := p.Acquire(context.Background(), modelA)
 		if err != nil {
 			t.Fatal(err)
@@ -462,7 +465,7 @@ func TestInvalidateSessionRecreates(t *testing.T) {
 		t.Fatalf("session creates = %d, want 1", mock.SessionCreates)
 	}
 
-	p.InvalidateSession(lease.Token)
+	p.InvalidateSession(lease.Token, lease.SessionInstanceID)
 	lease2, err := p.Acquire(context.Background(), modelA)
 	if err != nil {
 		t.Fatal(err)
@@ -476,8 +479,8 @@ func TestInvalidateSessionRecreates(t *testing.T) {
 	}
 
 	// Out-of-range tokens are ignored without panicking.
-	p.InvalidateSession(-1)
-	p.InvalidateSession(99)
+	p.InvalidateSession(-1, "")
+	p.InvalidateSession(99, "")
 }
 
 func TestInvalidateRunRestarts(t *testing.T) {
@@ -1332,8 +1335,8 @@ func TestPoolInvalidateToken(t *testing.T) {
 	defer mock.Close()
 	p := newTestPool(t, mock)
 
-	p.InvalidateSession(0)
-	p.InvalidateSession(999) // out of range safe
+	p.InvalidateSession(0, "")
+	p.InvalidateSession(999, "") // out of range safe
 	p.InvalidateRun(0, "base2-free")
 	p.InvalidateRun(999, "base2-free") // out of range safe
 	p.CooldownToken(0, 5*time.Minute)
