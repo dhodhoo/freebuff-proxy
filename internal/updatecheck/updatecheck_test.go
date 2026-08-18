@@ -104,6 +104,39 @@ func TestLatestFetchFailureReturnsprev(t *testing.T) {
 	}
 }
 
+// TestLatestFirstFetchFailureBacksOffForTTL verifies that a failed first
+// fetch still starts the CacheTTL backoff window: the attempt is stamped
+// fetched (see the review-P2 comment in Latest), so a second call well
+// inside CacheTTL must reuse the recorded failure window instead of
+// hitting the network again.
+func TestLatestFirstFetchFailureBacksOffForTTL(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+	tr := &rewriteTransport{target: srv.URL}
+	c := New(DefaultRepo, &http.Client{Transport: tr, Timeout: fetchTimeout})
+
+	if latest, err := c.Latest(context.Background()); latest != "" || err == nil {
+		t.Fatalf("first Latest = %q, %v; want empty + error", latest, err)
+	}
+	if hits != 1 {
+		t.Fatalf("network hits after first call = %d, want 1", hits)
+	}
+
+	// Second call, immediately (well inside CacheTTL): must NOT re-fetch,
+	// and the backoff hit surfaces as an empty tag with no error.
+	latest2, err2 := c.Latest(context.Background())
+	if latest2 != "" || err2 != nil {
+		t.Errorf("second Latest = %q, %v; want empty tag + nil error (backoff hit)", latest2, err2)
+	}
+	if hits != 1 {
+		t.Errorf("network hits after second call = %d, want 1 (first-ever failure must back off for CacheTTL)", hits)
+	}
+}
+
 // rewriteTransport sends every request to target (a test seam: the checker
 // hardcodes the github.com URL, which tests must not contact).
 type rewriteTransport struct {

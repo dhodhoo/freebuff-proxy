@@ -2,8 +2,10 @@
 // (issue #50b): a cached lookup of the latest GitHub release tag for the
 // repo, plus a semver-ish comparison against the running version. The
 // lookup is deliberately non-blocking for the dashboard — the first render
-// after a 6h cache expiry performs one bounded HTTP GET (3s timeout); a
-// failure degrades to "no update" and is retried on the next render.
+// after a 6h cache expiry (or after a failed attempt's backoff window)
+// performs one bounded HTTP GET (3s timeout); a failure degrades to
+// "no update" and backs off for the same 6h window instead of retrying on
+// every render.
 package updatecheck
 
 import (
@@ -51,12 +53,14 @@ func New(repo string, client *http.Client) *Checker {
 }
 
 // Latest returns the latest release tag (e.g. "v0.9.3") from the in-memory
-// cache, fetching it when the cache is empty or older than CacheTTL. A
-// fetch failure returns the previously cached tag (or "") with the error.
-// The cache is refreshed single-flight so concurrent renders share one GET.
+// cache, fetching it when the last attempt — successful or failed — is
+// older than CacheTTL. A fetch failure returns the previously cached tag
+// (or "") with the error and still records the attempt, so subsequent
+// calls back off for CacheTTL instead of re-fetching. The cache is
+// refreshed single-flight so concurrent renders share one GET.
 func (c *Checker) Latest(ctx context.Context) (string, error) {
 	c.mu.Lock()
-	if c.latest != "" && time.Since(c.fetched) < CacheTTL {
+	if time.Since(c.fetched) < CacheTTL {
 		tag := c.latest
 		c.mu.Unlock()
 		return tag, nil
@@ -92,10 +96,10 @@ func (c *Checker) Latest(ctx context.Context) (string, error) {
 		c.latest = tag
 		c.fetched = time.Now()
 	} else {
-		// Keep the previous value (retry on the next render). A first-ever
-		// failure also stamps fetched so the dashboard's frequent polls back
-		// off for CacheTTL instead of hammering api.github.com on every
-		// render (review P2).
+		// Keep the previous value and stamp the attempt: the CacheTTL window
+		// now also covers failed lookups (first-ever failure included), so
+		// the dashboard's frequent polls back off instead of hammering
+		// api.github.com on every render (review P2).
 		c.fetched = time.Now()
 	}
 	got := c.latest
