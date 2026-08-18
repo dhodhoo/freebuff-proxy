@@ -283,6 +283,8 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `ADOPT_CLI_SESSION` | `false` | Adopt the upstream CLI's active session instead of creating a new one |
 | `WAITING_ROOM_CHAIN` | `false` | Chain queued waiting-room requests across tokens instead of erroring |
 | `WEBHOOK_URL` | `""` | Notify this URL when a run finishes (POST) |
+| `RATE_LIMIT_PER_IP` | `0` | Requests/second allowed per client IP (`0` = disabled; e.g. `20`) |
+| `RATE_LIMIT_BURST` | `0` | Burst request capacity per client IP (`0` = default `2 * RATE_LIMIT_PER_IP`) |
 
 When `SESSION_PERSIST=true`, the state file stores a SHA-256 hash of each
 active token plus its session metadata (instance id, expiry, tier/country)
@@ -322,19 +324,19 @@ opt out). It enables essential anti-ban protections and presets:
   account mints. The pool already drains keys one at a time; do not add aggressive rotation
   on top.
 - **Only request models your account's tier and region actually offers.** Out-of-tier picks
-  are silently downgraded to `deepseek/deepseek-v4-flash` or refused (`model_unavailable`,
-  `session_model_mismatch`). The requested model id is correlated with the egress IP's
-  resolved geo, so a premium model request from a VPN/hosting IP is a suspicious,
-  ToS-prohibited combination.
+  are refused or downgraded (`model_unavailable`, `session_model_mismatch`).
+  The requested model id is correlated with the egress IP's resolved geo, so a premium model request
+  from a VPN/hosting IP is a suspicious, ToS-prohibited combination. On limited-tier accounts,
+  `mimo/mimo-v2.5` is the supported active model (`deepseek/deepseek-v4-flash` is restricted on limited tier).
 - **Know the difference between a quota and a ban.** `429` (quota, resets at
   Pacific midnight) is the normal end-of-day signal; the proxy locks the token locally and
   answers in `<1ms`, and routers fail over. `503` with `waiting_room` is the queued-waiting-room
   signal (also transient). Only `403` with `banned` / `country_blocked`
   means the account itself is gone: stop using it and move to a fresh established account.
-- **For ~24h of continuous coding, budget 4-5 keys.** Each FreeBuff account has a daily
-  session quota (≈6 sessions on the limited tier, ≈5 premium sessions/day). One key ≈ one
-  day of moderate use. Configure `AUTH_TOKENS` with as many keys as you need and let the
-  pool drain them one at a time.
+- **For ~24h of continuous coding, budget 4-5 keys.** Each FreeBuff account has a concurrent
+  session quota (up to 5 concurrent sessions on premium tier, 3 on limited tier).
+  One key ≈ one day of moderate use. Configure `AUTH_TOKENS` with multiple tokens to pool session
+  headroom across tokens and let the proxy drain them one at a time.
 - **Register accounts with real email addresses** (e.g. Gmail). Disposable / temp-mail
   registrations are a documented ban cohort: 6,699 of 7,129 accounts on flagged domains were
   already banned when the blocklist was compiled. Accounts sharing one mailbox are capped at
@@ -355,7 +357,7 @@ opt out). It enables essential anti-ban protections and presets:
 | Endpoint | Auth | Description |
 |---|---|---|
 | `POST /v1/chat/completions` | `API_KEYS` (when set) | OpenAI-compatible chat, streaming and non-streaming |
-| `GET /v1/models` | `API_KEYS` (when set) | Model catalog from the registry (fallback at boot + live refresh). Each row carries `available`/`status`/`current_access_tier`: models outside the limited-tier allowlist (`deepseek-v4-flash`, `mimo-v2.5`) are marked `available:false, status:"region_limited"` when the token's egress region demotes it to the limited tier; `MODELS_HIDE_UNAVAILABLE=true` prunes them from the list |
+| `GET /v1/models` | `API_KEYS` (when set) | Model catalog from the registry (fallback at boot + live refresh). Each row carries `available`/`status`/`current_access_tier`: models outside the limited-tier allowlist (`mimo-v2.5`) are marked `available:false, status:"region_limited"` when the token's egress region demotes it to the limited tier; `MODELS_HIDE_UNAVAILABLE=true` prunes them from the list |
 | `GET /healthz` | none | JSON: `status`, `uptime_seconds`, `models`, per-token snapshot (incl. per-model `quota` map when the last admission carried it), `bridge_tokens` |
 | `GET /metrics` | none | Prometheus text format: uptime, model count, per-token 24h messages / requests / active runs / cooldown, per-model quota (`freebuff_proxy_quota_recent` / `freebuff_proxy_quota_limit`) |
 | `POST /admin/reload` | `ADMIN_TOKEN` (when set) | Hot-reload configuration from disk without restart |

@@ -37,7 +37,7 @@ Using this proxy conflicts with Codebuff's terms of service. Upstream abuse dete
 |---|---|
 | **Keep `SAFE_MODE=true`** (default; anti-ban stealth: TLS fingerprint, header sanitization, request jitter, idle rotation) | **Don't** run 24/7 on heavy unattended automated tasks |
 | Use a **normal residential connection** | **Don't use a VPN / proxy / Tor**. Hard-block signal: limited tier or terminal `country_blocked`, restricted cohorts get a $0.50/day spend ceiling (≈1 session/day) |
-| Request **only models your tier/region offers** | **Don't request out-of-region models**: refused or silently downgraded to `deepseek/deepseek-v4-flash`, and the model id is correlated with your egress IP's region |
+| Request **only models your tier/region offers** | **Don't request out-of-region models**: refused or downgraded, and the model id is correlated with your egress IP's region. On limited-tier accounts, use `mimo/mimo-v2.5` |
 | Keep **one modest account** | **Don't create spam clusters**: upstream caps distinct active sessions per egress IP (`ip_capped`); accounts from the same signup network (≥8 per /24) or mailbox (≥3) are permanently capped at lower trust levels |
 | **Use one key until it is rate-limited** | **Don't rotate several healthy keys aggressively** (farming signal) |
 | Register with a **real email address** (e.g. Gmail) | **Don't use temp-mail**. Documented ban cohort: 6,699 of 7,129 accounts on flagged domains already banned |

@@ -81,9 +81,9 @@ In the 9router provider node, you can add any of these models from the proxy cat
 
 | Model ID in 9router | Description | Access Tier |
 | :--- | :--- | :--- |
-| `deepseek/deepseek-v4-flash` | **Default recommended model** (fast & resilient) | All regions / tiers |
+| `deepseek/deepseek-v4-flash` | High speed general coding model | Full tier |
 | `deepseek/deepseek-v4-pro` | Deep reasoning coding model | Full tier |
-| `mimo/mimo-v2.5` | Fast lightweight coding model | All regions / tiers |
+| `mimo/mimo-v2.5` | Fast lightweight coding model (supported on limited tier) | All regions / tiers |
 | `openai/gpt-5.6-luna` | Deep reasoning + multimodal | Full tier |
 | `minimax/minimax-m3` | High context window | Full tier |
 | `z-ai/glm-5.2` | Advanced agentic model | Rate limited (5/20h) |

@@ -971,7 +971,7 @@ func TestModelsAnnotationWithQuota(t *testing.T) {
 // TestModelsRegionLimited verifies the tier-aware annotation: with a token in
 // the 'limited' tier (region/privacy demotion), a model outside the limited
 // allowlist with no admission signal is marked available=false +
-// status=region_limited, while an allowlisted model (deepseek-v4-flash) stays
+// status=region_limited, while an allowlisted model (mimo-v2.5) stays
 // available. An admitted model keeps its available status (admission is
 // ground truth).
 func TestModelsRegionLimited(t *testing.T) {
@@ -1012,9 +1012,18 @@ func TestModelsRegionLimited(t *testing.T) {
 			Status    string
 		}{m.Available, m.Status}
 	}
-	// deepseek-v4-flash is on the limited allowlist -> available.
-	if m, ok := byID["deepseek/deepseek-v4-flash"]; !ok || !m.Available {
-		t.Errorf("deepseek-v4-flash = %+v, want available:true on limited tier", m)
+	// mimo/mimo-v2.5 is on the limited allowlist -> available.
+	if m, ok := byID["mimo/mimo-v2.5"]; !ok || !m.Available {
+		t.Errorf("mimo/mimo-v2.5 = %+v, want available:true on limited tier", m)
+	}
+	// deepseek-v4-flash is NOT on the limited allowlist anymore (disabled upstream)
+	// and was never admitted -> available:false + region_limited.
+	if m, ok := byID["deepseek/deepseek-v4-flash"]; !ok {
+		t.Errorf("deepseek-v4-flash missing from /v1/models")
+	} else if m.Available {
+		t.Errorf("deepseek-v4-flash available = true, want false on limited tier")
+	} else if m.Status != "region_limited" {
+		t.Errorf("deepseek-v4-flash status = %q, want region_limited", m.Status)
 	}
 	// anthropic/claude-fable-5 is NOT on the limited allowlist and was never
 	// admitted -> available:false + region_limited.
@@ -1060,16 +1069,19 @@ func TestModelsHideUnavailable(t *testing.T) {
 		if m.ID == "anthropic/claude-fable-5" {
 			t.Errorf("fable-5 present in /v1/models with MODELS_HIDE_UNAVAILABLE=true")
 		}
+		if m.ID == "deepseek/deepseek-v4-flash" {
+			t.Errorf("deepseek-v4-flash present in /v1/models with MODELS_HIDE_UNAVAILABLE=true (disabled on limited tier)")
+		}
 	}
 	found := false
 	for _, m := range out.Data {
-		if m.ID == "deepseek/deepseek-v4-flash" {
+		if m.ID == "mimo/mimo-v2.5" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("deepseek-v4-flash pruned, want kept (limited allowlist)")
+		t.Errorf("mimo/mimo-v2.5 pruned, want kept (limited allowlist)")
 	}
 }
 

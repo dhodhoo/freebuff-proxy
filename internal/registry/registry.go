@@ -64,15 +64,13 @@ const fetchTimeout = 30 * time.Second
 const maxFetchBytes = 2 << 20
 
 // LimitedTierModels is the model set available to 'limited' access-tier
-// accounts (egress region demotion, privacy-signal demotion). Mirrors the
-// upstream LIMITED_FREEBUFF_MODEL_IDS constant
-// (freebuff/common/src/constants/freebuff-models.ts): deepseek-v4-flash +
-// mimo-v2.5. Used to annotate /v1/models availability per token tier.
+// accounts (egress region demotion, privacy-signal demotion). DeepSeek Flash
+// was disabled for limited tier on 2026-08-18 due to upstream provider price
+// increases (mimo-v2.5 remains active for limited tier).
+// Used to annotate /v1/models availability per token tier.
 var LimitedTierModels = map[string]bool{
-	"deepseek/deepseek-v4-flash": true,
-	"mimo/mimo-v2.5":             true,
+	"mimo/mimo-v2.5": true,
 }
-
 // fallbackAgents is the hardcoded model→agent fallback used when the sources
 // are unreachable. It mirrors the CURRENT upstream FREE_MODE_AGENT_MODELS
 // exactly: the rows below are the verbatim parse of the pinned snapshot
