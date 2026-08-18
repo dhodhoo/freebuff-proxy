@@ -177,12 +177,12 @@ func TestRateLimitClassificationLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
-		client.classify(http.StatusTooManyRequests, `{"error":"free_mode_rate_limited","message":"wait 1 minute"}`, http.Header{})
+		_ = client.classify(http.StatusTooManyRequests, `{"error":"free_mode_rate_limited","message":"wait 1 minute"}`, http.Header{})
 	}
-	client.classify(http.StatusTooManyRequests, `{"error":"insufficient_quota","message":"load is saturated"}`, http.Header{})
-	client.classify(http.StatusTooManyRequests, `{"error":"limit_burst_rate","message":"slow down"}`, http.Header{})
-	client.classify(http.StatusTooManyRequests, `{"status":"rate_limited","retryAfterMs":48549499}`, http.Header{})
-	client.classify(http.StatusForbidden, `{"status":"banned"}`, http.Header{}) // NOT a rate-limit event
+	_ = client.classify(http.StatusTooManyRequests, `{"error":"insufficient_quota","message":"load is saturated"}`, http.Header{})
+	_ = client.classify(http.StatusTooManyRequests, `{"error":"limit_burst_rate","message":"slow down"}`, http.Header{})
+	_ = client.classify(http.StatusTooManyRequests, `{"status":"rate_limited","retryAfterMs":48549499}`, http.Header{})
+	_ = client.classify(http.StatusForbidden, `{"status":"banned"}`, http.Header{}) // NOT a rate-limit event
 
 	events := client.RateLimitEvents()
 	want := map[string]int64{

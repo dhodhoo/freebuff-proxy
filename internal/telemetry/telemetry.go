@@ -174,18 +174,30 @@ func (h *textHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
-	clone := *h
-	clone.attrs = append(append([]boundAttrs{}, h.attrs...), boundAttrs{depth: len(h.groups), attrs: attrs})
-	return &clone
+	// Explicit field-wise clone: copying the struct would copy the mutex
+	// (govet copylocks). The clone gets a fresh zero mutex.
+	return &textHandler{
+		level:    h.level,
+		w:        h.w,
+		colorize: h.colorize,
+		file:     h.file,
+		attrs:    append(append([]boundAttrs{}, h.attrs...), boundAttrs{depth: len(h.groups), attrs: attrs}),
+		groups:   append([]string{}, h.groups...),
+	}
 }
 
 func (h *textHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
 	}
-	clone := *h
-	clone.groups = append(append([]string{}, h.groups...), name)
-	return &clone
+	return &textHandler{
+		level:    h.level,
+		w:        h.w,
+		colorize: h.colorize,
+		file:     h.file,
+		attrs:    append([]boundAttrs{}, h.attrs...),
+		groups:   append(append([]string{}, h.groups...), name),
+	}
 }
 
 // collectAttrs returns the record's attrs as a slice.
@@ -274,18 +286,28 @@ func (h *jsonHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {
 		return h
 	}
-	clone := *h
-	clone.attrs = append(append([]boundAttrs{}, h.attrs...), boundAttrs{depth: len(h.groups), attrs: attrs})
-	return &clone
+	// Explicit field-wise clone: copying the struct would copy the mutex
+	// (govet copylocks). The clone gets a fresh zero mutex.
+	return &jsonHandler{
+		level:  h.level,
+		w:      h.w,
+		file:   h.file,
+		attrs:  append(append([]boundAttrs{}, h.attrs...), boundAttrs{depth: len(h.groups), attrs: attrs}),
+		groups: append([]string{}, h.groups...),
+	}
 }
 
 func (h *jsonHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
 	}
-	clone := *h
-	clone.groups = append(append([]string{}, h.groups...), name)
-	return &clone
+	return &jsonHandler{
+		level:  h.level,
+		w:      h.w,
+		file:   h.file,
+		attrs:  append([]boundAttrs{}, h.attrs...),
+		groups: append(append([]string{}, h.groups...), name),
+	}
 }
 
 func (h *jsonHandler) Handle(_ context.Context, r slog.Record) error {
