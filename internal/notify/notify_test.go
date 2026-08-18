@@ -130,13 +130,30 @@ func (failRT) RoundTrip(*http.Request) (*http.Response, error) {
 // TestSendFailureLogsWarn verifies T18: a failed webhook delivery logs a
 // WARN with the err and the target URL — a non-2xx status and a transport
 // error both fire it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (n int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestSendFailureLogsWarn(t *testing.T) {
 	t.Run("non-2xx status", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}))
 		defer srv.Close()
-		var sink bytes.Buffer
+		var sink lockedBuffer
 		s := New(srv.URL, nil)
 		s.SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		s.Send(Event{Event: "token_banned"})
@@ -154,7 +171,7 @@ func TestSendFailureLogsWarn(t *testing.T) {
 	})
 
 	t.Run("transport error", func(t *testing.T) {
-		var sink bytes.Buffer
+		var sink lockedBuffer
 		s := New("https://webhook.invalid/hook", &http.Client{Transport: failRT{}})
 		s.SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelWarn})))
 		s.Send(Event{Event: "pool_exhausted"})
