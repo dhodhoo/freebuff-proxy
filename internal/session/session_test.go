@@ -1301,6 +1301,17 @@ func TestLeaderCancellationDecoupling(t *testing.T) {
 			if count == 1 {
 				close(leaderStartedCh)
 				<-leaderBlockCh
+				// The leader's create must deterministically observe the
+				// cancellation: wait for the request context to be done
+				// before returning, so the mock's response cannot race the
+				// cancel and let the leader "succeed" (a -race timing
+				// flake). A bounded fallback prevents a hang if the cancel
+				// never arrives.
+				select {
+				case <-r.Context().Done():
+					return // canceled: no response, client sees context.Canceled
+				case <-time.After(2 * time.Second):
+				}
 				w.WriteHeader(http.StatusOK)
 				_, _ = io.WriteString(w, `{"status":"active","instanceId":"leader-inst","model":"model/A"}`)
 				return
@@ -1510,11 +1521,11 @@ func TestPreemptiveReAdmitOncePerExpiry(t *testing.T) {
 	}
 	// Let the async create land.
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && mock.SessionCreates < 2 {
+	for time.Now().Before(deadline) && mock.SessionCreatesSnapshot() < 2 {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if mock.SessionCreates != 2 {
-		t.Fatalf("creates after first trigger = %d, want 2 (initial + one re-admit)", mock.SessionCreates)
+	if got := mock.SessionCreatesSnapshot(); got != 2 {
+		t.Fatalf("creates after first trigger = %d, want 2 (initial + one re-admit)", got)
 	}
 
 	// Every further request in the same expiry window must NOT re-trigger.
@@ -1524,8 +1535,8 @@ func TestPreemptiveReAdmitOncePerExpiry(t *testing.T) {
 		}
 	}
 	time.Sleep(200 * time.Millisecond)
-	if mock.SessionCreates != 2 {
-		t.Errorf("creates after 5 rides = %d, want still 2 (once per expiry window)", mock.SessionCreates)
+	if got := mock.SessionCreatesSnapshot(); got != 2 {
+		t.Errorf("creates after 5 rides = %d, want still 2 (once per expiry window)", got)
 	}
 }
 

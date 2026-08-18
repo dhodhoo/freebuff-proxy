@@ -2246,7 +2246,10 @@ func TestChatModelIPLimitedConcurrentRefusals(t *testing.T) {
 	if until, _ := p.ModelUnfit(modelA); until.IsZero() {
 		t.Fatal("unfit not marked after prime")
 	}
-	before := mock.Requests
+	// Let any tail-end upstream activity from the prime's retry flow settle,
+	// then baseline: the entry-guard refusals must add ZERO upstream calls.
+	time.Sleep(300 * time.Millisecond)
+	before := mock.RequestsSnapshot()
 
 	// Now the entry guard fast-refuses; hammer it concurrently. Every
 	// refusal must be 409 and the upstream must see no new calls.
@@ -2273,8 +2276,8 @@ func TestChatModelIPLimitedConcurrentRefusals(t *testing.T) {
 			t.Errorf("request %d status = %d, want 409", i, c)
 		}
 	}
-	if mock.Requests != before {
-		t.Errorf("upstream requests = %d, want %d (prime baseline; guard refusals never reach upstream)", mock.Requests, before)
+	if got := mock.RequestsSnapshot(); got != before {
+		t.Errorf("upstream requests = %d, want %d (prime baseline; guard refusals never reach upstream)", got, before)
 	}
 }
 
