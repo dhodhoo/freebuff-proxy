@@ -739,14 +739,26 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		if cur := p.toks.Load(); idx < 0 || idx >= len(*cur) || (*cur)[idx] != tok {
 			continue
 		}
+		ss := tok.session.Snapshot()
+		effectiveModel := model
+		effectiveAgentID := agentID
+		if ss.Model != "" && ss.Model != model {
+			effectiveModel = ss.Model
+			if p.reg != nil {
+				if resolvedAgent, aerr := p.reg.AgentForModel(effectiveModel); aerr == nil {
+					effectiveAgentID = resolvedAgent
+				}
+			}
+		}
+
 		// Issue #90a: pre-create the run at session admission (best-effort)
 		// so the first chat on a freshly-admitted session does not pay the
 		// START latency. When a run already exists this is a cheap no-op;
 		// when the START fails here the Acquire below retries and surfaces
 		// the real error through the normal failover path.
-		_ = tok.runs.Precreate(ctx, agentID)
+		_ = tok.runs.Precreate(ctx, effectiveAgentID)
 		runStart := time.Now()
-		run, err := tok.runs.Acquire(ctx, agentID)
+		run, err := tok.runs.Acquire(ctx, effectiveAgentID)
 		phasetiming.FromContext(ctx).Since(phasetiming.RunAcquireMS, runStart)
 		if err != nil {
 			if errors.Is(err, upstream.ErrAuthRejected) {
@@ -780,8 +792,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
 			continue
 		}
-		ss := tok.session.Snapshot()
-		p.logger.Debug("pool: lease acquired", "token", idx+1, "model", model, "agent", agentID, "instance_id", instanceID,
+		p.logger.Debug("pool: lease acquired", "token", idx+1, "model", effectiveModel, "agent", effectiveAgentID, "instance_id", instanceID,
 			"tier", ss.TierAccess, "country", ss.TierCountry)
 		// Track the activity and end any idle-maintenance pause: the next
 		// maintain tick resumes rotation/refresh work.
@@ -789,7 +800,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		p.lastActive = time.Now()
 		p.idleFinished = false
 		p.lastActiveMu.Unlock()
-		return &Lease{Token: idx, Model: model, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
+		return &Lease{Token: idx, Model: effectiveModel, AgentID: effectiveAgentID, Run: run, SessionInstanceID: instanceID,
 			TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, entry: tok, AcquiredAt: time.Now()}, nil
 	}
 
@@ -1109,10 +1120,22 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		}
 		return nil, err
 	}
+	ss := entry.session.Snapshot()
+	effectiveModel := model
+	effectiveAgentID := agentID
+	if ss.Model != "" && ss.Model != model {
+		effectiveModel = ss.Model
+		if p.reg != nil {
+			if resolvedAgent, aerr := p.reg.AgentForModel(effectiveModel); aerr == nil {
+				effectiveAgentID = resolvedAgent
+			}
+		}
+	}
+
 	// Issue #90a: pre-create the run at session admission (best-effort).
-	_ = entry.runs.Precreate(ctx, agentID)
+	_ = entry.runs.Precreate(ctx, effectiveAgentID)
 	runStart := time.Now()
-	run, err := entry.runs.Acquire(ctx, agentID)
+	run, err := entry.runs.Acquire(ctx, effectiveAgentID)
 	phasetiming.FromContext(ctx).Since(phasetiming.RunAcquireMS, runStart)
 	if err != nil {
 		if errors.Is(err, upstream.ErrAuthRejected) {
@@ -1141,8 +1164,7 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 		return nil, err
 	}
 
-	ss := entry.session.Snapshot()
-	p.logger.Debug("pool: bridge lease acquired", "model", model, "agent", agentID, "instance_id", instanceID,
+	p.logger.Debug("pool: bridge lease acquired", "model", effectiveModel, "agent", effectiveAgentID, "instance_id", instanceID,
 		"tier", ss.TierAccess, "country", ss.TierCountry)
 	// Track the activity and end any idle-maintenance pause, mirroring
 	// Acquire: without this, IDLE_ROTATION_TIMEOUT was dead config in
@@ -1153,7 +1175,7 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 	p.lastActive = time.Now()
 	p.idleFinished = false
 	p.lastActiveMu.Unlock()
-	return &Lease{Token: -1, Model: model, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
+	return &Lease{Token: -1, Model: effectiveModel, AgentID: effectiveAgentID, Run: run, SessionInstanceID: instanceID,
 		TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, Bridge: entry, AcquiredAt: time.Now()}, nil
 }
 

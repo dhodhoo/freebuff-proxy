@@ -2232,15 +2232,14 @@ func classifyError(status int, body string, hdr http.Header) error {
 		// Client.classify wrapper records the flag so the pool can fire the
 		// gated WAITING_ROOM_CHAIN before the next create.
 		return &WaitingRoomRequiredError{RetryAfter: retryAfter, Detail: truncate(body, 200)}
-	case containsAny(lower, "session_model_mismatch") && containsAny(lower, "limited") && containsAny(lower, "on this"):
-		// The egress IP cannot serve the requested model. The session row is
-		// fine — it stays bound to its admitted model — so this is NOT
-		// session-invalid: invalidating would re-admit and burn a daily
-		// session slot. The server marks the refusal and the pool registry
-		// cools the (egress, model) pairing instead. The verified egress
-		// message is "model <id> is limited on this IP", so "on this"
-		// disambiguates from tier/plan wording ("limited to your current
-		// plan") that must fall through to ErrSessionInvalid below.
+	case containsAny(lower, "session_model_mismatch") && containsAny(lower, "limited"):
+		// The egress IP cannot serve the requested model (e.g. "Limited free
+		// access is only available with DeepSeek V4 Flash or MiMo 2.5." or
+		// "model <id> is limited on this IP"). The session row is fine — it
+		// stays bound to its admitted model — so this is NOT session-invalid:
+		// invalidating would re-admit and burn a daily session slot. The server
+		// marks the refusal and the pool registry cools the (egress, model)
+		// pairing instead.
 		return &LimitedIpError{RetryAfter: retryAfter, Body: truncate(body, 200)}
 	case containsAny(lower, "session_superseded"):
 		// #119: 409 session_superseded is a TERMINAL gate rejection

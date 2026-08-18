@@ -2176,6 +2176,14 @@ func TestClassifyErrorMatrix(t *testing.T) {
 				hdr:       http.Header{"Retry-After": {"120"}},
 				wantRetry: 120 * time.Second,
 			},
+			{
+				name: "production limited free access message",
+				body: `{"error":"session_model_mismatch","message":"Limited free access is only available with DeepSeek V4 Flash or MiMo 2.5."}`,
+			},
+			{
+				name: "status variant with limited free access",
+				body: `{"status":"session_model_mismatch","message":"Limited free access is only available with DeepSeek V4 Flash."}`,
+			},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

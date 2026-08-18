@@ -2578,3 +2578,58 @@ func TestSessionPollSchedule(t *testing.T) {
 		}
 	})
 }
+
+// TestAcquireSyncsAdmittedModel pins the upstream model coercion fix: when the
+// client requests model A (e.g. deepseek/deepseek-v4-flash) but upstream
+// admits the session for model B (e.g. mimo/mimo-v2.5 due to limited tier on
+// that IP/country), Acquire must return a lease with Model=B and AgentID for B
+// so downstream chat and runs stay consistent with the upstream session row.
+func TestAcquireSyncsAdmittedModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-coerced","model":"`+modelB+`"}`)
+	}
+	p := newTestPool(t, mock)
+
+	lease, err := p.Acquire(context.Background(), modelA)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	defer p.LeaseRelease(lease)
+
+	if lease.Model != modelB {
+		t.Errorf("lease.Model = %q, want coerced model %q", lease.Model, modelB)
+	}
+	wantAgent := agentB
+	if lease.AgentID != wantAgent {
+		t.Errorf("lease.AgentID = %q, want %q", lease.AgentID, wantAgent)
+	}
+}
+
+func TestBridgeAcquireSyncsAdmittedModel(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-coerced-bridge","model":"`+modelB+`"}`)
+	}
+	p := newBridgePool(t, mock)
+
+	lease, err := p.AcquireBridge(context.Background(), "test-token", modelA)
+	if err != nil {
+		t.Fatalf("AcquireBridge failed: %v", err)
+	}
+	defer p.LeaseRelease(lease)
+
+	if lease.Model != modelB {
+		t.Errorf("lease.Model = %q, want coerced model %q", lease.Model, modelB)
+	}
+	wantAgent := agentB
+	if lease.AgentID != wantAgent {
+		t.Errorf("lease.AgentID = %q, want %q", lease.AgentID, wantAgent)
+	}
+}
