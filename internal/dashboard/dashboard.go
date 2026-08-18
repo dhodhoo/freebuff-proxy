@@ -185,7 +185,7 @@ func (d *Dashboard) render(w http.ResponseWriter, r *http.Request, content strin
 // Page returns a handler for the named content template, wired to its data.
 func (d *Dashboard) Page(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		d.render(w, r, name, d.dataFor(name))
+		d.render(w, r, name, d.dataFor(name, r))
 	}
 }
 
@@ -215,8 +215,9 @@ func (d *Dashboard) RenderRestricted(w http.ResponseWriter, r *http.Request, msg
 	}
 }
 
-// dataFor resolves the page data for a named content template.
-func (d *Dashboard) dataFor(name string) any {
+// dataFor resolves the page data for a named content template. r carries the
+// query params consumed by the filtered pages (logs).
+func (d *Dashboard) dataFor(name string, r *http.Request) any {
 	switch name {
 	case "overview":
 		return d.overviewData()
@@ -227,7 +228,7 @@ func (d *Dashboard) dataFor(name string) any {
 	case "models":
 		return d.modelsData()
 	case "logs":
-		return d.logsData()
+		return d.logsData(r)
 	case "traces":
 		return d.tracesData()
 	case "setup":
@@ -266,7 +267,15 @@ func (d *Dashboard) playgroundData() playgroundData {
 
 type logsData struct {
 	Enabled bool
-	Entries []logEntry
+	// Level/Msg echo the active filters so the template keeps the controls
+	// in sync when a filtered fragment re-renders (hx-get targets the same
+	// #logs-root region).
+	Level string
+	Msg   string
+	// HasFilter reports whether a filter is active (drives the empty-state
+	// copy: "no matching records" vs "no records yet").
+	HasFilter bool
+	Entries   []logEntry
 }
 
 type logEntry struct {
@@ -276,12 +285,28 @@ type logEntry struct {
 	Fields  string
 }
 
-func (d *Dashboard) logsData() logsData {
+func (d *Dashboard) logsData(r *http.Request) logsData {
 	ld := logsData{Enabled: d.logs != nil}
 	if d.logs == nil {
 		return ld
 	}
+	level := strings.TrimSpace(r.URL.Query().Get("level"))
+	msg := strings.TrimSpace(r.URL.Query().Get("msg"))
+	// Echo the level lowercased so the select's option comparison (exact
+	// match) stays in sync even when the client passes "WARN" or "Info".
+	ld.Level = strings.ToLower(level)
+	ld.Msg = msg
+	ld.HasFilter = level != "" || msg != ""
+	msgLower := strings.ToLower(msg)
 	for _, e := range d.logs.Recent(200) {
+		// level matches exactly (INFO/WARN/... case-insensitive); msg is a
+		// case-insensitive substring of the message.
+		if level != "" && !strings.EqualFold(e.Level, level) {
+			continue
+		}
+		if msg != "" && !strings.Contains(strings.ToLower(e.Message), msgLower) {
+			continue
+		}
 		ld.Entries = append(ld.Entries, logEntry{
 			Time:    e.Time,
 			Level:   e.Level,

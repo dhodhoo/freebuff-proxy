@@ -28,6 +28,11 @@ type Ring struct {
 	next     int // next write position (ring)
 	filled   int // entries written so far (grows to capacity)
 	capacity int
+	// counts tallies every handled record by "level|msg" (level lowercased)
+	// so the /metrics endpoint can export log-event counters without a
+	// second subscription. Ring entries are bounded; counts are not (a full
+	// ring of distinct messages still counts every record).
+	counts map[string]int64
 }
 
 // Handler forwards records to next while retaining the last capacity entries
@@ -47,12 +52,30 @@ func NewHandler(next slog.Handler, capacity int) *Handler {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &Handler{ring: &Ring{buf: make([]Entry, capacity), capacity: capacity}, next: next}
+	return &Handler{ring: &Ring{buf: make([]Entry, capacity), capacity: capacity, counts: make(map[string]int64)}, next: next}
 }
 
 // Recent returns up to n entries, newest first.
 func (h *Handler) Recent(n int) []Entry {
 	return h.ring.recent(n)
+}
+
+// Counts returns a snapshot of the handled-record counters keyed
+// "level|msg" (level lowercased). The snapshot is independent of the ring:
+// mutating the returned map never affects later counts, and concurrent
+// Handle calls are safe.
+func (h *Handler) Counts() map[string]int64 {
+	return h.ring.countsSnapshot()
+}
+
+func (r *Ring) countsSnapshot() map[string]int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]int64, len(r.counts))
+	for k, v := range r.counts {
+		out[k] = v
+	}
+	return out
 }
 
 func (r *Ring) push(timeStr, level, message string, fields []string) {
@@ -63,6 +86,26 @@ func (r *Ring) push(timeStr, level, message string, fields []string) {
 	if r.filled < r.capacity {
 		r.filled++
 	}
+	r.counts[countKey(level, message)]++
+}
+
+// countKey builds the "level|msg" metric key. slog's level tokens are a
+// fixed set, so the common path lowercases without an extra allocation (the
+// key itself is the only per-record allocation, required by the map lookup).
+func countKey(level, message string) string {
+	switch level {
+	case "DEBUG":
+		return "debug|" + message
+	case "INFO":
+		return "info|" + message
+	case "WARN":
+		return "warn|" + message
+	case "ERROR":
+		return "error|" + message
+	}
+	// Custom levels (e.g. telemetry.LevelTrace, which slog renders as
+	// "DEBUG-4") fall through to a general lowercase.
+	return strings.ToLower(level) + "|" + message
 }
 
 func (r *Ring) recent(n int) []Entry {

@@ -1,10 +1,13 @@
 package server_test
 
 import (
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
 
+	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/testutil"
 )
 
@@ -59,5 +62,58 @@ func TestMetricsRateLimitEventsLabelEscaping(t *testing.T) {
 	want := `freebuff_proxy_rate_limit_events_total{token="1",code="weird\"code"} 1`
 	if !strings.Contains(body, want) {
 		t.Errorf("metrics missing escaped label %s in:\n%s", want, body)
+	}
+}
+
+// TestMetricsLogEvents pins T20's metrics surface: handled log records
+// render freebuff_proxy_log_events_total keyed by level|msg (level
+// lowercased), aggregated across the ring.
+func TestMetricsLogEvents(t *testing.T) {
+	ring := logring.NewHandler(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}), 200)
+	logger := slog.New(ring)
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServerWithLogger(t, nil, logger, ring, mock)
+
+	logger.Warn("pool exhausted", "token", "1")
+	logger.Warn("pool exhausted")
+	logger.Info("request handled")
+
+	resp, data := doJSON(t, http.MethodGet, ts.URL+"/metrics", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	body := string(data)
+	for _, want := range []string{
+		"# HELP freebuff_proxy_log_events_total",
+		"# TYPE freebuff_proxy_log_events_total counter",
+		`freebuff_proxy_log_events_total{level="warn",msg="pool exhausted"} 2`,
+		`freebuff_proxy_log_events_total{level="info",msg="request handled"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %s in:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsLogEventsLabelEscaping mirrors TestMetricsLabelEscaping for the
+// msg label: quotes in operator log messages are escaped so the Prometheus
+// text format stays parseable.
+func TestMetricsLogEventsLabelEscaping(t *testing.T) {
+	ring := logring.NewHandler(slog.NewTextHandler(io.Discard, nil), 100)
+	logger := slog.New(ring)
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServerWithLogger(t, nil, logger, ring, mock)
+
+	logger.Error(`upstream said "no"`)
+
+	resp, data := doJSON(t, http.MethodGet, ts.URL+"/metrics", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	want := `freebuff_proxy_log_events_total{level="error",msg="upstream said \"no\""} 1`
+	if !strings.Contains(string(data), want) {
+		t.Errorf("metrics missing escaped label %s in:\n%s", want, data)
 	}
 }

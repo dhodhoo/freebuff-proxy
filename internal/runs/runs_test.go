@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -990,5 +991,192 @@ func TestRunStartedFinishedLogTraceSessionID(t *testing.T) {
 	}
 	if finished[1] != started[1] {
 		t.Errorf("run finished trace_session_id = %q, want the run started value %q", finished[1], started[1])
+	}
+}
+
+// ── Wave 3 W3-A (T14): runs lifecycle telemetry ──────────────────────────
+
+// TestRunFinishedLogCarriesLifecycleAttrs verifies W3-A T14: the "runs: run
+// finished" record carries duration_ms (run lifetime), steps (the run's
+// in-memory recorded step count), and termination ("finish" via the FINISH
+// queue), alongside the existing run_id/requests/trace_session_id fields.
+func TestRunFinishedLogCarriesLifecycleAttrs(t *testing.T) {
+	testutil.UnsetConfigEnv(t)
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, 40*time.Millisecond)
+
+	restore, logged := captureSlogLocked()
+	defer restore()
+
+	first, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.RecordStep(first, "chatcmpl-1")
+	mgr.RecordStep(first, "chatcmpl-2")
+	mgr.Release(first)
+	// Let the run age past the rotation interval: the next acquire rotates
+	// it away and FINISHes it asynchronously through the deferred queue.
+	time.Sleep(60 * time.Millisecond)
+	second, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(second)
+
+	eventually(t, "run finished record", func() bool {
+		return strings.Contains(logged(), "runs: run finished")
+	})
+
+	re := regexp.MustCompile(`runs: run finished[^\n]*duration_ms=([0-9]+) steps=([0-9]+) termination=([a-z]+)`)
+	m := re.FindStringSubmatch(logged())
+	if m == nil {
+		t.Fatalf("run finished record missing lifecycle attrs:\n%s", logged())
+	}
+	if m[3] != "finish" {
+		t.Errorf("termination = %q, want finish (FINISH queue path)", m[3])
+	}
+	if m[2] != "2" {
+		t.Errorf("steps = %s, want 2 (recorded before rotation)", m[2])
+	}
+	duration, err := strconv.Atoi(m[1])
+	if err != nil || duration < 0 {
+		t.Errorf("duration_ms = %q, want a non-negative integer", m[1])
+	}
+}
+
+// TestRunFinishedDropLogsTermination verifies W3-A T14's drop arm: a
+// draining run force-dropped without FINISH (DrainTTL, issue #55) emits the
+// same "runs: run finished" record with termination=drop, while the existing
+// TTL-expired warn keeps its run_id/agent_id/age fields unchanged.
+func TestRunFinishedDropLogsTermination(t *testing.T) {
+	testutil.UnsetConfigEnv(t)
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManagerOpts(t, mock, Options{
+		RotationInterval: time.Hour,
+		DrainTTL:         50 * time.Millisecond,
+	})
+
+	run, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.RecordStep(run, "chatcmpl-1")
+	mgr.Release(run)
+
+	// Age the run past its draining TTL so Maintain's prune pass drops it
+	// without FINISH (mirrors a persistently failing FINISH, issue #55).
+	mgr.mu.Lock()
+	run.drainedAt = time.Now().Add(-time.Hour)
+	mgr.draining = append(mgr.draining, run)
+	mgr.mu.Unlock()
+
+	restore, logged := captureSlogLocked()
+	defer restore()
+	mgr.Maintain(context.Background())
+
+	out := logged()
+	if !strings.Contains(out, "runs: dropping draining run (TTL expired)") {
+		t.Fatalf("expected TTL-expired drop warn:\n%s", out)
+	}
+	// The existing warn keeps its run_id/agent_id/age fields (unchanged).
+	warnRe := regexp.MustCompile(`runs: dropping draining run \(TTL expired\)[^\n]*run_id=run-0001[^\n]*agent_id=agent-alpha[^\n]*age=`)
+	if !warnRe.MatchString(out) {
+		t.Errorf("TTL-expired warn lost its fields:\n%s", out)
+	}
+	dropRe := regexp.MustCompile(`runs: run finished[^\n]*duration_ms=[0-9]+ steps=([0-9]+) termination=drop`)
+	m := dropRe.FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no run finished drop record:\n%s", out)
+	}
+	if m[1] != "1" {
+		t.Errorf("dropped run steps = %s, want 1", m[1])
+	}
+	// Dropped without FINISH: nothing may have reached the upstream.
+	if got := len(nonChildFinished(mock)); got != 0 {
+		t.Errorf("dropped run must not be FINISHed upstream, got %d finished runs", got)
+	}
+}
+
+// TestShutdownAbandonWarnLogsFields verifies W3-A T14: the shutdown drain
+// abandoning WARN logs pending_jobs/runs/key instead of the whole manager
+// struct (a *RunManager dump would leak internal state to the log).
+func TestShutdownAbandonWarnLogsFields(t *testing.T) {
+	testutil.UnsetConfigEnv(t)
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.SetFinishDelay(250 * time.Millisecond)
+	// The rotation sequence STARTs four runs (two per agent); the default
+	// pool holds three ids.
+	mock.RunIDs = append([]string{"run-0001", "run-0002", "run-0003", "run-0004", "run-0005"}, mock.RunIDs...)
+	mgr, _ := newTestManager(t, mock, 40*time.Millisecond)
+
+	// Rotate both agents so the worker is mid-FINISH (slow mock) with a
+	// second FINISH queued when Shutdown's deadline expires.
+	first, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(first)
+	time.Sleep(60 * time.Millisecond)
+	second, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(second)
+	time.Sleep(60 * time.Millisecond)
+	b1, err := mgr.Acquire(context.Background(), agentB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(b1)
+	time.Sleep(60 * time.Millisecond)
+	b2, err := mgr.Acquire(context.Background(), agentB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(b2)
+
+	// The worker is mid-FINISH (250ms slow mock) when Shutdown abandons,
+	// so at least the second rotation's job must still be queued; the
+	// logged values must match what the queue/runs hold at that moment.
+	mgr.mu.Lock()
+	wantPending := len(mgr.finishQueue)
+	wantRuns := len(mgr.runs)
+	mgr.mu.Unlock()
+	if wantPending < 1 {
+		t.Fatalf("setup: queued finish jobs = %d, want >= 1 (worker must be busy)", wantPending)
+	}
+
+	restore, logged := captureSlogLocked()
+	defer restore()
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	mgr.Shutdown(expired)
+
+	out := logged()
+	re := regexp.MustCompile(`runs: finish-queue drain exceeded shutdown deadline; abandoning remaining jobs[^\n]*pending_jobs=([0-9]+) runs=([0-9]+) key=([0-9a-f]+)`)
+	m := re.FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("abandon warn missing pending_jobs/runs/key:\n%s", out)
+	}
+	if m[1] != fmt.Sprint(wantPending) || m[2] != fmt.Sprint(wantRuns) {
+		t.Errorf("abandon warn pending_jobs/runs = %s/%s, want %d/%d", m[1], m[2], wantPending, wantRuns)
+	}
+	if m[3] == "" {
+		t.Error("abandon warn key empty")
+	}
+	if strings.Contains(out, "manager=") {
+		t.Error("abandon warn leaked the manager struct (manager= attr present)")
+	}
+
+	// The worker must still drain and exit so no goroutine outlives the
+	// mock server.
+	select {
+	case <-mgr.finishExited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("finish worker did not exit after shutdown abandon")
 	}
 }

@@ -73,6 +73,10 @@ type Server struct {
 	logger  *slog.Logger
 	started time.Time
 
+	// logs is the optional dashboard log viewer ring (nil = disabled); its
+	// Counts feed freebuff_proxy_log_events_total on /metrics.
+	logs *logring.Handler
+
 	// dash is the embedded admin UI (htmx + vendored assets).
 	dash *dashboard.Dashboard
 	// adminAuth guards the dashboard: a stateless HMAC-signed session cookie
@@ -152,7 +156,7 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath, loginFlows: make(map[string]*loginFlow)}
+	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath, loginFlows: make(map[string]*loginFlow), logs: logs}
 	s.cfg.Store(cfg)
 	// The token estimator shares one o200k_base codec process-wide, so
 	// count_tokens requests never rebuild the vocabulary.
@@ -1842,6 +1846,7 @@ func effectiveConfigKV(cfg *config.Config) map[string]string {
 		"LOG_LEVEL":                             cfg.LogLevel,
 		"LOG_FORMAT":                            cfg.LogFormat,
 		"LOG_ACCESS":                            strconv.FormatBool(cfg.LogAccess),
+		"LOG_RING_SIZE":                         strconv.Itoa(cfg.LogRingSize),
 		"MAX_MESSAGES_PER_DAY":                  strconv.Itoa(cfg.MaxMessagesPerDay),
 		"MAX_SPEND_PER_DAY":                     strconv.FormatInt(cfg.MaxSpendPerDay, 10),
 		"IDLE_ROTATION_TIMEOUT":                 cfg.IdleRotationTimeout.String(),
@@ -3234,6 +3239,24 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sb.WriteString("\n")
+
+	if s.logs != nil {
+		// T20: handled-record counters from the dashboard log ring. The key
+		// is logring's "level|msg" (level lowercased). msg is a free-form
+		// operator message, so the label is escaped like every upstream-
+		// derived label.
+		sb.WriteString("# HELP freebuff_proxy_log_events_total Log records handled per level and message\n")
+		sb.WriteString("# TYPE freebuff_proxy_log_events_total counter\n")
+		for key, n := range s.logs.Counts() {
+			level, msg, ok := strings.Cut(key, "|")
+			if !ok {
+				continue
+			}
+			fmt.Fprintf(&sb, "freebuff_proxy_log_events_total{level=\"%s\",msg=\"%s\"} %d\n",
+				escapeLabelValue(level), escapeLabelValue(msg), n)
+		}
+		sb.WriteString("\n")
+	}
 
 	_, _ = w.Write([]byte(sb.String()))
 }

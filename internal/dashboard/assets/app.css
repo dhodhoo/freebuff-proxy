@@ -515,6 +515,26 @@ textarea[name="content"] {
   margin-bottom: 0.6rem;
 }
 
+.logs-filter {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0 0 0.8rem;
+}
+
+.logs-filter select,
+.logs-filter input {
+  margin: 0;
+  width: auto;
+  flex: 0 1 auto;
+}
+
+.logs-filter input[type="search"] {
+  flex: 1 1 18rem;
+  min-width: 10rem;
+}
+
 .step-card {
   margin-bottom: 1rem;
 }

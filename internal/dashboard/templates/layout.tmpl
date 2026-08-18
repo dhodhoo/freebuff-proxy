@@ -43,7 +43,7 @@
 </main>
 {{if eq .Page "overview"}}<div hx-get="/admin" hx-trigger="every 5s" hx-target="#overview-root" hx-swap="innerHTML" hidden></div>{{end}}
 {{if eq .Page "tokens"}}<div hx-get="/admin/tokens" hx-trigger="every 30s" hx-target="#tokens-root" hx-swap="innerHTML" hidden></div>{{end}}
-{{if eq .Page "logs"}}<div hx-get="/admin/logs" hx-trigger="every 3s" hx-target="#logs-root" hx-swap="innerHTML" hidden></div>{{end}}
+{{if eq .Page "logs"}}<div hx-get="/admin/logs" hx-trigger="every 3s" hx-target="#logs-root" hx-swap="innerHTML" hx-include="#logs-filter" hidden></div>{{end}}
 {{if eq .Page "traces"}}<div hx-get="/admin/traces" hx-trigger="every 3s" hx-target="#traces-root" hx-swap="innerHTML" hidden></div>{{end}}
 {{if eq .Page "metrics"}}<div hx-get="/admin/metrics" hx-trigger="every 5s" hx-target="#metrics-root" hx-swap="innerHTML" hidden></div>{{end}}
 <footer class="container muted">

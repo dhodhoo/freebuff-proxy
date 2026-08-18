@@ -536,7 +536,15 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 	select {
 	case <-waitDone:
 	case <-ctx.Done():
-		slog.Warn("runs: finish-queue drain exceeded shutdown deadline; abandoning remaining jobs", "manager", m)
+		// Report the queue and run counts, never the manager struct itself
+		// (a *RunManager dump would leak internal state to the log).
+		m.mu.Lock()
+		runs := len(m.runs)
+		m.mu.Unlock()
+		slog.Warn("runs: finish-queue drain exceeded shutdown deadline; abandoning remaining jobs",
+			"pending_jobs", len(m.finishQueue),
+			"runs", runs,
+			"key", m.key)
 	}
 	_ = ctx.Err() // lint: ctx is still used by the caller below
 
@@ -1294,6 +1302,25 @@ func (m *RunManager) removeRun(run *Run) {
 	m.store.RemoveRun(m.key, run.AgentID)
 }
 
+// logRunFinished emits a run's terminal lifecycle record (W3-A): every way
+// a run leaves the manager — FINISHed through the deferred queue or
+// force-dropped from the draining list without FINISH — logs the same
+// run-finished event with the run's lifetime (duration_ms, now-StartedAt),
+// its in-memory recorded step count (steps), and the termination path
+// ("finish" via the FINISH queue, "drop" without FINISH). steps is the
+// run's recorded-step snapshot taken under m.mu by the caller: the queue
+// path reuses finishPayload's copy, the drop path reads run.Steps while
+// holding the manager mutex. Takes no lock itself.
+func logRunFinished(run *Run, steps int, termination string) {
+	slog.Debug("runs: run finished",
+		"run_id", run.RunID,
+		"requests", run.Requests,
+		"trace_session_id", run.TraceSessionID,
+		"duration_ms", int(time.Since(run.StartedAt).Milliseconds()),
+		"steps", steps,
+		"termination", termination)
+}
+
 // pruneDrainingLocked bounds the draining list (issue #55): entries stuck
 // past DrainTTL or beyond DrainQueueCap are force-dropped with a warn log —
 // their upstream FINISH is best-effort anyway, and the list must never grow
@@ -1304,6 +1331,7 @@ func (m *RunManager) pruneDrainingLocked() {
 	for _, run := range m.draining {
 		if !run.drainedAt.IsZero() && now.Sub(run.drainedAt) > m.drainTTL {
 			slog.Warn("runs: dropping draining run (TTL expired)", "run_id", run.RunID, "agent_id", run.AgentID, "age", now.Sub(run.drainedAt).Round(time.Second))
+			logRunFinished(run, len(run.Steps), "drop")
 			continue
 		}
 		kept = append(kept, run)
@@ -1314,6 +1342,7 @@ func (m *RunManager) pruneDrainingLocked() {
 		m.draining = append([]*Run(nil), m.draining[:m.drainQueueCap]...)
 		for _, run := range overflow {
 			slog.Warn("runs: dropping draining run (queue cap)", "run_id", run.RunID, "agent_id", run.AgentID)
+			logRunFinished(run, len(run.Steps), "drop")
 		}
 	}
 }
@@ -1359,7 +1388,7 @@ func (m *RunManager) finishIfReadyCtx(ctx context.Context, run *Run) {
 	m.draining = filtered
 	m.mu.Unlock()
 	m.removeRun(run)
-	slog.Debug("runs: run finished", "run_id", run.RunID, "requests", run.Requests, "trace_session_id", run.TraceSessionID)
+	logRunFinished(run, len(steps), "finish")
 }
 
 // ReleaseAbandoned releases run after the downstream client's context was
