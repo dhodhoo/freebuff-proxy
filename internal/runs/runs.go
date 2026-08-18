@@ -1011,9 +1011,12 @@ func (m *RunManager) rotate(ctx context.Context, agentID string) error {
 			m.mu.Unlock()
 			return err
 		}
-		slog.Debug("runs: run started", "agent_id", agentID, "run_id", runID)
+		// Mint the trace session id before logging so the run-started line
+		// and every chat trace of this run share it (T3, D2).
+		traceSessionID := newTraceSessionID()
+		slog.Debug("runs: run started", "agent_id", agentID, "run_id", runID, "trace_session_id", traceSessionID)
 
-		newRun := &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now(), TraceSessionID: newTraceSessionID()}
+		newRun := &Run{AgentID: agentID, RunID: runID, StartedAt: time.Now(), TraceSessionID: traceSessionID}
 		oldRun := m.runs[agentID]
 		m.runs[agentID] = newRun
 		if oldRun != nil {
@@ -1356,7 +1359,7 @@ func (m *RunManager) finishIfReadyCtx(ctx context.Context, run *Run) {
 	m.draining = filtered
 	m.mu.Unlock()
 	m.removeRun(run)
-	slog.Debug("runs: run finished", "run_id", run.RunID, "requests", run.Requests)
+	slog.Debug("runs: run finished", "run_id", run.RunID, "requests", run.Requests, "trace_session_id", run.TraceSessionID)
 }
 
 // ReleaseAbandoned releases run after the downstream client's context was

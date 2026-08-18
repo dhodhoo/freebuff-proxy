@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -916,4 +917,78 @@ func TestTraceSessionIDMintedPerRun(t *testing.T) {
 		t.Errorf("TraceSessionID = %q after rotation, want a fresh id", run3.TraceSessionID)
 	}
 	mgr.Release(run3)
+}
+
+// lockedBuffer is a mutex-guarded bytes.Buffer for captureSlogLocked: the
+// deferred finish worker logs asynchronously while the test reads, so the
+// underlying buffer must not be written concurrently with a read.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *lockedBuffer) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *lockedBuffer) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
+// captureSlogLocked swaps the default slog handler for a locked Debug-level
+// recorder and returns a restore func plus a snapshot of everything logged
+// since capture.
+func captureSlogLocked() (restore func(), logged func() string) {
+	buf := &lockedBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return func() { slog.SetDefault(prev) }, buf.String
+}
+
+// TestRunStartedFinishedLogTraceSessionID verifies T3: the run's
+// trace_session_id (the value threaded into codebuff_metadata) appears on
+// BOTH "runs: run started" and "runs: run finished" with the same value.
+func TestRunStartedFinishedLogTraceSessionID(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, 40*time.Millisecond)
+
+	restore, logged := captureSlogLocked()
+	defer restore()
+
+	first, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(first)
+	// Let the run age past the rotation interval: the next acquire rotates
+	// it away and FINISHes it asynchronously through the deferred queue.
+	time.Sleep(60 * time.Millisecond)
+	second, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.Release(second)
+
+	startedRe := regexp.MustCompile(`runs: run started[^\n]*trace_session_id=([0-9a-f-]+)`)
+	started := startedRe.FindStringSubmatch(logged())
+	if started == nil {
+		t.Fatalf("no run started line with trace_session_id:\n%s", logged())
+	}
+
+	eventually(t, "run finished line", func() bool {
+		return strings.Contains(logged(), "runs: run finished")
+	})
+	finishedRe := regexp.MustCompile(`runs: run finished[^\n]*trace_session_id=([0-9a-f-]+)`)
+	finished := finishedRe.FindStringSubmatch(logged())
+	if finished == nil {
+		t.Fatalf("run finished line missing trace_session_id:\n%s", logged())
+	}
+	if finished[1] != started[1] {
+		t.Errorf("run finished trace_session_id = %q, want the run started value %q", finished[1], started[1])
+	}
 }

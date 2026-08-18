@@ -99,7 +99,7 @@ func main() {
 
 	// Effective log level: LOG_LEVEL config wins, else -v → debug, else info.
 	level := resolveLogLevel(cfg.LogLevel, *verbose)
-	logger := telemetry.New(level, cfg.LogFile)
+	logger := telemetry.New(level, cfg.LogFile, cfg.LogFormat)
 	// The dashboard log viewer reads from an in-memory ring that mirrors
 	// every record the process logger emits (no log file or docker needed).
 	logringHandler := logring.NewHandler(logger.Handler(), 500)
@@ -281,7 +281,7 @@ func main() {
 		"registry_refresh", cfg.RegistryRefresh.String(),
 		"registry_agents", len(reg.AgentIDs()),
 		"registry_models", reg.ModelCount(),
-		"log_level", level.String(),
+		"log_level", logLevelDisplay(level),
 		"verbose", *verbose,
 	)
 	if cfg.ActingUserID != "" {
@@ -430,6 +430,16 @@ func resolveLogLevel(cfgLogLevel string, verbose bool) slog.Level {
 		return slog.LevelDebug
 	}
 	return slog.LevelInfo
+}
+
+// logLevelDisplay renders the configured level for the startup summary.
+// LevelTrace prints as TRACE instead of slog's "DEBUG-4" (the level sits
+// below DEBUG, so slog's String() appends the negative offset).
+func logLevelDisplay(level slog.Level) string {
+	if level == telemetry.LevelTrace {
+		return "TRACE"
+	}
+	return level.String()
 }
 
 // ignoredExeAdjacentEnv returns the path of a .env that sits next to the

@@ -17,7 +17,7 @@ import (
 var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "COST_MODE", "ACTING_USER_ID", "USER_ID",
-	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
+	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL", "LOG_FORMAT",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
 	"MODELS_HIDE_UNAVAILABLE", "CORS_ALLOWED_ORIGIN", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
 	"AUTO_DISCOVER_TOKEN", "TRANSIENT_RETRIES", "ADMIN_TOKEN",
@@ -1011,10 +1011,21 @@ func TestLogLevel(t *testing.T) {
 		t.Errorf("LogLevel = %q, want debug", cfg.LogLevel)
 	}
 
+	// trace is accepted (case-insensitive), matching telemetry.ParseLevel
+	t.Setenv("LOG_LEVEL", "trace")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env trace): %v", err)
+	} else if cfg.LogLevel != "trace" {
+		t.Errorf("LogLevel = %q, want trace", cfg.LogLevel)
+	}
+
 	// invalid level fails validation
 	t.Setenv("LOG_LEVEL", "bogus")
 	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_LEVEL") {
 		t.Fatalf("Load (invalid level): err = %v, want error mentioning LOG_LEVEL", err)
+	}
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "debug, info, warn, error, trace") {
+		t.Fatalf("Load (invalid level): err = %v, want error listing trace", err)
 	}
 
 	// .env source
@@ -1026,6 +1037,59 @@ func TestLogLevel(t *testing.T) {
 		t.Fatalf("Load (.env): %v", err)
 	} else if cfg.LogLevel != "warn" {
 		t.Errorf("LogLevel = %q, want warn (from .env)", cfg.LogLevel)
+	}
+}
+
+func TestLogFormat(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	// default: "text" when unset (the historic output shape)
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text by default", cfg.LogFormat)
+	}
+
+	// env source
+	t.Setenv("LOG_FORMAT", "json")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env json): %v", err)
+	} else if cfg.LogFormat != "json" {
+		t.Errorf("LogFormat = %q, want json", cfg.LogFormat)
+	}
+
+	// explicit empty resets to the default
+	t.Setenv("LOG_FORMAT", "")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (empty format): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text for empty value", cfg.LogFormat)
+	}
+
+	// invalid format fails validation
+	t.Setenv("LOG_FORMAT", "xml")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_FORMAT") {
+		t.Fatalf("Load (invalid format): err = %v, want error mentioning LOG_FORMAT", err)
+	}
+
+	// JSON file source (weakest): env wins over it
+	t.Setenv("LOG_FORMAT", "text")
+	json := `{"AUTH_TOKENS":["tok"],"LOG_FORMAT":"json"}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(json), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (json file): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text (env beats JSON file)", cfg.LogFormat)
+	}
+	t.Setenv("LOG_FORMAT", "")
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (json file, no env): %v", err)
+	} else if cfg.LogFormat != "json" {
+		t.Errorf("LogFormat = %q, want json from JSON file", cfg.LogFormat)
 	}
 }
 

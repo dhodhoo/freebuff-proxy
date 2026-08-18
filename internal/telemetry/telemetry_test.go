@@ -2,6 +2,8 @@ package telemetry
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,22 +11,31 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
-// closeLogFile closes the log file held by a NewLogger result so TempDir
-// cleanup can delete it (Windows refuses to delete open files).
+// closeLogFile closes the log file held by a New/NewLogger result so
+// TempDir cleanup can delete it (Windows refuses to delete open files).
 func closeLogFile(t *testing.T, logger *slog.Logger) {
 	t.Helper()
-	th, ok := logger.Handler().(*textHandler)
-	if !ok {
-		t.Fatalf("logger handler is %T, want *textHandler", logger.Handler())
-	}
-	th.mu.Lock()
-	defer th.mu.Unlock()
-	if th.file != nil {
-		_ = th.file.Close()
-		th.file = nil
+	switch th := logger.Handler().(type) {
+	case *textHandler:
+		th.mu.Lock()
+		defer th.mu.Unlock()
+		if th.file != nil {
+			_ = th.file.Close()
+			th.file = nil
+		}
+	case *jsonHandler:
+		th.mu.Lock()
+		defer th.mu.Unlock()
+		if th.file != nil {
+			_ = th.file.Close()
+			th.file = nil
+		}
+	default:
+		t.Fatalf("logger handler is %T, want *textHandler or *jsonHandler", logger.Handler())
 	}
 }
 
@@ -166,6 +177,66 @@ func TestRedactHeadersNonCanonicalKey(t *testing.T) {
 	}
 }
 
+// TestRedactHeadersFreebuffPrefix verifies every x-freebuff-* header is
+// redacted (session tokens, instance ids and account metadata are sensitive
+// request context) while unrelated headers pass through untouched.
+func TestRedactHeadersFreebuffPrefix(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Freebuff-Session-Id", "sess-abc")
+	h.Set("x-freebuff-model", "deepseek-v4-pro")
+	h.Set("X-Freebuff-Instance-Id", "inst-1")
+	h.Set("X-Freebuff-Heartbeat", "1")
+	h.Set("X-Request-Id", "req-123")
+	h.Set("Content-Type", "application/json")
+
+	got := RedactHeaders(h)
+	for _, k := range []string{"X-Freebuff-Session-Id", "X-Freebuff-Model", "X-Freebuff-Instance-Id", "X-Freebuff-Heartbeat"} {
+		if v := got[k][0]; v != "[redacted]" {
+			t.Errorf("RedactHeaders[%q] = %q, want [redacted]", k, v)
+		}
+	}
+	if v := got["X-Request-Id"][0]; v != "req-123" {
+		t.Errorf("X-Request-Id = %q, want req-123 (not sensitive)", v)
+	}
+	if v := got["Content-Type"][0]; v != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", v)
+	}
+}
+
+// TestRedactSecrets pins the token scrubber: cb_-prefixed tokens and
+// Bearer <token> sequences (base64url alphabet) are replaced everywhere,
+// and strings without secrets pass through unchanged.
+func TestRedactSecrets(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"cb token alone", "cb_AbC123", "[redacted]"},
+		{"cb token in body", `{"error":"free_mode_limited","token":"cb_xyz789"}`, `{"error":"free_mode_limited","token":"[redacted]"}`},
+		{"bearer header", "Authorization: Bearer abcDEF012._~+/=-9", "Authorization: [redacted]"},
+		{"bearer in json", `{"auth":"Bearer xYz","ok":1}`, `{"auth":"[redacted]","ok":1}`},
+		{"both forms", "token=cb_a1B2 auth=Bearer q.r-s", "token=[redacted] auth=[redacted]"},
+		{"no secret", "plain text with no tokens", "plain text with no tokens"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RedactSecrets(tc.in); got != tc.want {
+				t.Errorf("RedactSecrets(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+	// The input string is not mutated.
+	in := "cb_keep"
+	if got := RedactSecrets(in); got != "[redacted]" {
+		t.Errorf("RedactSecrets returned %q", got)
+	}
+	if in != "cb_keep" {
+		t.Errorf("RedactSecrets mutated its input: %q", in)
+	}
+}
+
 func TestParseLevel(t *testing.T) {
 	if _, ok := ParseLevel(""); ok {
 		t.Error(`ParseLevel("") ok=true, want false`)
@@ -178,6 +249,18 @@ func TestParseLevel(t *testing.T) {
 	}
 	if _, ok := ParseLevel("bogus"); ok {
 		t.Error("ParseLevel(bogus) ok=true, want false")
+	}
+	// trace is a first-class level, one step below debug, case-insensitive.
+	for _, s := range []string{"trace", "TRACE", "Trace"} {
+		if lv, ok := ParseLevel(s); !ok || lv != LevelTrace {
+			t.Errorf("ParseLevel(%q) = %v, ok=%v; want LevelTrace, true", s, lv, ok)
+		}
+	}
+	if LevelTrace >= slog.LevelDebug {
+		t.Errorf("LevelTrace = %v, want strictly below LevelDebug (%v)", LevelTrace, slog.LevelDebug)
+	}
+	if got := LevelTrace.String(); got != "DEBUG-4" {
+		t.Errorf("LevelTrace.String() = %q, want slog's DEBUG-4 (banner must special-case TRACE)", got)
 	}
 }
 
@@ -279,30 +362,198 @@ func TestAttrValueEscaping(t *testing.T) {
 	}
 }
 
-// TestWithAttrsWithGroupNoOp pins the text handler's no-op
-// WithAttrs/WithGroup contract: both return the SAME handler, and bound
-// attrs/groups are silently dropped from the output (the process logger
-// never carries them — a regression would double-print fields).
-func TestWithAttrsWithGroupNoOp(t *testing.T) {
+// TestTextHandlerWithAttrsWithGroup pins the text handler's copy-on-write
+// WithAttrs/WithGroup contract: bound attrs are appended to every record,
+// group keys get the dotted group.key prefix, and the handler a With*
+// call was made on is never mutated (immutable base attrs).
+func TestTextHandlerWithAttrsWithGroup(t *testing.T) {
 	var buf bytes.Buffer
 	h := &textHandler{w: &buf, level: slog.LevelInfo}
-	if got := h.WithAttrs([]slog.Attr{slog.String("k", "v")}); got != slog.Handler(h) {
-		t.Errorf("WithAttrs returned a different handler: %T", got)
+
+	base := slog.New(h)
+	if got := h.WithAttrs([]slog.Attr{slog.String("k", "v")}); got == slog.Handler(h) {
+		t.Error("WithAttrs returned the same handler, want a copy")
 	}
-	if got := h.WithGroup("grp"); got != slog.Handler(h) {
-		t.Errorf("WithGroup returned a different handler: %T", got)
+	if got := h.WithGroup("grp"); got == slog.Handler(h) {
+		t.Error("WithGroup returned the same handler, want a copy")
 	}
+
+	// Without bound state the base handler output is untouched.
+	base.Info("plain")
+	if !strings.Contains(buf.String(), "msg=plain\n") {
+		t.Errorf("base handler output changed by With* calls: %q", buf.String())
+	}
+
+	// Bound attrs first (at their bind-time depth, no group prefix yet),
+	// record attrs under the group — slog's text-handler order.
+	buf.Reset()
 	logger := slog.New(h).With("bound", "attr").WithGroup("grp")
-	logger.Info("msg")
+	logger.Info("msg", "k", "v")
 	out := buf.String()
-	if strings.Contains(out, "bound=attr") {
-		t.Errorf("bound attr leaked into output despite no-op WithAttrs: %q", out)
+	for _, want := range []string{"msg=msg", "bound=attr", "grp.k=v"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output %q missing %q", out, want)
+		}
 	}
-	if strings.Contains(out, "grp.") {
-		t.Errorf("group prefix leaked into output despite no-op WithGroup: %q", out)
+	if strings.Contains(out, "grp.bound=") {
+		t.Errorf("bound attr wrongly prefixed by a later group: %q", out)
 	}
-	if !strings.Contains(out, "msg=msg") {
-		t.Errorf("plain record missing: %q", out)
+	if n := strings.Count(out, "\n"); n != 1 {
+		t.Errorf("record split across %d lines, want 1: %q", n, out)
+	}
+
+	// A second WithGroup nests: grp.a.k=v. Record group attrs prefix too.
+	buf.Reset()
+	logger = slog.New(h).WithGroup("grp").WithGroup("a").With("b", "1")
+	logger.Info("nested", slog.Group("g", slog.Int("n", 2)))
+	out = buf.String()
+	for _, want := range []string{"grp.a.b=1", "grp.a.g.n=2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("nested output %q missing %q", out, want)
+		}
+	}
+
+	// The original handler still has no bound state after all the With*
+	// calls above (copy-on-write left it immutable).
+	buf.Reset()
+	base.Info("still plain")
+	if strings.Contains(buf.String(), "bound=attr") || strings.Contains(buf.String(), "grp.") {
+		t.Errorf("base handler leaked bound state: %q", buf.String())
+	}
+}
+
+// TestTextHandlerShape pins the byte-for-byte output shape at info/debug
+// for attr-less records (the process-logger contract) and the trace token.
+func TestTextHandlerShape(t *testing.T) {
+	fixed := time.Date(2026, 8, 18, 12, 0, 0, 123000000, time.UTC)
+	var buf bytes.Buffer
+	h := &textHandler{w: &buf, level: LevelTrace}
+
+	rec := slog.NewRecord(fixed, slog.LevelInfo, "hello", 0)
+	rec.AddAttrs(slog.String("k", "v"))
+	if err := h.Handle(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	want := "time=2026-08-18T12:00:00.123Z level=INFO msg=hello k=v\n"
+	if got := buf.String(); got != want {
+		t.Errorf("text record = %q, want %q", got, want)
+	}
+
+	buf.Reset()
+	rec = slog.NewRecord(fixed, LevelTrace, "trace line", 0)
+	if err := h.Handle(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "level=TRACE ") {
+		t.Errorf("trace record level token not TRACE: %q", buf.String())
+	}
+}
+
+// TestJSONHandlerShape writes records through New with format "json" and
+// verifies each line parses as JSON with the RFC3339-ms time, the level and
+// msg fields, and real group nesting.
+func TestJSONHandlerShape(t *testing.T) {
+	out := captureStderr(t, func() {
+		logger := New(LevelTrace, "", "json").With("node", "n1").WithGroup("svc")
+		logger.Info("hello", "k", "v", slog.Int("status", 200), slog.Group("http", slog.Int("latency_ms", 12)))
+		logger.Warn("warn line")
+	})
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 JSON lines, got %d: %q", len(lines), out)
+	}
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
+		t.Fatalf("line 1 is not valid JSON: %v\n%q", err, lines[0])
+	}
+	// RFC3339 with milliseconds (the record time is local, so no zone
+	// assertion).
+	tm, err := time.Parse("2006-01-02T15:04:05.000Z07:00", rec["time"].(string))
+	if err != nil {
+		t.Errorf("time field %q not RFC3339-ms: %v", rec["time"], err)
+	} else if tm.IsZero() {
+		t.Errorf("time field parsed to zero time: %v", rec["time"])
+	}
+	if rec["level"] != "INFO" {
+		t.Errorf("level = %v, want INFO", rec["level"])
+	}
+	if rec["msg"] != "hello" {
+		t.Errorf("msg = %v, want hello", rec["msg"])
+	}
+	// The bound "node" attr predates WithGroup("svc"), so it sits at the top
+	// level; record attrs nest inside svc — slog's semantics.
+	if rec["node"] != "n1" {
+		t.Errorf("node = %v, want n1 (bound before the group)", rec["node"])
+	}
+	svc, ok := rec["svc"].(map[string]any)
+	if !ok {
+		t.Fatalf("svc field not nested object: %v", rec["svc"])
+	}
+	if svc["k"] != "v" {
+		t.Errorf("svc.k = %v, want v", svc["k"])
+	}
+	if svc["status"] != float64(200) {
+		t.Errorf("svc.status = %v, want 200", svc["status"])
+	}
+	httpGroup, ok := svc["http"].(map[string]any)
+	if !ok {
+		t.Fatalf("svc.http not nested object: %v", svc["http"])
+	}
+	if httpGroup["latency_ms"] != float64(12) {
+		t.Errorf("svc.http.latency_ms = %v, want 12", httpGroup["latency_ms"])
+	}
+	// Color-free: JSON must not contain ANSI escapes.
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("json output contains ANSI escapes: %q", out)
+	}
+	// The warn line parses too and levels map to their slog names.
+	var w map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &w); err != nil {
+		t.Fatalf("line 2 is not valid JSON: %v\n%q", err, lines[1])
+	}
+	if w["level"] != "WARN" || w["msg"] != "warn line" {
+		t.Errorf("warn record = %v, want level WARN msg warn line", w)
+	}
+}
+
+// TestJSONHandlerEmptyGroups verifies that groups that end up empty are
+// suppressed (slog's contract), so no "key":{} shells pollute the JSON.
+func TestJSONHandlerEmptyGroups(t *testing.T) {
+	var buf bytes.Buffer
+	h := &jsonHandler{w: &buf, level: slog.LevelInfo}
+	logger := slog.New(h).WithGroup("x").WithGroup("y")
+	logger.Info("no groups")
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("output not valid JSON: %v\n%q", err, buf.String())
+	}
+	if _, ok := rec["x"]; ok {
+		t.Errorf("empty group x leaked into output: %v", rec)
+	}
+	if rec["msg"] != "no groups" {
+		t.Errorf("msg = %v, want no groups", rec["msg"])
+	}
+
+	// A group with content is kept; an inner empty group is dropped.
+	buf.Reset()
+	logger = slog.New(&jsonHandler{w: &buf, level: slog.LevelInfo}).
+		WithGroup("x").With("a", 1).WithGroup("y")
+	logger.Info("kept", slog.Group("g"))
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("output not valid JSON: %v\n%q", err, buf.String())
+	}
+	x, ok := rec["x"].(map[string]any)
+	if !ok {
+		t.Fatalf("x not nested object: %v", rec)
+	}
+	if x["a"] != float64(1) {
+		t.Errorf("x.a = %v, want 1", x["a"])
+	}
+	if _, ok := x["y"]; ok {
+		t.Errorf("empty group y leaked: %v", x)
+	}
+	if _, ok := x["g"]; ok {
+		t.Errorf("empty group attr g leaked: %v", x)
 	}
 }
 

@@ -3564,3 +3564,21 @@ func TestDeviceOSWireContract(t *testing.T) {
 		}
 	}
 }
+
+// TestReqIDContextHelpers pins the D1 ctx plumbing: withReqID stores the id
+// and ReqID reads it through descendant contexts (the timeout wraps in
+// ChatCompletions/do derive from the wrapped ctx).
+func TestReqIDContextHelpers(t *testing.T) {
+	if got := ReqID(context.Background()); got != "" {
+		t.Errorf("ReqID(background) = %q, want empty", got)
+	}
+	ctx := withReqID(context.Background(), "req-123")
+	if got := ReqID(ctx); got != "req-123" {
+		t.Errorf("ReqID = %q, want req-123", got)
+	}
+	child, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if got := ReqID(child); got != "req-123" {
+		t.Errorf("ReqID(child) = %q, want req-123 (value must survive descendant wraps)", got)
+	}
+}

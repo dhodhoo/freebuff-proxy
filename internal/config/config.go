@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"freebuff-proxy/internal/telemetry"
 )
 
 // Config is the fully-resolved, validated runtime configuration.
@@ -49,7 +51,8 @@ type Config struct {
 	RegistryRefresh       time.Duration
 	DebugDump             bool
 	LogFile               string
-	LogLevel              string            // "" (use -v/default) or debug|info|warn|error
+	LogLevel              string            // "" (use -v/default) or debug|info|warn|error|trace
+	LogFormat             string            // "text" (default) or "json"
 	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
 	MaxSpendPerDay        int64             // 0 = unlimited: ADVISORY per-token Pacific-day spend ceiling in ledger units (tokens from upstream usage blocks; issue #122). Never blocks — the upstream $ ceilings ($15 full / $5 limited / $0.50 restricted, compose by minimum, server-enforced) are the real gate. Surfaced as SpendLimit/SpendPct on /healthz so operator comparisons align with the Pacific-midnight reset.
 	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
@@ -184,6 +187,7 @@ type rawConfig struct {
 	DebugDump                        bool   `json:"DEBUG_DUMP"`
 	LogFile                          string `json:"LOG_FILE"`
 	LogLevel                         string `json:"LOG_LEVEL"`
+	LogFormat                        string `json:"LOG_FORMAT"`
 	MaxMessagesPerDay                *int   `json:"MAX_MESSAGES_PER_DAY"`
 	MaxSpendPerDay                   *int   `json:"MAX_SPEND_PER_DAY"`
 	IdleRotationTimeout              string `json:"IDLE_ROTATION_TIMEOUT"`
@@ -377,6 +381,7 @@ func Load(configPath string) (Config, error) {
 	overrideBool(&raw.DebugDump, "DEBUG_DUMP")
 	overrideString(&raw.LogFile, "LOG_FILE")
 	overrideString(&raw.LogLevel, "LOG_LEVEL")
+	overrideString(&raw.LogFormat, "LOG_FORMAT")
 	overrideInt(&raw.MaxMessagesPerDay, "MAX_MESSAGES_PER_DAY")
 	overrideInt(&raw.MaxSpendPerDay, "MAX_SPEND_PER_DAY")
 	overrideString(&raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
@@ -585,6 +590,12 @@ func Load(configPath string) (Config, error) {
 		raw.ActingUserID = raw.LegacyActingUserID
 	}
 
+	// LOG_FORMAT default: empty means the text format (the historic output).
+	logFormat := strings.TrimSpace(raw.LogFormat)
+	if logFormat == "" {
+		logFormat = "text"
+	}
+
 	cfg := Config{
 		ListenAddr:                       strings.TrimSpace(raw.ListenAddr),
 		UpstreamBaseURL:                  upstreamBaseURL,
@@ -602,6 +613,7 @@ func Load(configPath string) (Config, error) {
 		DebugDump:                        raw.DebugDump,
 		LogFile:                          strings.TrimSpace(raw.LogFile),
 		LogLevel:                         strings.TrimSpace(raw.LogLevel),
+		LogFormat:                        logFormat,
 		MaxMessagesPerDay:                maxMessagesPerDay,
 		MaxSpendPerDay:                   maxSpendPerDay,
 		IdleRotationTimeout:              idleRotationTimeout,
@@ -804,10 +816,16 @@ func (c Config) Validate() error {
 	}
 
 	if c.LogLevel != "" {
-		var level slog.Level
-		if err := level.UnmarshalText([]byte(c.LogLevel)); err != nil {
-			return fmt.Errorf("LOG_LEVEL %q must be one of: debug, info, warn, error", c.LogLevel)
+		if _, ok := telemetry.ParseLevel(c.LogLevel); !ok {
+			return fmt.Errorf("LOG_LEVEL %q must be one of: debug, info, warn, error, trace", c.LogLevel)
 		}
+	}
+	switch c.LogFormat {
+	case "", "text", "json":
+		// "" never survives From (it defaults to "text"), accepted for
+		// direct Config construction.
+	default:
+		return fmt.Errorf("LOG_FORMAT %q must be one of: text, json", c.LogFormat)
 	}
 
 	u, err := url.Parse(c.UpstreamBaseURL)
@@ -918,6 +936,7 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideBoolFrom(&raw.DebugDump, get, "DEBUG_DUMP")
 	overrideStringFrom(&raw.LogFile, get, "LOG_FILE")
 	overrideStringFrom(&raw.LogLevel, get, "LOG_LEVEL")
+	overrideStringFrom(&raw.LogFormat, get, "LOG_FORMAT")
 	overrideIntFrom(&raw.MaxMessagesPerDay, get, "MAX_MESSAGES_PER_DAY")
 	overrideIntFrom(&raw.MaxSpendPerDay, get, "MAX_SPEND_PER_DAY")
 	overrideStringFrom(&raw.IdleRotationTimeout, get, "IDLE_ROTATION_TIMEOUT")

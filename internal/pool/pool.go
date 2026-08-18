@@ -200,6 +200,11 @@ type TokenSnapshot struct {
 	// pinned TLS fingerprint swaps. Surfaced per-token in /metrics.
 	TransientRetries     int64
 	FingerprintRotations int64
+	// RateLimitEvents is this token's upstream rate-limit classification
+	// ledger (T7), keyed by upstream body code (rate_limited, ip_capped,
+	// spend_limited, insufficient_quota, limit_burst_rate,
+	// free_mode_rate_limited, ...). Surfaced per-token in /metrics.
+	RateLimitEvents map[string]int64
 }
 
 // Pool balances requests across the configured tokens.
@@ -1709,6 +1714,7 @@ func (p *Pool) Snapshot() []TokenSnapshot {
 			Standing:                ss.Standing,
 			TransientRetries:        tok.client.TransientRetries(),
 			FingerprintRotations:    tok.client.FingerprintRotations(),
+			RateLimitEvents:         tok.client.RateLimitEvents(),
 			Spend24h:                spend.Rolling24h,
 			SpendDay:                spend.Day,
 			SpendWeek:               spend.Week,

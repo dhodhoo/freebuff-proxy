@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"freebuff-proxy/internal/egress"
+	"freebuff-proxy/internal/telemetry"
 )
 
 // TestHoldForExitIfConsolePipedStderrNoHang guards the console hold: with
@@ -234,6 +235,8 @@ func TestResolveLogLevel(t *testing.T) {
 		{"config wins", "warn", false, slog.LevelWarn},
 		{"config beats verbose", "error", true, slog.LevelError},
 		{"config case-insensitive", "DEBUG", false, slog.LevelDebug},
+		{"trace level", "trace", false, telemetry.LevelTrace},
+		{"trace case-insensitive", "TRACE", true, telemetry.LevelTrace},
 		{"unparseable falls back to info", "bogus", true, slog.LevelInfo},
 	}
 	for _, tc := range cases {
@@ -242,6 +245,26 @@ func TestResolveLogLevel(t *testing.T) {
 				t.Errorf("resolveLogLevel(%q, %v) = %v, want %v", tc.logLevel, tc.verbose, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestLogLevelDisplay pins the startup-summary level rendering: trace shows
+// as TRACE (not slog's "DEBUG-4"), every other level keeps slog's name.
+func TestLogLevelDisplay(t *testing.T) {
+	cases := []struct {
+		level slog.Level
+		want  string
+	}{
+		{telemetry.LevelTrace, "TRACE"},
+		{slog.LevelDebug, "DEBUG"},
+		{slog.LevelInfo, "INFO"},
+		{slog.LevelWarn, "WARN"},
+		{slog.LevelError, "ERROR"},
+	}
+	for _, tc := range cases {
+		if got := logLevelDisplay(tc.level); got != tc.want {
+			t.Errorf("logLevelDisplay(%v) = %q, want %q", tc.level, got, tc.want)
+		}
 	}
 }
 
