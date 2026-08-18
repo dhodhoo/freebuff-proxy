@@ -3540,3 +3540,21 @@ func TestProbeAccountSendsIncludeUnusedRateLimits(t *testing.T) {
 		t.Errorf("RateLimitsByModel = %+v, want parsed per-model quota", st.RateLimitsByModel)
 	}
 }
+
+func TestDeviceOSWireContract(t *testing.T) {
+	tests := []struct {
+		goos string
+		want string
+	}{
+		{"darwin", "macos"}, // Go reports darwin, wire contract wants macos
+		{"windows", "windows"},
+		{"linux", "linux"},
+		{"freebsd", "linux"}, // CLI falls back to linux for unknown platforms
+		{"", "linux"},
+	}
+	for _, tt := range tests {
+		if got := deviceOSFor(tt.goos); got != tt.want {
+			t.Errorf("deviceOSFor(%q) = %q, want %q", tt.goos, got, tt.want)
+		}
+	}
+}

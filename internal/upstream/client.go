@@ -1560,7 +1560,7 @@ func (c *Client) requestAds(ctx context.Context, provider string) error {
 		"provider": provider,
 		"messages": []any{},
 		"device": map[string]any{
-			"os":       runtime.GOOS,
+			"os":       deviceOS(),
 			"timezone": egressDeviceTimezone(),
 			"locale":   egressDeviceLocale(),
 		},
@@ -1594,6 +1594,25 @@ func (c *Client) requestAds(ctx context.Context, provider string) error {
 		return fmt.Errorf("ads status %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
 	return nil
+}
+
+// deviceOS maps runtime.GOOS to the ads device block's wire contract
+// (macos|windows|linux, use-gravity-ad.ts getDeviceInfo platformToOs):
+// Go reports "darwin" but the API only accepts "macos", and anything
+// unrecognized falls back to "linux" exactly like the CLI.
+func deviceOS() string {
+	return deviceOSFor(runtime.GOOS)
+}
+
+func deviceOSFor(goos string) string {
+	switch goos {
+	case "darwin":
+		return "macos"
+	case "windows":
+		return "windows"
+	default:
+		return "linux"
+	}
 }
 
 // egressDeviceTimezone returns the host IANA timezone name for the ads
