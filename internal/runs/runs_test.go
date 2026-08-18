@@ -726,8 +726,15 @@ func TestCooldownIpCappedCapsReAdmits(t *testing.T) {
 	if got == nil {
 		t.Fatal("IpCappedError() = nil after budget exhausted, want remembered terminal error")
 	}
-	if got.RetryAfter < time.Minute {
-		t.Errorf("terminal RetryAfter = %v, want the remaining window to midnight (>= 1m)", got.RetryAfter)
+	// The remembered error surfaces the REMAINING window to midnight. Near
+	// Pacific midnight that window is legitimately short — the suite can
+	// run across the boundary — so assert it matches the actual window
+	// (within test-execution drift) instead of a fixed floor.
+	if got.RetryAfter <= 0 {
+		t.Fatal("terminal RetryAfter = 0, want the remaining window to midnight")
+	}
+	if d := got.RetryAfter - time.Until(want); d > 2*time.Second || d < -2*time.Second {
+		t.Errorf("terminal RetryAfter = %v, want the remaining window to midnight (~%v)", got.RetryAfter, time.Until(want))
 	}
 
 	// Further refusals the same day must not move the lock (no re-admit loop).
