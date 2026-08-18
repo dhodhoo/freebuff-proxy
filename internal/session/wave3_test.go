@@ -149,10 +149,10 @@ func TestReAdmitDisabledByDefault(t *testing.T) {
 	}
 }
 
-// TestHeartbeatSkipsWithinProbeTTL pins issue #60(a): heartbeat GETs within
+// TestPollSkipsWithinProbeTTL pins issue #60(a): session poll GETs within
 // the admission probe cache TTL of a successful session response are
 // skipped; after the TTL the GET happens.
-func TestHeartbeatSkipsWithinProbeTTL(t *testing.T) {
+func TestPollSkipsWithinProbeTTL(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	m := newTestSession(t, mock)
@@ -162,17 +162,17 @@ func TestHeartbeatSkipsWithinProbeTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	pollsAfterAdmit := mock.SessionPolls
-	if err := m.Heartbeat(context.Background()); err != nil {
+	if err := m.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if mock.SessionPolls != pollsAfterAdmit {
-		t.Errorf("heartbeat within probe TTL issued a GET (polls %d → %d)", pollsAfterAdmit, mock.SessionPolls)
+		t.Errorf("poll within probe TTL issued a GET (polls %d → %d)", pollsAfterAdmit, mock.SessionPolls)
 	}
 }
 
-// TestHeartbeatAfterProbeTTLPolls pins the other side: once the TTL
-// elapses, the heartbeat GET fires.
-func TestHeartbeatAfterProbeTTLPolls(t *testing.T) {
+// TestPollAfterProbeTTLPolls pins the other side: once the TTL elapses, the
+// session poll GET fires.
+func TestPollAfterProbeTTLPolls(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	m := newTestSession(t, mock)
@@ -183,11 +183,11 @@ func TestHeartbeatAfterProbeTTLPolls(t *testing.T) {
 	}
 	time.Sleep(80 * time.Millisecond) // age past the TTL
 	polls := mock.SessionPolls
-	if err := m.Heartbeat(context.Background()); err != nil {
+	if err := m.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if mock.SessionPolls != polls+1 {
-		t.Errorf("heartbeat after TTL = %d polls, want %d+1", mock.SessionPolls, polls)
+		t.Errorf("poll after TTL = %d polls, want %d+1", mock.SessionPolls, polls)
 	}
 }
 

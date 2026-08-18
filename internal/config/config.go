@@ -24,23 +24,34 @@ import (
 
 // Config is the fully-resolved, validated runtime configuration.
 type Config struct {
-	ListenAddr            string
-	UpstreamBaseURL       string
-	AuthTokens            []string
-	RotationInterval      time.Duration
-	RequestTimeout        time.Duration
-	SessionCallTimeout    time.Duration
-	APIKeys               []string
-	AdminToken            string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
-	HTTP2Upstream         bool   // true = negotiate HTTP/2 with the upstream so the ALPN matches real browsers (HTTP2_UPSTREAM); false forces HTTP/1.1 (#51)
-	CostMode              string // "" (omit) or "free"; A/B pending, PRD §8
-	UserID                string // optional FreeBuff account id sent as x-freebuff-acting-user-id (CLI parity; empty = omitted)
+	ListenAddr         string
+	UpstreamBaseURL    string
+	AuthTokens         []string
+	RotationInterval   time.Duration
+	RequestTimeout     time.Duration
+	SessionCallTimeout time.Duration
+	APIKeys            []string
+	AdminToken         string // bearer token required for POST /admin/reload ("" = unauthenticated in default deployments)
+	HTTP2Upstream      bool   // true = negotiate HTTP/2 with the upstream so the ALPN matches real browsers (HTTP2_UPSTREAM); false forces HTTP/1.1 (#51)
+	CostMode           string // "" (omit) or "free"; A/B pending, PRD §8
+	// ActingUserID is the optional FreeBuff account id sent as
+	// x-freebuff-acting-user-id (ACTING_USER_ID; empty = header omitted).
+	// BAN RISK: the official CLI sends the account's OWN id here, derived
+	// from GET /api/v1/me (sdk/src/run.ts:649-658), and the server honors
+	// the header only for the FreeBuff Web service account
+	// (common/src/constants/freebuff-models.ts:1180-1183). Any value other
+	// than the token's own account id impersonates another user — a flag.
+	// The only safe value is the token's own account id. (True CLI parity —
+	// auto-deriving each token's own id once via GET /api/v1/me — is
+	// deferred; see the gap analysis item 24.)
+	ActingUserID          string
 	TLSFingerprint        string // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
 	RegistryRefresh       time.Duration
 	DebugDump             bool
 	LogFile               string
 	LogLevel              string            // "" (use -v/default) or debug|info|warn|error
 	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
+	MaxSpendPerDay        int64             // 0 = unlimited: ADVISORY per-token Pacific-day spend ceiling in ledger units (tokens from upstream usage blocks; issue #122). Never blocks — the upstream $ ceilings ($15 full / $5 limited / $0.50 restricted, compose by minimum, server-enforced) are the real gate. Surfaced as SpendLimit/SpendPct on /healthz so operator comparisons align with the Pacific-midnight reset.
 	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
 	SafeMode              bool              // true = apply recommended anti-ban safe defaults
 	HybridMode            bool              // true = relay client tokens like bridge AND serve token-less requests from the pool
@@ -80,7 +91,7 @@ type Config struct {
 	SessionReAdmitLead time.Duration
 	// SessionProbeCacheTTL is how long the last successful session state is
 	// reused before a fresh upstream poll (issue #60, SESSION_PROBE_CACHE_TTL
-	// default 15s): heartbeat GETs within the TTL are skipped.
+	// default 15s): session poll GETs within the TTL are skipped.
 	SessionProbeCacheTTL time.Duration
 	// WebhookURL fires best-effort alert POSTs when the token pool is
 	// exhausted or a token is classified banned (issue #48, WEBHOOK_URL;
@@ -157,45 +168,49 @@ type rawConfig struct {
 	// explicitly-empty AUTH_TOKENS means the operator chose bridge mode, so
 	// CLI auto-discovery must not refill it (runtime mode switch persists
 	// "AUTH_TOKENS=" to .env and relies on this).
-	AuthTokensSet                    bool     `json:"-"`
-	RotationInterval                 string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout                   string   `json:"REQUEST_TIMEOUT"`
-	SessionCallTimeout               string   `json:"SESSION_CALL_TIMEOUT"`
-	APIKeys                          []string `json:"API_KEYS"`
-	AdminToken                       string   `json:"ADMIN_TOKEN"`
-	CostMode                         string   `json:"COST_MODE"`
-	UserID                           string   `json:"USER_ID"`
-	TLSFingerprint                   string   `json:"TLS_FINGERPRINT"`
-	RegistryRefresh                  string   `json:"REGISTRY_REFRESH"`
-	DebugDump                        bool     `json:"DEBUG_DUMP"`
-	LogFile                          string   `json:"LOG_FILE"`
-	LogLevel                         string   `json:"LOG_LEVEL"`
-	MaxMessagesPerDay                *int     `json:"MAX_MESSAGES_PER_DAY"`
-	IdleRotationTimeout              string   `json:"IDLE_ROTATION_TIMEOUT"`
-	SafeMode                         bool     `json:"SAFE_MODE"`
-	HybridMode                       bool     `json:"HYBRID_MODE"`
-	ModelsHideUnavailable            bool     `json:"MODELS_HIDE_UNAVAILABLE"`
-	CORSAllowedOrigin                string   `json:"CORS_ALLOWED_ORIGIN"`
-	RequestJitter                    string   `json:"REQUEST_JITTER"`
-	CLIVersion                       string   `json:"CLI_VERSION"`
-	ModelAliases                     string   `json:"MODEL_ALIASES"`
-	TransientRetries                 *int     `json:"TRANSIENT_RETRIES"`
-	SessionPersist                   bool     `json:"SESSION_PERSIST"`
-	SessionStateFile                 string   `json:"SESSION_STATE_FILE"`
-	HTTP2Upstream                    bool     `json:"HTTP2_UPSTREAM"`
-	SessionCreateMaxParallelGlobal   *int     `json:"SESSION_CREATE_MAX_PARALLEL_GLOBAL"`
-	SessionCreateMaxParallelPerModel *int     `json:"SESSION_CREATE_MAX_PARALLEL_PER_MODEL"`
-	RunFinishQueueSize               *int     `json:"RUN_FINISH_QUEUE_SIZE"`
-	RunFinishInlineTimeout           string   `json:"RUN_FINISH_INLINE_TIMEOUT"`
-	RunsDrainQueueCap                *int     `json:"RUNS_DRAIN_QUEUE_CAP"`
-	RunsDrainTTL                     string   `json:"RUNS_DRAIN_TTL"`
-	SessionReAdmitLead               string   `json:"SESSION_RE_ADMIT_LEAD"`
-	SessionProbeCacheTTL             string   `json:"SESSION_PROBE_CACHE_TTL"`
-	WebhookURL                       string   `json:"WEBHOOK_URL"`
-	FallbackAfter                    string   `json:"FALLBACK_AFTER_MS"`
-	FallbackModels                   string   `json:"FALLBACK_MODEL"`
-	AdoptCLISession                  bool     `json:"ADOPT_CLI_SESSION"`
-	WaitingRoomChain                 bool     `json:"WAITING_ROOM_CHAIN"`
+	AuthTokensSet      bool     `json:"-"`
+	RotationInterval   string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout     string   `json:"REQUEST_TIMEOUT"`
+	SessionCallTimeout string   `json:"SESSION_CALL_TIMEOUT"`
+	APIKeys            []string `json:"API_KEYS"`
+	AdminToken         string   `json:"ADMIN_TOKEN"`
+	CostMode           string   `json:"COST_MODE"`
+	ActingUserID       string   `json:"ACTING_USER_ID"`
+	// LegacyActingUserID is the pre-rename JSON key (USER_ID) — merged at
+	// the end of Load when no ACTING_USER_ID source set a value (#126).
+	LegacyActingUserID               string `json:"USER_ID"`
+	TLSFingerprint                   string `json:"TLS_FINGERPRINT"`
+	RegistryRefresh                  string `json:"REGISTRY_REFRESH"`
+	DebugDump                        bool   `json:"DEBUG_DUMP"`
+	LogFile                          string `json:"LOG_FILE"`
+	LogLevel                         string `json:"LOG_LEVEL"`
+	MaxMessagesPerDay                *int   `json:"MAX_MESSAGES_PER_DAY"`
+	MaxSpendPerDay                   *int   `json:"MAX_SPEND_PER_DAY"`
+	IdleRotationTimeout              string `json:"IDLE_ROTATION_TIMEOUT"`
+	SafeMode                         bool   `json:"SAFE_MODE"`
+	HybridMode                       bool   `json:"HYBRID_MODE"`
+	ModelsHideUnavailable            bool   `json:"MODELS_HIDE_UNAVAILABLE"`
+	CORSAllowedOrigin                string `json:"CORS_ALLOWED_ORIGIN"`
+	RequestJitter                    string `json:"REQUEST_JITTER"`
+	CLIVersion                       string `json:"CLI_VERSION"`
+	ModelAliases                     string `json:"MODEL_ALIASES"`
+	TransientRetries                 *int   `json:"TRANSIENT_RETRIES"`
+	SessionPersist                   bool   `json:"SESSION_PERSIST"`
+	SessionStateFile                 string `json:"SESSION_STATE_FILE"`
+	HTTP2Upstream                    bool   `json:"HTTP2_UPSTREAM"`
+	SessionCreateMaxParallelGlobal   *int   `json:"SESSION_CREATE_MAX_PARALLEL_GLOBAL"`
+	SessionCreateMaxParallelPerModel *int   `json:"SESSION_CREATE_MAX_PARALLEL_PER_MODEL"`
+	RunFinishQueueSize               *int   `json:"RUN_FINISH_QUEUE_SIZE"`
+	RunFinishInlineTimeout           string `json:"RUN_FINISH_INLINE_TIMEOUT"`
+	RunsDrainQueueCap                *int   `json:"RUNS_DRAIN_QUEUE_CAP"`
+	RunsDrainTTL                     string `json:"RUNS_DRAIN_TTL"`
+	SessionReAdmitLead               string `json:"SESSION_RE_ADMIT_LEAD"`
+	SessionProbeCacheTTL             string `json:"SESSION_PROBE_CACHE_TTL"`
+	WebhookURL                       string `json:"WEBHOOK_URL"`
+	FallbackAfter                    string `json:"FALLBACK_AFTER_MS"`
+	FallbackModels                   string `json:"FALLBACK_MODEL"`
+	AdoptCLISession                  bool   `json:"ADOPT_CLI_SESSION"`
+	WaitingRoomChain                 bool   `json:"WAITING_ROOM_CHAIN"`
 }
 
 func defaultRawConfig() rawConfig {
@@ -208,6 +223,7 @@ func defaultRawConfig() rawConfig {
 		RegistryRefresh:                  "6h",
 		CostMode:                         "free", // free-tier mode; omission routes requests as PAID and fresh free accounts get 402 "Out of credits" (upstream check: cost_mode !== 'free' → billing)
 		MaxMessagesPerDay:                nil,
+		MaxSpendPerDay:                   nil,   // 0 = unlimited advisory spend ceiling (never enforced)
 		IdleRotationTimeout:              "",    // "" = disabled (unset → SAFE_MODE preset may fill)
 		SafeMode:                         true,  // anti-ban presets on by default; set SAFE_MODE=false to disable
 		HybridMode:                       false, // relay client tokens AND serve the pool (off by default)
@@ -351,13 +367,20 @@ func Load(configPath string) (Config, error) {
 	overrideCSV(&raw.APIKeys, "API_KEYS")
 	overrideString(&raw.AdminToken, "ADMIN_TOKEN")
 	overrideString(&raw.CostMode, "COST_MODE")
-	overrideString(&raw.UserID, "USER_ID")
+	overrideString(&raw.ActingUserID, "ACTING_USER_ID")
+	// Backward-compat alias (#126): the pre-rename USER_ID knob still works
+	// when the new name is unset/empty (an operator .env keeps sending the
+	// header after upgrade). ACTING_USER_ID always wins when both are set.
+	if raw.ActingUserID == "" {
+		overrideString(&raw.ActingUserID, "USER_ID")
+	}
 	overrideString(&raw.TLSFingerprint, "TLS_FINGERPRINT")
 	overrideString(&raw.RegistryRefresh, "REGISTRY_REFRESH")
 	overrideBool(&raw.DebugDump, "DEBUG_DUMP")
 	overrideString(&raw.LogFile, "LOG_FILE")
 	overrideString(&raw.LogLevel, "LOG_LEVEL")
 	overrideInt(&raw.MaxMessagesPerDay, "MAX_MESSAGES_PER_DAY")
+	overrideInt(&raw.MaxSpendPerDay, "MAX_SPEND_PER_DAY")
 	overrideString(&raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
 	overrideBool(&raw.SafeMode, "SAFE_MODE")
 	overrideBool(&raw.HybridMode, "HYBRID_MODE")
@@ -502,6 +525,16 @@ func Load(configPath string) (Config, error) {
 		maxMessagesPerDay = *raw.MaxMessagesPerDay
 	}
 
+	// MAX_SPEND_PER_DAY (issue #122): advisory per-token Pacific-day spend
+	// ceiling in ledger units, default 0 (unlimited). Deliberately NOT
+	// enforced — the upstream $ ceilings are server-side and the proxy
+	// cannot know the account's restricted cohort; surfaced as
+	// SpendLimit/SpendPct on /healthz.
+	maxSpendPerDay := int64(0)
+	if raw.MaxSpendPerDay != nil {
+		maxSpendPerDay = int64(*raw.MaxSpendPerDay)
+	}
+
 	// TRANSIENT_RETRIES: nil defaults to 1 (one additional attempt after a
 	// transient transport failure); an explicit 0 disables retries.
 	transientRetries := 1
@@ -547,6 +580,13 @@ func Load(configPath string) (Config, error) {
 		fallbackModels = defaultFallbackModels()
 	}
 
+	// Backward-compat (#126): a JSON config carrying the pre-rename USER_ID
+	// key still works when no ACTING_USER_ID source (env/.env/JSON) set a
+	// value. Weakest source — env and .env override it via the aliases above.
+	if raw.ActingUserID == "" {
+		raw.ActingUserID = raw.LegacyActingUserID
+	}
+
 	cfg := Config{
 		ListenAddr:                       strings.TrimSpace(raw.ListenAddr),
 		UpstreamBaseURL:                  upstreamBaseURL,
@@ -558,13 +598,14 @@ func Load(configPath string) (Config, error) {
 		AdminToken:                       strings.TrimSpace(raw.AdminToken),
 		HTTP2Upstream:                    raw.HTTP2Upstream,
 		CostMode:                         strings.TrimSpace(raw.CostMode),
-		UserID:                           strings.TrimSpace(raw.UserID),
+		ActingUserID:                     strings.TrimSpace(raw.ActingUserID),
 		TLSFingerprint:                   strings.TrimSpace(raw.TLSFingerprint),
 		RegistryRefresh:                  registryRefresh,
 		DebugDump:                        raw.DebugDump,
 		LogFile:                          strings.TrimSpace(raw.LogFile),
 		LogLevel:                         strings.TrimSpace(raw.LogLevel),
 		MaxMessagesPerDay:                maxMessagesPerDay,
+		MaxSpendPerDay:                   maxSpendPerDay,
 		IdleRotationTimeout:              idleRotationTimeout,
 		SafeMode:                         raw.SafeMode,
 		HybridMode:                       raw.HybridMode,
@@ -715,6 +756,8 @@ func (c Config) Validate() error {
 		return errors.New(`COST_MODE must be "free" or unset -- any other value (e.g. a typo) routes requests as PAID and fresh free accounts get 402 "Out of credits"`)
 	case c.MaxMessagesPerDay < 0:
 		return errors.New("MAX_MESSAGES_PER_DAY cannot be negative")
+	case c.MaxSpendPerDay < 0:
+		return errors.New("MAX_SPEND_PER_DAY cannot be negative")
 	}
 
 	if c.WebhookURL != "" {
@@ -868,13 +911,17 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideCSVFrom(&raw.APIKeys, get, "API_KEYS")
 	overrideStringFrom(&raw.AdminToken, get, "ADMIN_TOKEN")
 	overrideStringFrom(&raw.CostMode, get, "COST_MODE")
-	overrideStringFrom(&raw.UserID, get, "USER_ID")
+	overrideStringFrom(&raw.ActingUserID, get, "ACTING_USER_ID")
+	if raw.ActingUserID == "" {
+		overrideStringFrom(&raw.ActingUserID, get, "USER_ID")
+	}
 	overrideStringFrom(&raw.TLSFingerprint, get, "TLS_FINGERPRINT")
 	overrideStringFrom(&raw.RegistryRefresh, get, "REGISTRY_REFRESH")
 	overrideBoolFrom(&raw.DebugDump, get, "DEBUG_DUMP")
 	overrideStringFrom(&raw.LogFile, get, "LOG_FILE")
 	overrideStringFrom(&raw.LogLevel, get, "LOG_LEVEL")
 	overrideIntFrom(&raw.MaxMessagesPerDay, get, "MAX_MESSAGES_PER_DAY")
+	overrideIntFrom(&raw.MaxSpendPerDay, get, "MAX_SPEND_PER_DAY")
 	overrideStringFrom(&raw.IdleRotationTimeout, get, "IDLE_ROTATION_TIMEOUT")
 	// The remaining keys mirror the real-environment override set in Load.
 	// AUTO_DISCOVER_TOKEN is intentionally env-only (it controls the .env

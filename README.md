@@ -251,7 +251,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `SESSION_CALL_TIMEOUT` | `30s` | Session call timeout |
 | `REGISTRY_REFRESH` | `6h` | Model catalog refresh interval |
 | `COST_MODE` | `free` | `free` (free-tier) or paid billing mode |
-| `USER_ID` | `""` | Optional FreeBuff account id; sent on every chat call as `x-freebuff-acting-user-id` (the real CLI sends it and the free-mode gate expects it). Empty = header omitted |
+| `ACTING_USER_ID` | `""` | Optional FreeBuff account id; sent on every chat call as `x-freebuff-acting-user-id`. BAN RISK: only the token's own account id is safe (the CLI derives it from `GET /api/v1/me`; the server honors the header only for the FreeBuff Web service account) — any other value impersonates another user. Pre-rename name `USER_ID` still works. Empty = header omitted |
 | `TLS_FINGERPRINT` | `auto` | `auto`, `chrome120`, `chrome126`, `safari17`, `safari18`, `firefox120`, `firefox128`, `edge126`, `random` |
 | `DEBUG_DUMP` | `false` | Persist redacted traffic dumps to `./dump/` (mode 0600) |
 | `LOG_FILE` | `""` | Append log lines to a file (e.g. `./logs/proxy.log`) |
@@ -266,7 +266,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `SESSION_PERSIST` | `false` | Persist session state AND active agent runs to disk so a restart resumes them instead of re-creating (new daily slot / re-START) |
 | `SESSION_STATE_FILE` | `.freebuff-session-state.json` | Path of the session state file (used when `SESSION_PERSIST=true`; token-keyed, `0600`) |
 | `SESSION_RE_ADMIT_LEAD` | `60s` | Re-admit a session pre-emptively when less than this remains: the request rides the old session while the refresh runs in the background |
-| `SESSION_PROBE_CACHE_TTL` | `15s` | Reuse the last successful session state (skip redundant heartbeat GETs) within this window |
+| `SESSION_PROBE_CACHE_TTL` | `15s` | Reuse the last successful session state (skip redundant session poll GETs) within this window |
 | `SESSION_CREATE_MAX_PARALLEL_GLOBAL` | `128` | Cap on concurrent in-flight session admissions (wait-or-503) |
 | `SESSION_CREATE_MAX_PARALLEL_PER_MODEL` | `32` | Per-model cap on concurrent in-flight session admissions |
 | `RUN_FINISH_QUEUE_SIZE` | `64` | Bounded deferred-FINISH worker queue for rotated/drained runs |

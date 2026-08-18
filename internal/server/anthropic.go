@@ -785,6 +785,7 @@ func (s *Server) relayAnthropicStream(ctx context.Context, w http.ResponseWriter
 			if usage, ok := chunk["usage"]; ok && usage != nil {
 				if um, ok := usage.(map[string]any); ok {
 					st.usage = openAIUsageToAnthropic(um)
+					stats.usageTokens = usageTotalTokens(um) // #122 spend ledger
 				}
 			}
 			s.accumulateAnthropicChunk(send, st, chunk)
@@ -1135,6 +1136,9 @@ func (s *Server) relayAnthropicJSON(ctx context.Context, w http.ResponseWriter, 
 		s.writeJSONError(w, http.StatusBadGateway,
 			"failed to build response: "+err.Error(), "upstream_error", "upstream_unavailable", 0)
 		return
+	}
+	if usage, ok := completion["usage"].(map[string]any); ok {
+		stats.usageTokens = usageTotalTokens(usage) // #122 spend ledger
 	}
 	stats.bytes = len(out)
 	w.Header().Set("Content-Type", "application/json")

@@ -110,11 +110,18 @@ func TestFinishRunDropsFromActive(t *testing.T) {
 	}
 	mgr.Release(run)
 
-	mgr.FinishRun(context.Background(), run, 3)
+	// Issue #114: record 3 completed steps — totalSteps must come from the
+	// recorded steps (preferred over the request-count fallback) and the
+	// steps must ride IN the FINISH payload.
+	for i := 0; i < 3; i++ {
+		mgr.RecordStep(run, "")
+	}
+	mgr.FinishRun(context.Background(), run)
 
 	eventually(t, "FINISH payload", func() bool {
 		f, ok := finishedRun(mock, "run-0001")
-		return ok && f.Status == "completed" && f.TotalSteps == 3
+		return ok && f.Status == "completed" && f.TotalSteps == 3 && len(f.Steps) == 3 &&
+			f.Steps[0].StepNumber == 1 && f.Steps[2].StepNumber == 3
 	})
 
 	// Dropped from active: the next acquire must START afresh.
@@ -676,6 +683,90 @@ func TestClearCooldowns(t *testing.T) {
 	}
 	if m.BanError() != nil {
 		t.Error("ban window not cleared")
+	}
+}
+
+// TestCooldownIpCappedCapsReAdmits pins #118: the CLI treats ip_capped as
+// terminal-until-reset (never an automatic re-admission loop), so the
+// proxy's CooldownIpCapped honors the FULL retryAfterMs (+jitter) for the
+// first refusals of a Pacific day, then locks the token until the next
+// Pacific midnight after maxIpCappedReAdmitsPerDay — with the remembered
+// error's Retry-After reflecting the remaining window.
+func TestCooldownIpCappedCapsReAdmits(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	ice := &upstream.IpCappedError{ActiveUsersForIP: 8, Limit: 6, RetryAfter: 60 * time.Second, Body: `{"status":"ip_capped"}`}
+
+	// Refusals 1..max-1: bounded window = full retryAfterMs + jitter (the
+	// jitter only ever extends the window, never shrinks it).
+	for i := 1; i < maxIpCappedReAdmitsPerDay; i++ {
+		mgr.CooldownIpCapped(ice)
+		until := mgr.CooldownUntil()
+		if !time.Now().Before(until) {
+			t.Fatalf("refusal %d: cooldown already expired, want now+retryAfter(+jitter)", i)
+		}
+		if time.Until(until) < ice.RetryAfter-time.Second {
+			t.Errorf("refusal %d: window %v shorter than retryAfterMs %v (jitter must not shrink it)",
+				i, time.Until(until), ice.RetryAfter)
+		}
+		if got := mgr.IpCappedError(); got == nil || got.RetryAfter != 60*time.Second {
+			t.Errorf("refusal %d: IpCappedError = %+v, want remembered original window", i, got)
+		}
+	}
+
+	// Budget exhausted: terminal until the next Pacific midnight.
+	mgr.CooldownIpCapped(ice)
+	want := upstream.NextPacificMidnight()
+	if until := mgr.CooldownUntil(); until.Sub(want) > time.Second || want.Sub(until) > time.Second {
+		t.Errorf("terminal lock until = %v, want ~Pacific midnight %v", until, want)
+	}
+	got := mgr.IpCappedError()
+	if got == nil {
+		t.Fatal("IpCappedError() = nil after budget exhausted, want remembered terminal error")
+	}
+	if got.RetryAfter < time.Minute {
+		t.Errorf("terminal RetryAfter = %v, want the remaining window to midnight (>= 1m)", got.RetryAfter)
+	}
+
+	// Further refusals the same day must not move the lock (no re-admit loop).
+	first := mgr.CooldownUntil()
+	mgr.CooldownIpCapped(ice)
+	if until := mgr.CooldownUntil(); !until.Equal(first) {
+		t.Errorf("terminal lock moved on extra refusal: %v -> %v", first, until)
+	}
+
+	// Acquire skips the token during the terminal window (shared cooldown).
+	if _, err := mgr.Acquire(context.Background(), agentA); err == nil {
+		t.Error("Acquire during terminal ip_capped lock succeeded, want skip error")
+	}
+
+	// Pacific day rollover resets the budget: the next refusal gets a
+	// bounded window again instead of staying locked.
+	mgr.mu.Lock()
+	mgr.ipCappedDayReset = time.Time{} // force the "new day" branch
+	mgr.mu.Unlock()
+	mgr.CooldownIpCapped(ice)
+	until := mgr.CooldownUntil()
+	if until.Equal(want) {
+		t.Fatal("lock did not lift on the new Pacific day")
+	}
+	if !time.Now().Before(until) || time.Until(until) > ice.RetryAfter+2*time.Minute {
+		t.Errorf("post-reset window = %v, want now+retryAfterMs(+jitter)", time.Until(until))
+	}
+
+	// ClearCooldowns (dashboard unlock) resets the budget too.
+	mgr.CooldownIpCapped(ice)
+	mgr.CooldownIpCapped(ice)
+	mgr.CooldownIpCapped(ice)
+	if !time.Now().Before(mgr.CooldownUntil()) {
+		t.Fatal("expected terminal lock before ClearCooldowns")
+	}
+	mgr.ClearCooldowns()
+	mgr.CooldownIpCapped(ice)
+	if until := mgr.CooldownUntil(); !time.Now().Before(until) || time.Until(until) > ice.RetryAfter+2*time.Minute {
+		t.Errorf("post-ClearCooldowns window = %v, want bounded window (budget reset)", time.Until(until))
 	}
 }
 

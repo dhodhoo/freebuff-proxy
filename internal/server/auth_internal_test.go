@@ -156,7 +156,7 @@ func assertNoTmpFiles(t *testing.T, dir, base string) {
 }
 
 // errorResponse decodes the OpenAI error shape writeError produces.
-func errorResponse(t *testing.T, err error) (status int, body struct {
+func errorResponse(t *testing.T, err error) (status int, hdr http.Header, body struct {
 	Error struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
@@ -172,7 +172,7 @@ func errorResponse(t *testing.T, err error) (status int, body struct {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("writeError response is not JSON: %v: %s", err, w.Body.Bytes())
 	}
-	return w.Code, body
+	return w.Code, w.Header(), body
 }
 
 // TestWriteErrorNewMappings pins the self-healing error matrix additions:
@@ -181,7 +181,7 @@ func errorResponse(t *testing.T, err error) (status int, body struct {
 func TestWriteErrorNewMappings(t *testing.T) {
 	t.Run("country blocked 403", func(t *testing.T) {
 		err := &upstream.CountryBlockedError{CountryCode: "CN", CountryBlockReason: "region_restricted", IpPrivacySignals: []string{"vpn"}}
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusForbidden {
 			t.Errorf("status = %d, want 403", status)
 		}
@@ -195,7 +195,7 @@ func TestWriteErrorNewMappings(t *testing.T) {
 
 	t.Run("free mode cli required 403", func(t *testing.T) {
 		err := fmt.Errorf("free tier gate: %w", upstream.ErrFreeModeCLIRequired)
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusForbidden {
 			t.Errorf("status = %d, want 403", status)
 		}
@@ -210,7 +210,7 @@ func TestWriteErrorNewMappings(t *testing.T) {
 	t.Run("credits 402 with body passthrough", func(t *testing.T) {
 		const upstreamBody = `{"error":"out of credits","model":"deepseek/deepseek-v4-flash"}`
 		err := &upstream.CreditsError{Status: http.StatusPaymentRequired, Body: upstreamBody}
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusPaymentRequired {
 			t.Errorf("status = %d, want 402", status)
 		}
@@ -225,9 +225,41 @@ func TestWriteErrorNewMappings(t *testing.T) {
 		}
 	})
 
+	t.Run("waiting room required 503 with retry-after", func(t *testing.T) {
+		// #116: 428 waiting_room_required surfaces as 503 waiting_room_required
+		// + Retry-After — NEVER a bare 502.
+		err := &upstream.WaitingRoomRequiredError{RetryAfter: 45 * time.Second, Detail: `{"error":"waiting_room_required"}`}
+		status, hdr, body := errorResponse(t, err)
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", status)
+		}
+		if body.Error.Code != "waiting_room_required" {
+			t.Errorf("code = %q, want waiting_room_required", body.Error.Code)
+		}
+		if got := hdr.Get("Retry-After"); got != "45" {
+			t.Errorf("Retry-After = %q, want 45 (the refusal's retryAfter, ceil seconds)", got)
+		}
+	})
+
+	t.Run("session superseded 409", func(t *testing.T) {
+		// #119: 409 session_superseded — terminal, no auto-rejoin.
+		const upstreamBody = `{"error":"session_superseded","message":"another CLI took over"}`
+		err := &upstream.SessionSupersededError{Status: http.StatusConflict, Body: upstreamBody}
+		status, _, body := errorResponse(t, err)
+		if status != http.StatusConflict {
+			t.Errorf("status = %d, want 409", status)
+		}
+		if body.Error.Code != "session_superseded" {
+			t.Errorf("code = %q, want session_superseded", body.Error.Code)
+		}
+		if body.Error.Message != upstreamBody {
+			t.Errorf("message = %q, want upstream body verbatim", body.Error.Message)
+		}
+	})
+
 	t.Run("upstream deadline 504", func(t *testing.T) {
 		err := fmt.Errorf("chat: %w", context.DeadlineExceeded)
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusGatewayTimeout {
 			t.Errorf("status = %d, want 504", status)
 		}
@@ -244,17 +276,17 @@ func TestWriteErrorNewMappings(t *testing.T) {
 // 403 account_banned, rate limit 429, waiting room 503 — the new mappings
 // must not shadow them.
 func TestWriteErrorExistingMappingsUnchanged(t *testing.T) {
-	status, body := errorResponse(t, &upstream.BanError{ResumesAt: time.Now().Add(time.Hour), Body: `{"status":"banned"}`})
+	status, _, body := errorResponse(t, &upstream.BanError{ResumesAt: time.Now().Add(time.Hour), Body: `{"status":"banned"}`})
 	if status != http.StatusForbidden || body.Error.Code != "account_banned" {
 		t.Errorf("ban: status=%d code=%q, want 403 account_banned", status, body.Error.Code)
 	}
 
-	status, body = errorResponse(t, &upstream.RateLimitError{RetryAfter: time.Minute})
+	status, _, body = errorResponse(t, &upstream.RateLimitError{RetryAfter: time.Minute})
 	if status != http.StatusTooManyRequests || body.Error.Code != "rate_limited" {
 		t.Errorf("rate limit: status=%d code=%q, want 429 rate_limited", status, body.Error.Code)
 	}
 
-	status, body = errorResponse(t, &upstream.WaitingRoomError{RetryAfter: time.Minute})
+	status, _, body = errorResponse(t, &upstream.WaitingRoomError{RetryAfter: time.Minute})
 	if status != http.StatusServiceUnavailable || body.Error.Code != "waiting_room_queued" {
 		t.Errorf("waiting room: status=%d code=%q, want 503 waiting_room_queued", status, body.Error.Code)
 	}
@@ -386,7 +418,7 @@ func TestWriteFileAtomicFailurePreservesTarget(t *testing.T) {
 func TestWriteErrorIpCappedAndSessionLimit(t *testing.T) {
 	t.Run("ip capped 429", func(t *testing.T) {
 		err := &upstream.IpCappedError{ActiveUsersForIP: 5, Limit: 4, RetryAfter: 45 * time.Second, Body: `{"status":"ip_capped"}`}
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusTooManyRequests {
 			t.Errorf("status = %d, want 429", status)
 		}
@@ -399,7 +431,7 @@ func TestWriteErrorIpCappedAndSessionLimit(t *testing.T) {
 	})
 	t.Run("session limit reached 409", func(t *testing.T) {
 		err := &upstream.SessionLimitError{Status: http.StatusConflict, Body: `{"error":{"code":"session_limit_reached"}}`}
-		status, body := errorResponse(t, err)
+		status, _, body := errorResponse(t, err)
 		if status != http.StatusConflict {
 			t.Errorf("status = %d, want 409", status)
 		}
@@ -446,7 +478,7 @@ func TestWriteErrorModelIPLimited(t *testing.T) {
 		RetryAfter: 5 * time.Minute,
 		Body:       `{"status":"session_model_mismatch","message":"model z-ai/glm-5.2 is limited on this IP"}`,
 	}
-	status, body := errorResponse(t, err)
+	status, _, body := errorResponse(t, err)
 	if status != http.StatusConflict {
 		t.Errorf("status = %d, want 409", status)
 	}

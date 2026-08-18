@@ -690,11 +690,16 @@ func TestPoolChat(t *testing.T) {
 		t.Errorf("upstream body missing the leased run id: %s", recorded)
 	}
 	h := mock.RecordedChatHeaders[0]
-	if got := h.Get("x-freebuff-model"); got != modelA {
-		t.Errorf("x-freebuff-model = %q, want %q", got, modelA)
+	// #106: the chat POST carries no model/instance headers — they ride in
+	// the body metadata only.
+	if got := h.Get("x-freebuff-model"); got != "" {
+		t.Errorf("x-freebuff-model = %q on the chat POST, want absent (#106)", got)
 	}
-	if got := h.Get("x-freebuff-instance-id"); got != "inst-abc-123" {
-		t.Errorf("x-freebuff-instance-id = %q, want inst-abc-123", got)
+	if got := h.Get("x-freebuff-instance-id"); got != "" {
+		t.Errorf("x-freebuff-instance-id = %q on the chat POST, want absent (#106)", got)
+	}
+	if !strings.Contains(recorded, `"freebuff_instance_id":"inst-abc-123"`) {
+		t.Errorf("upstream body missing freebuff_instance_id in codebuff_metadata: %s", recorded)
 	}
 
 	// Invalid leases fail without panicking.
@@ -1227,9 +1232,10 @@ func TestMaintainTickSkipsCooldownToken(t *testing.T) {
 	defer mock.Close()
 	p := newTestPool(t, mock)
 
-	// An active session + run: a normal maintain pass would heartbeat the
-	// session (GET) and may rotate the run. With the token cooling down the
-	// pass must not touch the upstream at all.
+	// An active session + run: a normal maintain pass would poll the
+	// session (GET) and may rotate the run. With the token cooling down
+	// neither the maintain pass nor the session-poll pass may touch the
+	// upstream at all.
 	lease, err := p.Acquire(context.Background(), modelA)
 	if err != nil {
 		t.Fatal(err)
@@ -1240,8 +1246,9 @@ func TestMaintainTickSkipsCooldownToken(t *testing.T) {
 
 	before := mock.Requests
 	p.maintainTick(context.Background())
+	p.sessionPollTick(context.Background())
 	if got := mock.Requests; got != before {
-		t.Errorf("upstream requests during cooldown maintain = %d, want %d (no heartbeat/rotate)", got, before)
+		t.Errorf("upstream requests during cooldown maintain = %d, want %d (no poll/rotate)", got, before)
 	}
 }
 func TestBridgeLRUEviction(t *testing.T) {
@@ -2426,16 +2433,16 @@ func TestAcquireIpCappedCooldownBounded(t *testing.T) {
 		t.Errorf("RetryAfter = %s, want 45s (bounded to retryAfterMs)", ice.RetryAfter)
 	}
 
-	// Cooldown is bounded to the retry window, NOT the Pacific midnight
-	// quota lock (which would be many hours away).
+	// Cooldown is bounded to the retry window ±20% jitter (#118), NOT the
+	// Pacific midnight quota lock (which would be many hours away).
 	snap := p.Snapshot()[0]
 	if snap.CooldownUntil.IsZero() {
 		t.Fatal("CooldownUntil zero, want bounded window")
 	}
 	want := time.Now().Add(45 * time.Second)
 	diff := snap.CooldownUntil.Sub(want)
-	if diff < -2*time.Second || diff > 2*time.Second {
-		t.Errorf("CooldownUntil = %v, want ≈ now+45s (bounded), not Pacific midnight", snap.CooldownUntil)
+	if diff < -11*time.Second || diff > 11*time.Second {
+		t.Errorf("CooldownUntil = %v, want ≈ now+45s ±20%% jitter (bounded), not Pacific midnight", snap.CooldownUntil)
 	}
 
 	// While the window is active, a second acquire surfaces the remembered
@@ -2462,8 +2469,8 @@ func TestPoolCooldownTokenIpCappedBounded(t *testing.T) {
 	}
 	want := time.Now().Add(30 * time.Second)
 	diff := snap.CooldownUntil.Sub(want)
-	if diff < -2*time.Second || diff > 2*time.Second {
-		t.Errorf("CooldownUntil = %v, want ≈ now+30s (bounded), not Pacific midnight", snap.CooldownUntil)
+	if diff < -8*time.Second || diff > 8*time.Second {
+		t.Errorf("CooldownUntil = %v, want ≈ now+30s ±20%% jitter (bounded), not Pacific midnight", snap.CooldownUntil)
 	}
 
 	// Out-of-range tokens are ignored without panicking.
@@ -2472,11 +2479,11 @@ func TestPoolCooldownTokenIpCappedBounded(t *testing.T) {
 	p.CooldownTokenIpCapped(0, nil)
 }
 
-// TestMaintainTickSkipsHeartbeatWhileChatInFlight verifies #77: the maintain
-// loop skips the session poll/heartbeat GETs while any run holds an
-// in-flight lease (a poll landing mid-chat can kick the active session with
-// 428), and resumes them once the lease drains.
-func TestMaintainTickSkipsHeartbeatWhileChatInFlight(t *testing.T) {
+// TestSessionPollSkipsWhileChatInFlight verifies #77: the session-liveness
+// poll is skipped while any run holds an in-flight lease (a poll landing
+// mid-chat can kick the active session with 428), and resumes once the lease
+// drains.
+func TestSessionPollSkipsWhileChatInFlight(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	p := newTestPool(t, mock)
@@ -2491,15 +2498,83 @@ func TestMaintainTickSkipsHeartbeatWhileChatInFlight(t *testing.T) {
 	}
 
 	before := mock.SessionPolls
-	p.maintainTick(context.Background())
+	p.sessionPollTick(context.Background())
 	if got := mock.SessionPolls; got != before {
-		t.Errorf("session polls during in-flight chat = %d, want %d (heartbeat/advance skipped)", got, before)
+		t.Errorf("session polls during in-flight chat = %d, want %d (poll skipped)", got, before)
 	}
 
-	// Release the lease: the next maintain pass heartbeats again.
+	// Release the lease: the next poll pass polls again.
 	p.LeaseRelease(lease)
-	p.maintainTick(context.Background())
+	p.sessionPollTick(context.Background())
 	if got := mock.SessionPolls; got <= before {
-		t.Errorf("session polls after release = %d, want > %d (heartbeat resumed)", got, before)
+		t.Errorf("session polls after release = %d, want > %d (poll resumed)", got, before)
 	}
+}
+
+// TestSessionPollSchedule pins the liveness-poll cadence helpers (gap #2;
+// reference/freebuff sdk polling-backoff.ts): the success interval is ~30s
+// ±20% jitter capped to remaining+1s near expiry, and the failure backoff
+// grows 20s→300s while never scheduling a retry before the server's
+// Retry-After floor.
+func TestSessionPollSchedule(t *testing.T) {
+	t.Run("success interval jittered around 30s", func(t *testing.T) {
+		for i := 0; i < 50; i++ {
+			d := sessionPollSuccessDelay(session.SessionSnapshot{})
+			if d < 24*time.Second || d > 36*time.Second {
+				t.Fatalf("success delay = %s, want 30s ±20%%", d)
+			}
+		}
+	})
+
+	t.Run("success interval capped near expiry", func(t *testing.T) {
+		rem := 10 * time.Second
+		d := sessionPollSuccessDelay(session.SessionSnapshot{ExpiresAt: time.Now().Add(rem)})
+		// remaining+1s (clock-drift tolerant: allow a few ms either side of
+		// the two time.Now() samples).
+		if d < rem || d > rem+2*time.Second {
+			t.Errorf("success delay near expiry = %s, want ≈ %s (remaining+1s)", d, rem+time.Second)
+		}
+	})
+
+	t.Run("failure backoff doubles and caps at 300s", func(t *testing.T) {
+		cases := []struct {
+			failures int
+			min      time.Duration
+			max      time.Duration
+		}{
+			{1, 10 * time.Second, 20 * time.Second},   // 20s, lower-half jitter
+			{2, 20 * time.Second, 40 * time.Second},   // 40s
+			{3, 40 * time.Second, 80 * time.Second},   // 80s
+			{6, 150 * time.Second, 300 * time.Second}, // capped at 300s
+		}
+		for _, tc := range cases {
+			d := sessionPollBackoffDelay(tc.failures, 0)
+			if d < tc.min || d > tc.max {
+				t.Errorf("backoff(%d) = %s, want [%s, %s]", tc.failures, d, tc.min, tc.max)
+			}
+		}
+	})
+
+	t.Run("failure backoff honors Retry-After floor", func(t *testing.T) {
+		for i := 0; i < 50; i++ {
+			d := sessionPollBackoffDelay(1, 60*time.Second)
+			// retryAfter × (1 ± 0.2) jitter: [48s, 72s], max'd with the 20s
+			// base backoff — never before the floor.
+			if d < 48*time.Second || d > 300*time.Second {
+				t.Errorf("backoff with Retry-After 60s = %s, want ≥ 48s (never before the floor)", d)
+			}
+		}
+	})
+
+	t.Run("retry-after extracted from classified errors", func(t *testing.T) {
+		if got := sessionPollRetryAfter(&upstream.UpstreamError{Status: 503, RetryAfter: 45 * time.Second}); got != 45*time.Second {
+			t.Errorf("UpstreamError RetryAfter = %s, want 45s", got)
+		}
+		if got := sessionPollRetryAfter(&upstream.RateLimitError{RetryAfter: 90 * time.Second}); got != 90*time.Second {
+			t.Errorf("RateLimitError RetryAfter = %s, want 90s", got)
+		}
+		if got := sessionPollRetryAfter(errors.New("plain")); got != 0 {
+			t.Errorf("plain error RetryAfter = %s, want 0", got)
+		}
+	})
 }

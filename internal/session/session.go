@@ -88,7 +88,7 @@ type Manager struct {
 	reAdmitLead time.Duration
 	// probeTTL (issue #60, SESSION_PROBE_CACHE_TTL default 15s) + lastAdmitted:
 	// the last successful upstream session response is reused to skip a
-	// redundant GET (heartbeat) within the TTL.
+	// redundant poll GET within the TTL.
 	probeTTL     time.Duration
 	lastAdmitted time.Time
 
@@ -153,7 +153,7 @@ func (m *Manager) SetReAdmitLead(d time.Duration) {
 }
 
 // SetAdmissionProbeTTL configures the admission probe cache TTL (issue #60):
-// heartbeat GETs within d of the last successful session response are
+// session poll GETs within d of the last successful session response are
 // skipped. d <= 0 disables. Wired by the pool from SESSION_PROBE_CACHE_TTL;
 // safe to call at runtime.
 func (m *Manager) SetAdmissionProbeTTL(d time.Duration) {
@@ -298,6 +298,28 @@ func shortInstance(id string) string {
 	return id
 }
 
+// sessionUsable reports whether the cached state can serve a chat right now:
+// an active session until expiresAt-5s (the reference safety margin), or any
+// state that still holds a live instance id within the 30-minute grace drain
+// after expiry (gap #13, FREEBUFF_SESSION_GRACE_MS: within grace the row
+// stays alive and chat passes — reference/freebuff freebuff-session.ts). The
+// instance-id test guards the grace extension: an ended row whose instance id
+// is gone cannot be ridden, and an expired active cache is only reusable
+// while its slot survives upstream.
+func sessionUsable(s *cachedState) bool {
+	if s == nil || s.instanceID == "" {
+		return false
+	}
+	if s.status == "active" && time.Now().Before(s.expiresAt.Add(-expiryMargin)) {
+		return true
+	}
+	graceEnd := s.gracePeriodEndsAt
+	if graceEnd.IsZero() && !s.expiresAt.IsZero() {
+		graceEnd = s.expiresAt.Add(graceWindow)
+	}
+	return !graceEnd.IsZero() && time.Now().Before(graceEnd)
+}
+
 // commit replaces the cached state and mirrors it into the store (when
 // configured). Caller must hold m.mu.
 //
@@ -339,17 +361,24 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 		s := m.state
 		if s != nil && !m.refreshing {
 			switch s.status {
-			case "active":
-				if (model == "" || s.model == "" || s.model == model) && time.Now().Before(s.expiresAt.Add(-expiryMargin)) {
+			case "active", "ended":
+				// Fast path: reuse the cached instance while it is usable —
+				// an active session until expiresAt-5s, or (gap #13) a
+				// session whose instance id survives the 30-minute grace
+				// drain (FREEBUFF_SESSION_GRACE_MS: within grace the row
+				// stays alive and chat passes).
+				if (model == "" || s.model == "" || s.model == model) && sessionUsable(s) {
 					instance := s.instanceID
-					// Issue #99: pre-emptive re-admit. When the session has
-					// less than the re-admit lead left, kick off an async
-					// re-admit (single-flight through the refreshing
-					// machinery) and ride the old session this request; the
-					// next request gets the new instance. The refresh runs on
-					// a background context so the caller's cancellation never
-					// strands a half-started admission.
-					if m.reAdmitLead > 0 && time.Until(s.expiresAt.Add(-expiryMargin)) <= m.reAdmitLead {
+					// Issue #99: pre-emptive re-admit. Only while the
+					// session is still pre-expiry (within reAdmitLead of
+					// expiresAt-5s): inside the grace drain the CLI rides
+					// the old row until grace ends, and a fresh admission
+					// would supersede it. The refresh runs on a background
+					// context so the caller's cancellation never strands a
+					// half-started admission.
+					if s.status == "active" && m.reAdmitLead > 0 &&
+						time.Now().Before(s.expiresAt.Add(-expiryMargin)) &&
+						time.Until(s.expiresAt.Add(-expiryMargin)) <= m.reAdmitLead {
 						m.refreshing = true
 						m.refreshErr = nil
 						refreshCh := make(chan struct{})
@@ -363,7 +392,8 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 					slog.Debug("session reused", "instance_id", instance, "model", s.model, "expires_at", s.expiresAt.Format(time.RFC3339))
 					return instance, nil
 				}
-				// Freshness exceeded or model mismatch — fall through to refresh.
+				// Usability exhausted (past grace) or model mismatch — fall
+				// through to refresh.
 			case "disabled":
 				m.mu.Unlock()
 				return "", nil
@@ -414,10 +444,10 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 						}
 					}
 					// Issue #99: a failed pre-emptive re-admit leaves the old
-					// active session authoritative — ride it rather than
-					// erroring a request that could still be served.
-					if s != nil && s.status == "active" &&
-						time.Now().Before(s.expiresAt.Add(-expiryMargin)) {
+					// session authoritative — ride it rather than erroring a
+					// request that could still be served (through the grace
+					// drain, gap #13).
+					if s != nil && sessionUsable(s) {
 						return s.instanceID, nil
 					}
 					return "", err
@@ -502,7 +532,7 @@ func (m *Manager) asyncReAdmit(model string) {
 // statusError maps an upstream session status to the typed error callers
 // use for recovery (token cooldown, region surfacing). st supplies the
 // fields carried by the error; non-error statuses return nil. Shared by
-// refresh and Heartbeat so both map the same way.
+// refresh and Poll so both map the same way.
 func statusError(status string, st *upstream.SessionState) error {
 	switch status {
 	case "banned":
@@ -620,7 +650,8 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 				standing:           st.Standing,
 			})
 			// Issue #60: the successful admission refreshes the probe cache
-			// window — subsequent heartbeat GETs within the TTL are skipped.
+			// window — subsequent session poll GETs within the TTL are
+			// skipped.
 			m.lastAdmitted = time.Now()
 			m.mu.Unlock()
 			slog.Debug("session created", "status", "active", "instance_id", st.InstanceID,
@@ -825,46 +856,59 @@ func (m *Manager) EndSession(ctx context.Context) error {
 		return nil
 	}
 	slog.Debug("session ended", "instance_id", instanceID)
-	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) {
+	// A superseded DELETE is the same "slot already gone" case as
+	// session-invalid (#119): swallow both so teardown never errors on a
+	// slot another instance took over.
+	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
 		return err
 	}
 	return nil
 }
 
-// Shutdown handles session teardown at process shutdown. When persistence is
-// disabled it behaves exactly like EndSession (DELETE upstream). When
-// persistence is enabled, only a genuinely active + unexpired session is kept
-// alive — so a later restart can resume it — and its state is flushed to the
-// store. Every other state (nil, queued, disabled, expired-active, ended)
-// falls through to the normal EndSession path, which releases the upstream
-// slot and removes the store entry via the CAS commit. Runs are FINISHed
-// separately by the run manager.
+// Shutdown handles session teardown at process shutdown. Per the CLI
+// (gap #13), exit ALWAYS releases the upstream session slot (DELETE),
+// whether or not persistence is enabled — the CLI DELETEs on exit and a
+// later restart re-admits fresh. When persistence is enabled the cached
+// state is flushed to the store FIRST (so a crash mid-shutdown does not
+// lose the entry) and the entry survives the DELETE: a restart resumes via
+// pollPersisted, which re-adopts the slot when the DELETE did not take
+// effect upstream, or drops the dead entry and re-POSTs fresh when it did.
+// Runs are FINISHed separately by the run manager.
 func (m *Manager) Shutdown(ctx context.Context) error {
 	if m.store == nil {
+		// No persistence: exactly the normal EndSession path (DELETE
+		// upstream + drop the cache).
 		return m.EndSession(ctx)
 	}
 	m.mu.Lock()
-	keepAlive := false
 	instanceID := ""
-	if s := m.state; s != nil && s.status == "active" && s.instanceID != "" &&
-		time.Now().Before(s.expiresAt.Add(-expiryMargin)) {
-		keepAlive = true
-		instanceID = s.instanceID
-		m.store.Save(m.key, s)
+	if m.state != nil && m.state.instanceID != "" {
+		instanceID = m.state.instanceID
+		m.store.Save(m.key, m.state)
 		// Surface a failed flush: without the persisted entry a restart
 		// cannot resume the slot, so a write/rename failure must not be
 		// silent. Re-read the FILE through a fresh Store — the in-memory
 		// map is updated before the flush attempt and cannot verify disk.
 		if persisted := NewStore(m.store.path).Load(m.key); persisted == nil || persisted.instanceID != instanceID {
-			slog.Warn("session: keep-alive persist failed", "instance_id", instanceID)
+			slog.Warn("session: shutdown persist failed", "instance_id", shortInstance(instanceID))
 		}
 	}
 	m.mu.Unlock()
-	if keepAlive {
-		slog.Debug("session kept for restart", "instance_id", instanceID)
+
+	if instanceID == "" {
 		return nil
 	}
-	return m.EndSession(ctx)
+	// Release the upstream slot directly (not EndSession): EndSession's CAS
+	// commit(nil) would remove the store entry we just flushed, and the
+	// DELETE is keyed on the user, not the instance (reference/freebuff
+	// session wire: DELETE = Bearer only, #120 — EndSession never sends the
+	// instance header). The cached state is kept in-memory so the store
+	// entry stays; the process is exiting.
+	slog.Debug("session ended on shutdown", "instance_id", shortInstance(instanceID))
+	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
+		return err
+	}
+	return nil
 }
 
 // pollPersisted attempts to resume a persisted session before a fresh create
@@ -936,18 +980,24 @@ func (m *Manager) pollPersisted(ctx context.Context, requestedModel string) (*up
 	}
 }
 
-// Heartbeat sends a periodic compact GET with x-freebuff-heartbeat: 1 for active sessions,
-// keeping last_seen_at fresh on the server so the session concurrency slot is maintained.
-func (m *Manager) Heartbeat(ctx context.Context) error {
+// Poll runs the periodic session-liveness poll: a compact GET with NO
+// heartbeat header — the CLI never beats (x-freebuff-heartbeat is
+// Desktop-only, reference/freebuff freebuff-models.ts:1212-1215); liveness
+// comes from the recurring compact GET itself (gap #2). It refreshes the
+// cached state the way the CLI's 30s compact poll does: statusError
+// mappings, drop-on-ban, invalidate on superseded/none, and — within the
+// 30-minute grace drain — an ended response that still carries the instance
+// id is kept as a usable "ended" row instead of being invalidated (gap #13).
+func (m *Manager) Poll(ctx context.Context) error {
 	m.mu.Lock()
-	if m.state == nil || m.state.status != "active" || m.state.instanceID == "" {
+	if m.state == nil || (m.state.status != "active" && m.state.status != "ended") || m.state.instanceID == "" {
 		m.mu.Unlock()
 		return nil
 	}
 	// Issue #60: admission probe caching — within the probe TTL of the last
 	// successful session response the cached state is authoritative, so the
-	// heartbeat GET is redundant; skip it (less upstream traffic, fewer
-	// chances to trip the one-client-at-a-time gate).
+	// poll GET is redundant; skip it (less upstream traffic, fewer chances
+	// to trip the one-client-at-a-time gate).
 	if m.probeTTL > 0 && !m.lastAdmitted.IsZero() && time.Since(m.lastAdmitted) < m.probeTTL {
 		m.mu.Unlock()
 		return nil
@@ -955,8 +1005,22 @@ func (m *Manager) Heartbeat(ctx context.Context) error {
 	instanceID := m.state.instanceID
 	m.mu.Unlock()
 
-	st, err := m.client.GetSessionWithOpts(ctx, instanceID, true, true)
+	st, err := m.client.GetSessionWithOpts(ctx, instanceID, true)
 	if err != nil {
+		// #116: 428 waiting_room_required is session-ENDING
+		// (endsTheSession:true per FREEBUFF_GATE_CODES — the seat is gone;
+		// reference/freebuff freebuff-session.ts). Drop the cached admission
+		// so the next EnsureSession re-admits fresh (the pool's
+		// WAITING_ROOM_CHAIN fires before the create). Any other poll error
+		// is left for the pool's failure backoff.
+		if errors.Is(err, upstream.ErrWaitingRoomRequired) {
+			m.mu.Lock()
+			if m.state != nil && m.state.instanceID == instanceID {
+				m.commit(nil)
+				slog.Debug("session dropped during poll", "reason", "waiting_room_required", "instance_id", instanceID)
+			}
+			m.mu.Unlock()
+		}
 		return err
 	}
 	m.mu.Lock()
@@ -966,24 +1030,60 @@ func (m *Manager) Heartbeat(ctx context.Context) error {
 	if serr := statusError(st.Status, st); serr != nil {
 		// A banned session is dead until the account unban: drop the cached
 		// admission (cooldown) so the token re-admits only after the pool's
-		// ban window, instead of heartbeat-ing a stale slot.
+		// ban window, instead of polling a stale slot.
 		if st.Status == "banned" {
 			m.mu.Lock()
 			if m.state != nil && m.state.instanceID == instanceID {
 				m.commit(nil)
-				slog.Debug("session dropped during heartbeat", "reason", st.Status, "instance_id", instanceID)
+				slog.Debug("session dropped during poll", "reason", st.Status, "instance_id", instanceID)
 			}
 			m.mu.Unlock()
 		}
 		return serr
 	}
-	if st.Status == "ended" || st.Status == "superseded" || st.Status == "none" {
+	if st.Status == "superseded" || st.Status == "none" {
 		m.mu.Lock()
 		if m.state != nil && m.state.instanceID == instanceID {
 			m.commit(nil)
-			slog.Debug("session ended during heartbeat", "reason", st.Status, "instance_id", instanceID)
+			slog.Debug("session ended during poll", "reason", st.Status, "instance_id", instanceID)
 		}
 		m.mu.Unlock()
+		return nil
+	}
+	if st.Status == "ended" {
+		// Ended WITH the instance id still present: the row is in the 30-min
+		// grace drain and stays usable (gap #13). Refresh the cached state
+		// as ended-with-instance so the fast path keeps serving it until
+		// grace closes; the pool keeps polling. The grace end comes from the
+		// response when present, else expiresAt + graceWindow.
+		graceEnd := st.GracePeriodEndsAt
+		if graceEnd.IsZero() && !st.ExpiresAt.IsZero() {
+			graceEnd = st.ExpiresAt.Add(graceWindow)
+		}
+		if st.InstanceID != "" && !graceEnd.IsZero() && time.Now().Before(graceEnd) {
+			m.mu.Lock()
+			if m.state != nil && m.state.instanceID == instanceID {
+				m.commit(&cachedState{
+					status:            "ended",
+					instanceID:        st.InstanceID,
+					model:             m.state.model,
+					expiresAt:         st.ExpiresAt,
+					gracePeriodEndsAt: graceEnd,
+				})
+				slog.Debug("session in grace drain during poll", "instance_id", instanceID, "grace_ends_at", graceEnd.Format(time.RFC3339))
+			}
+			m.mu.Unlock()
+			return nil
+		}
+		// The row is gone (no instance id) or past grace: drop it so the
+		// next EnsureSession re-creates a fresh session.
+		m.mu.Lock()
+		if m.state != nil && m.state.instanceID == instanceID {
+			m.commit(nil)
+			slog.Debug("session ended during poll", "reason", st.Status, "instance_id", instanceID)
+		}
+		m.mu.Unlock()
+		return nil
 	}
 	return nil
 }

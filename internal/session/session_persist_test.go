@@ -282,12 +282,14 @@ func TestPersistModelMatchAdopted(t *testing.T) {
 	})
 }
 
-// TestShutdownKeepAliveOnlyWhenResumable verifies Shutdown keeps the upstream
-// session alive only for genuinely active + unexpired sessions. Every other
-// state falls through to the normal EndSession path (upstream DELETE + store
-// removal via the CAS commit).
-func TestShutdownKeepAliveOnlyWhenResumable(t *testing.T) {
-	t.Run("active unexpired kept", func(t *testing.T) {
+// TestShutdownAlwaysDeletesEvenWhenPersisting verifies gap #13: shutdown
+// ALWAYS releases the upstream session slot (DELETE) whether or not
+// persistence is enabled — the CLI DELETEs on exit. The store entry is
+// still written (and survives the DELETE) so a restart can resume via
+// pollPersisted, which drops the dead entry and re-POSTs fresh when the
+// DELETE took effect upstream.
+func TestShutdownAlwaysDeletesEvenWhenPersisting(t *testing.T) {
+	t.Run("active unexpired deleted but entry kept", func(t *testing.T) {
 		mock := testutil.NewMock()
 		defer mock.Close()
 		store := NewStore(filepath.Join(t.TempDir(), "state.json"))
@@ -299,15 +301,15 @@ func TestShutdownKeepAliveOnlyWhenResumable(t *testing.T) {
 		if err := mgr.Shutdown(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if mock.SessionEnds != 0 {
-			t.Errorf("SessionEnds = %d, want 0 (active+unexpired kept for restart)", mock.SessionEnds)
+		if mock.SessionEnds != 1 {
+			t.Errorf("SessionEnds = %d, want 1 (DELETE on exit even when persisting)", mock.SessionEnds)
 		}
 		if got := store.Load(key); got == nil || got.instanceID != "inst-abc-123" {
-			t.Errorf("store after Shutdown = %+v, want active inst-abc-123", got)
+			t.Errorf("store after Shutdown = %+v, want active inst-abc-123 (entry survives the DELETE)", got)
 		}
 	})
 
-	t.Run("queued ends upstream and drops entry", func(t *testing.T) {
+	t.Run("queued ends upstream and entry kept", func(t *testing.T) {
 		mock := testutil.NewMock()
 		defer mock.Close()
 		mock.SessionSequence = []string{"queued"}
@@ -333,12 +335,14 @@ func TestShutdownKeepAliveOnlyWhenResumable(t *testing.T) {
 		if mock.SessionEnds != 1 {
 			t.Errorf("SessionEnds = %d, want 1 (queued releases the upstream slot)", mock.SessionEnds)
 		}
-		if got := store.Load(key); got != nil {
-			t.Errorf("store after Shutdown = %+v, want nil (entry removed)", got)
+		// The queued entry survives the DELETE; a restart ignores it
+		// (pollPersisted only resumes active slots) and re-POSTs fresh.
+		if got := store.Load(key); got == nil || got.status != "queued" {
+			t.Errorf("store after Shutdown = %+v, want queued entry kept", got)
 		}
 	})
 
-	t.Run("expired active ends upstream", func(t *testing.T) {
+	t.Run("expired active deleted but entry kept", func(t *testing.T) {
 		mock := testutil.NewMock()
 		defer mock.Close()
 		store := NewStore(filepath.Join(t.TempDir(), "state.json"))
@@ -359,10 +363,10 @@ func TestShutdownKeepAliveOnlyWhenResumable(t *testing.T) {
 			t.Fatal(err)
 		}
 		if mock.SessionEnds != 1 {
-			t.Errorf("SessionEnds = %d, want 1 (expired-active is not resumable)", mock.SessionEnds)
+			t.Errorf("SessionEnds = %d, want 1 (DELETE on exit)", mock.SessionEnds)
 		}
-		if got := store.Load(key); got != nil {
-			t.Errorf("store after Shutdown = %+v, want nil", got)
+		if got := store.Load(key); got == nil || got.instanceID != "inst-expired" {
+			t.Errorf("store after Shutdown = %+v, want inst-expired entry kept", got)
 		}
 	})
 }

@@ -46,8 +46,10 @@ import (
 // Typed error sentinels. Callers use errors.Is against these; the concrete
 // error values wrap an UpstreamError where applicable.
 var (
-	// ErrSessionInvalid: the free session is stale/superseded/expired or a
-	// waiting room / update is required. Refresh the session and retry once.
+	// ErrSessionInvalid: the free session is stale/expired, model-locked, or
+	// an update is required. Refresh the session and retry once. (409
+	// session_superseded is its OWN terminal sentinel, ErrSessionSuperseded
+	// — #119.)
 	ErrSessionInvalid = errors.New("upstream session invalid")
 	// ErrRunInvalid: the agent run is gone. Rotate the run and retry once.
 	ErrRunInvalid = errors.New("upstream run invalid")
@@ -87,8 +89,11 @@ var (
 	// ErrIpCapped: 429 ip_capped — too many DISTINCT users hold an active
 	// free session on the egress IP. Admission-only: existing sessions keep
 	// running and the request succeeds once one of them ends, so unlike
-	// ErrRateLimited it is NOT tied to a quota reset and must never trigger
-	// the Pacific-midnight lock (reference/freebuff freebuff-session.ts).
+	// ErrRateLimited it is NOT tied to a quota reset upstream (reference/
+	// freebuff freebuff-session.ts). The proxy's CooldownIpCapped adds a
+	// bounded re-admission policy (#118): full retryAfter + jitter per hit,
+	// with a per-token daily cap (3rd hit in a rolling window) that locks
+	// until the Pacific-midnight reset.
 	ErrIpCapped = errors.New("upstream ip capped")
 	// ErrSessionLimitReached: 409 session_limit_reached — the ACCOUNT is
 	// over its concurrent-tab budget; this session's row is fine
@@ -98,11 +103,15 @@ var (
 	ErrSessionLimitReached = errors.New("upstream session limit reached")
 	// ErrWaitingRoomRequired: 428 waiting_room_required — the account must
 	// walk the reference pre-session flow (request_ad_chain + get_streak)
-	// before the next session create (issue #94). Retryable with Retry-After
-	// honored, NO token cooldown, and deliberately DISTINCT from
-	// ErrSessionInvalid: the cached session row is not stale, so the
-	// session must NOT be invalidated/refreshed (reference
-	// freebuff2api-optimized codebuff.py:1048-1074).
+	// before the next session create (issue #94). endsTheSession:true per
+	// FREEBUFF_GATE_CODES (the seat is gone mid-chat), so the server drops
+	// the cached session and re-admits once; the WAITING_ROOM_CHAIN gate
+	// stays gated — the flag is recorded by Client.classify and the chain
+	// fires before the next create. Retryable with Retry-After honored, NO
+	// token cooldown, and deliberately DISTINCT from ErrSessionInvalid:
+	// the recovery is re-admit-once, never the invalidate+refresh loop
+	// (reference/freebuff freebuff-session.ts FREEBUFF_GATE_CODES,
+	// send-message.ts handleFreebuffGateError).
 	ErrWaitingRoomRequired = errors.New("upstream waiting room required")
 	// ErrModelIPLimited: the egress IP cannot serve the requested model
 	// (session_model_mismatch + "limited" marker, or the limited_ip session
@@ -111,6 +120,16 @@ var (
 	// model) pairing, so the session must NOT be invalidated/refreshed
 	// (that would burn a daily session slot re-admitting).
 	ErrModelIPLimited = errors.New("upstream: model limited on egress IP")
+	// ErrSessionSuperseded: 409 session_superseded — another client/instance
+	// took over the account; this session's row is GONE (endsTheSession:true
+	// per FREEBUFF_GATE_CODES). TERMINAL gate rejection: the server must
+	// NOT auto-reacquire within the same request (auto-takeover risks
+	// ping-pong with the other instance) — it drops the cached row so the
+	// NEXT request re-joins fresh and surfaces 409 session_superseded
+	// (reference/freebuff freebuff-session.ts FREEBUFF_GATE_CODES,
+	// send-message.ts handleFreebuffGateError, use-freebuff-session.ts
+	// nextDelayMs returns null for superseded = stop polling).
+	ErrSessionSuperseded = errors.New("upstream session superseded")
 )
 
 // WaitingRoomError is the concrete value behind ErrWaitingRoom; callers
@@ -156,6 +175,21 @@ func (e *WaitingRoomRequiredError) Error() string {
 }
 
 func (e *WaitingRoomRequiredError) Unwrap() error { return ErrWaitingRoomRequired }
+
+// SessionSupersededError is the concrete value behind ErrSessionSuperseded
+// (#119): a 409 session_superseded gate rejection — another instance took
+// over the account (endsTheSession:true). Terminal: callers surface it as
+// 409 session_superseded and never auto-reacquire in-request.
+type SessionSupersededError struct {
+	Status int
+	Body   string // truncated upstream body
+}
+
+func (e *SessionSupersededError) Error() string {
+	return fmt.Sprintf("upstream %d: %s", e.Status, e.Body)
+}
+
+func (e *SessionSupersededError) Unwrap() error { return ErrSessionSuperseded }
 
 // UpstreamError is a non-recoverable upstream failure surfaced verbatim.
 type UpstreamError struct {
@@ -262,8 +296,9 @@ func (e *CreditsError) Unwrap() error { return ErrCredits }
 // automatically. The client retries it in-place against the SAME lease and
 // session (up to TRANSIENT_RETRIES extra attempts) before surfacing it; it
 // is never a token cooldown and never a session invalidation. Unwrap yields
-// a Retryable UpstreamError so generic server paths surface it as a
-// retryable 503 once the client-side budget is exhausted.
+// a Retryable UpstreamError so errors.As finds it, but writeError has a
+// dedicated branch: it surfaces as 429 free_mode_capacity_deferred with
+// Retry-After once the client-side budget is exhausted (#105) — not a 503.
 type CapacityDeferredError struct {
 	Status     int
 	RetryAfter time.Duration
@@ -286,10 +321,12 @@ func (e *CapacityDeferredError) Unwrap() error {
 // IpCappedError is a 429 ip_capped response: too many DISTINCT users already
 // hold an active free session on this egress IP. Admission-only — existing
 // sessions on the IP keep running, and the request succeeds once one of them
-// ends — so unlike RateLimitError it is NOT tied to a quota reset and never
-// falls back to the Pacific-midnight lock. RetryAfter comes from the body's
-// retryAfterMs only (reference/freebuff freebuff-session.ts). Unwrap makes
-// errors.Is(err, ErrIpCapped) work.
+// ends — so unlike RateLimitError it is NOT tied to a quota reset upstream.
+// RetryAfter comes from the body's retryAfterMs only (reference/freebuff
+// freebuff-session.ts). The proxy's CooldownIpCapped applies the bounded
+// re-admission policy (#118): full retryAfter + jitter per hit, with a
+// per-token daily cap that locks until the Pacific-midnight reset.
+// Unwrap makes errors.Is(err, ErrIpCapped) work.
 type IpCappedError struct {
 	ActiveUsersForIP int
 	Limit            float64
@@ -479,6 +516,12 @@ type ChatOptions struct {
 	// CLI (run.ts: previousRun?.traceSessionId ?? randomUUID). Injected as
 	// codebuff_metadata["trace_session_id"] when set.
 	TraceSessionID string
+	// StepNumber is the 1-based per-run agent step counter (CLI parity:
+	// llm_step_number is merged on every chat call, String(n);
+	// reference/freebuff agent-runtime run-agent-step.ts:1175-1177).
+	// Injected as codebuff_metadata["llm_step_number"] when > 0; the run
+	// manager sets it per chat call at the server construction sites.
+	StepNumber int
 }
 
 // Client speaks the codebuff.com wire protocol for a single token.
@@ -491,9 +534,8 @@ type Client struct {
 	requestTimeout     time.Duration
 	sessionCallTimeout time.Duration
 	requestJitter      time.Duration
-	cliVersion         string
 	costMode           string
-	userID             string // optional x-freebuff-acting-user-id (USER_ID; CLI parity)
+	userID             string // optional x-freebuff-acting-user-id (ACTING_USER_ID; see New's doc + client.go acting-user comment: only the token's OWN account id is safe)
 	debugDump          bool
 
 	// transientRetriesLimit is TRANSIENT_RETRIES: the maximum number of
@@ -555,14 +597,30 @@ func (c *Client) TokenKey() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// cliUserAgent mirrors the official CLI / SDK user agent. The upstream
-// free-tier gate (403 free_mode_cli_required) keys on the CLI request
-// envelope (x-freebuff-* headers, codebuff_metadata, forced streaming and
-// the cb_easp stop sentinel — see the package comment), NOT the User-Agent,
-// so the stealth path may carry a browser UA matched to its TLS fingerprint
-// without tripping the gate. This constant is applied on the non-stealth
-// path so the request signature stays identical on every request.
-const cliUserAgent = "ai-sdk/openai-compatible/0.10.7/codebuff"
+// cliUserAgent mirrors the official CLI chat user agent: the pinned
+// @codebuff/llm-providers version, NOT the CLI_VERSION knob
+// (reference/freebuff model-provider.ts:150; llm-providers package.json
+// 1.0.0). The upstream free-tier gate (403 free_mode_cli_required) keys on
+// the CLI request envelope (x-freebuff-* headers, codebuff_metadata, forced
+// streaming and the cb_easp stop sentinel — see the package comment), but
+// the server still fingerprints the UA, and 0.10.7 (the SDK version) is
+// never emitted by a real CLI. Every upstream API call (chat + session +
+// agent-runs) sends this UA — no browser persona (#108/#109).
+const cliUserAgent = "ai-sdk/openai-compatible/1.0.0/codebuff"
+
+// freebuffCliUA is the ads-API request User-Agent, mirroring the installed
+// official CLI binary the proxy emulates (reference
+// cli/src/hooks/use-gravity-ad.ts getCliAdRequestUserAgent:
+// "Freebuff-CLI/<CODEBUFF_CLI_VERSION>"; 0.0.149 = the vendored binary).
+const freebuffCliUA = "Freebuff-CLI/0.0.149"
+
+// adBrowserUserAgent is the browser-like user agent passed to ad providers
+// for targeting/fraud screening (#124). The CLI ships one per platform and
+// warns that native runtime UAs look bot-like to ad networks
+// (reference common/src/util/ad-user-agent.ts: Chrome 124; use-gravity-ad.ts
+// sends it as the body userAgent). The proxy runs on Windows by default, so
+// the win32 entry is the faithful choice.
+const adBrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 // New builds the client for one token.
 func New(token string, cfg *config.Config) (*Client, error) {
@@ -582,11 +640,6 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		return nil, errors.New("upstream: nil config")
 	}
 
-	cliVer := cfg.CLIVersion
-	if cliVer == "" {
-		cliVer = "0.10.7"
-	}
-
 	c := &Client{
 		token:                 token,
 		tokenIndex:            tokenIndex,
@@ -594,9 +647,8 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		requestTimeout:        cfg.RequestTimeout,
 		sessionCallTimeout:    cfg.SessionCallTimeout,
 		requestJitter:         cfg.RequestJitter,
-		cliVersion:            cliVer,
 		costMode:              cfg.CostMode,
-		userID:                cfg.UserID,
+		userID:                cfg.ActingUserID,
 		debugDump:             cfg.DebugDump,
 		transientRetriesLimit: cfg.TransientRetries,
 		http2Upstream:         cfg.HTTP2Upstream,
@@ -695,11 +747,12 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 				return errors.New("too many redirects")
 			}
 			// Go strips Authorization/Cookie on cross-host redirects but not
-			// x-codebuff-api-key, which carries the same raw token. Drop both
-			// when the redirect target is a different host OR downgrades the
-			// scheme https->http (same host, plaintext) so the token never
-			// leaks to a redirect target; same-scheme same-host redirects
-			// (e.g. CDN or bare-host -> www) keep their credentials.
+			// x-codebuff-api-key, which carried the same raw token (defensive —
+			// newRequest no longer sets it, #107). Drop both when the redirect
+			// target is a different host OR downgrades the scheme https->http
+			// (same host, plaintext) so the token never leaks to a redirect
+			// target; same-scheme same-host redirects (e.g. CDN or bare-host
+			// -> www) keep their credentials.
 			if !strings.EqualFold(via[0].URL.Host, req.URL.Host) ||
 				(strings.EqualFold(via[0].URL.Scheme, "https") && strings.EqualFold(req.URL.Scheme, "http")) {
 				req.Header.Del("Authorization")
@@ -762,14 +815,24 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 			req = req.WithContext(reqCtx)
 		}
 		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set("x-freebuff-model", opts.Model)
-		if opts.SessionInstanceID != "" {
-			req.Header.Set("x-freebuff-instance-id", opts.SessionInstanceID)
-		}
+		// The chat POST carries NO x-freebuff-model / x-freebuff-instance-id
+		// headers (#106): the official CLI sends exactly Authorization + the
+		// ai-sdk UA (+ optional acting-user-id) on chat
+		// (reference/freebuff model-provider.ts:146-152); the model and
+		// instance id ride only in the body metadata (injectEnvelope).
 		if c.userID != "" {
-			// The official CLI sends the acting user id on every chat call and
-			// the free-mode gate expects it
-			// (reference/proxy-freebuff/server.js:131-134).
+			// The official CLI sends x-freebuff-acting-user-id on every
+			// chat call with the account's OWN id, derived from
+			// GET /api/v1/me (reference/freebuff sdk/src/run.ts:649-658;
+			// sdk/src/impl/model-provider.ts:148-153 — agent-runs
+			// START/FINISH carry it too, database.ts:318-320/396-398).
+			// The server treats it as a trusted server-to-server header
+			// honored only when the request authenticates as the FreeBuff
+			// Web service account (reference/freebuff
+			// common/src/constants/freebuff-models.ts:1180-1183).
+			// ACTING_USER_ID is therefore only safe when it equals the
+			// token's own account id; any other value impersonates a
+			// foreign user (a possible flag).
 			req.Header.Set("x-freebuff-acting-user-id", c.userID)
 		}
 		resp, _, err := c.do(req, 0)
@@ -786,6 +849,25 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 			if isCapacityDeferred(cerr) && capacityDeferredAttempts < c.transientRetriesLimit {
 				capacityDeferredAttempts++
 				c.capacityDeferredRetries.Add(1) // lifetime metric
+				// #105: the free-tier capacity queue asks the client to WAIT
+				// before retrying — the AI SDK absorbs the deferral silently,
+				// honoring retry-after with a 10s default
+				// (reference/freebuff sdk model-provider.ts:41-49,62-81). Sleep
+				// the parsed retry-after (floor 10s) so the same-session retry
+				// does not re-POST immediately (amplification); ctx
+				// cancellation aborts the sleep like every other upstream wait.
+				ra := 10 * time.Second
+				var cde *CapacityDeferredError
+				if errors.As(cerr, &cde) && cde.RetryAfter > 0 {
+					ra = cde.RetryAfter
+				}
+				timer := time.NewTimer(ra)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, ctx.Err()
+				}
 				continue
 			}
 			return nil, cerr
@@ -794,14 +876,19 @@ func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []b
 	}
 }
 
-// CreateSession POSTs /api/v1/freebuff/session with an empty object.
+// CreateSession POSTs /api/v1/freebuff/session with no body.
 func (c *Client) CreateSession(ctx context.Context) (*SessionState, error) {
 	return c.CreateSessionForModel(ctx, "")
 }
 
-// CreateSessionForModel POSTs /api/v1/freebuff/session with the requested model header.
+// CreateSessionForModel POSTs /api/v1/freebuff/session with the requested
+// model header. The POST carries NO body and therefore no Content-Type
+// (#120): the CLI's session POST is a bare fetch with Authorization + the
+// optional x-freebuff-model header only (reference/freebuff
+// freebuff-session-api.ts callFreebuffSession, codebuff-api.ts sets
+// Content-Type only when body !== undefined).
 func (c *Client) CreateSessionForModel(ctx context.Context, model string) (*SessionState, error) {
-	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/freebuff/session", []byte("{}"))
+	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/freebuff/session", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -815,11 +902,15 @@ func (c *Client) CreateSessionForModel(ctx context.Context, model string) (*Sess
 // 404 maps to Status "ended" (the session vanished upstream; the session
 // manager re-creates it). Only a CREATE 404 maps to "disabled".
 func (c *Client) GetSession(ctx context.Context, instanceID string) (*SessionState, error) {
-	return c.GetSessionWithOpts(ctx, instanceID, false, false)
+	return c.GetSessionWithOpts(ctx, instanceID, false)
 }
 
-// GetSessionWithOpts polls /api/v1/freebuff/session with optional compact or heartbeat headers.
-func (c *Client) GetSessionWithOpts(ctx context.Context, instanceID string, compact, heartbeat bool) (*SessionState, error) {
+// GetSessionWithOpts polls /api/v1/freebuff/session with an optional compact
+// response header. There is deliberately NO heartbeat option: the CLI never
+// sends x-freebuff-heartbeat (Desktop-only, reference/freebuff
+// freebuff-models.ts:1212-1215); liveness comes from the recurring compact
+// GET itself (gap #2).
+func (c *Client) GetSessionWithOpts(ctx context.Context, instanceID string, compact bool) (*SessionState, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "/api/v1/freebuff/session", nil)
 	if err != nil {
 		return nil, err
@@ -829,9 +920,6 @@ func (c *Client) GetSessionWithOpts(ctx context.Context, instanceID string, comp
 	}
 	if compact {
 		req.Header.Set("x-freebuff-compact-session", "1")
-	}
-	if heartbeat {
-		req.Header.Set("x-freebuff-heartbeat", "1")
 	}
 	return c.sessionCall(req)
 }
@@ -882,13 +970,16 @@ func (c *Client) ProbeAccount(ctx context.Context) (*SessionState, error) {
 	return state, nil
 }
 
-// EndSession DELETE /api/v1/freebuff/session; 404 is tolerated.
+// EndSession DELETE /api/v1/freebuff/session; 404 is tolerated. The DELETE
+// is keyed on the user, not the instance: the CLI releases its slot with
+// Authorization only, no x-freebuff-instance-id header (#120,
+// reference/freebuff freebuff-session-api.ts releaseFreebuffSlot → DELETE).
+// instanceID is kept for call-site logging; it is never sent.
 func (c *Client) EndSession(ctx context.Context, instanceID string) error {
 	req, err := c.newRequest(ctx, http.MethodDelete, "/api/v1/freebuff/session", nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("x-freebuff-instance-id", instanceID)
 
 	resp, cancel, err := c.do(req, c.sessionCallTimeout)
 	if err != nil {
@@ -939,18 +1030,59 @@ func (c *Client) StartRun(ctx context.Context, agentID string) (string, error) {
 	return parsed.RunID, nil
 }
 
-// FinishRun POSTs /api/v1/agent-runs with action FINISH, marking the run
-// completed with step accounting (mirrors the official CLI payload).
-func (c *Client) FinishRun(ctx context.Context, runID string, totalSteps int) error {
-	payload, _ := json.Marshal(map[string]any{
+// RunStep is one agent-run step, batched in memory and sent WITH FINISH
+// (issue #114, CLI parity: reference/freebuff/sdk/src/impl/database.ts
+// pendingAgentStepSchema — the CLI has NO /steps endpoint, so steps ride
+// the FINISH payload). The proxy records one step per completed chat call.
+type RunStep struct {
+	// ID is a per-step UUID minted at record time.
+	ID string `json:"id"`
+	// StepNumber is the 1-based per-run step index (sequential 1,2,3…).
+	StepNumber int `json:"stepNumber"`
+	// Credits is always 0 for the proxy (the upstream account owns spend).
+	Credits int `json:"credits,omitempty"`
+	// ChildRunIDs is empty for proxy-recorded steps (child runs are
+	// separate runs, not steps).
+	ChildRunIDs []string `json:"childRunIds,omitempty"`
+	// MessageID is the completed chat response id; null when the stream
+	// never carried one (the CLI schema allows a null messageId).
+	MessageID *string `json:"messageId"`
+	// Status mirrors the CLI step lifecycle; proxy-recorded steps are
+	// always "completed" (recorded only after a successful chat).
+	Status string `json:"status,omitempty"`
+	// StartTime is the step start instant, RFC3339Nano UTC.
+	StartTime string `json:"startTime"`
+}
+
+// FinishRun POSTs /api/v1/agent-runs with action FINISH, reporting the
+// run's honest terminal status and its completed steps (issue #114, CLI
+// parity: reference/freebuff/sdk/src/impl/database.ts finishAgentRun — the
+// full payload is sent in ONE request; there is no /steps endpoint).
+// totalSteps is the step count the manager reports (len(steps) preferred,
+// falling back to the request count when no steps were recorded);
+// errorMessage is omitted when empty and truncated to 5000 runes otherwise,
+// exactly like the CLI's truncateString(errorMessage, 5000).
+func (c *Client) FinishRun(ctx context.Context, runID, status string, totalSteps int, steps []RunStep, errorMessage string) error {
+	if steps == nil {
+		steps = []RunStep{}
+	}
+	payload := map[string]any{
 		"action":        "FINISH",
 		"runId":         runID,
-		"status":        "completed",
+		"status":        status,
 		"totalSteps":    totalSteps,
 		"directCredits": 0,
 		"totalCredits":  0,
-	})
-	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/agent-runs", payload)
+		"steps":         steps,
+	}
+	if errorMessage != "" {
+		payload["errorMessage"] = truncateRunes(errorMessage, 5000)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/agent-runs", body)
 	if err != nil {
 		return err
 	}
@@ -961,9 +1093,9 @@ func (c *Client) FinishRun(ctx context.Context, runID string, totalSteps int) er
 	}
 	defer releaseCancel(cancel)
 	defer func() { _ = resp.Body.Close() }()
-	body := drainBody(resp.Body)
+	bodyStr := drainBody(resp.Body)
 	if resp.StatusCode >= 400 {
-		return c.classify(resp.StatusCode, body, resp.Header)
+		return c.classify(resp.StatusCode, bodyStr, resp.Header)
 	}
 	return nil
 }
@@ -1004,45 +1136,6 @@ func (c *Client) StartChildRun(ctx context.Context, parentRunID string) (string,
 		return "", fmt.Errorf("upstream: child START response missing runId: %q", truncate(body, 200))
 	}
 	return parsed.RunID, nil
-}
-
-// RecordRunStep POSTs /api/v1/agent-runs/{runID}/steps with stepNumber 2
-// accounting (issue #91, CLI parity:
-// reference/freebuff-reverse .../http.go recordRunStep). Best-effort: the
-// server fires it through the bounded finish queue and failures are logged,
-// never surfaced. messageID is the completed chat response id ("" when the
-// stream never carried one); startTime anchors the step.
-func (c *Client) RecordRunStep(ctx context.Context, runID, messageID string, startTime time.Time) error {
-	body := map[string]any{
-		"stepNumber":  2,
-		"credits":     0,
-		"childRunIds": []any{},
-		"messageId":   nil,
-		"status":      "completed",
-		"startTime":   startTime.UTC().Format(time.RFC3339Nano),
-	}
-	if messageID != "" {
-		body["messageId"] = messageID
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	req, err := c.newRequest(ctx, http.MethodPost, "/api/v1/agent-runs/"+runID+"/steps", payload)
-	if err != nil {
-		return err
-	}
-	resp, cancel, err := c.do(req, c.sessionCallTimeout)
-	if err != nil {
-		return err
-	}
-	defer releaseCancel(cancel)
-	defer func() { _ = resp.Body.Close() }()
-	bodyStr := drainBody(resp.Body)
-	if resp.StatusCode >= 400 {
-		return c.classify(resp.StatusCode, bodyStr, resp.Header)
-	}
-	return nil
 }
 
 // --- internals ---
@@ -1237,31 +1330,48 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 	if err != nil {
 		return nil, fmt.Errorf("upstream: build %s %s: %w", method, path, err)
 	}
+	// A bodyless POST/PUT/PATCH is trivially replayable on a transient
+	// retry: give it a NoBody GetBody so do()'s TRANSIENT_RETRIES replay
+	// works (a nil GetBody silently disables retries, which after #120
+	// would break the bodyless session POST's transport-level retry). GETs
+	// and DELETEs stay nil-GetBody (never retried — idempotent reads fail
+	// fast and the poll loop's own backoff owns them).
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		if body == nil {
+			req.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
+		}
+	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("x-codebuff-api-key", c.token)
 	if c.authOnly {
 		// Token-less login-flow client (#62/#66): never send an empty
 		// credential pair — the /api/auth/cli/* endpoints take the login
 		// User-Agent instead (see authLoginRequest).
 		req.Header.Del("Authorization")
-		req.Header.Del("x-codebuff-api-key")
 	}
-	req.Header.Set("Content-Type", "application/json")
+	// Content-Type only when a body is present (#120): the CLI sets it iff
+	// body !== undefined (reference/freebuff codebuff-api.ts:344-346), so a
+	// bodyless session POST must not carry it. Chat always has a body.
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	// The official CLI sends the pinned llm-providers ai-sdk UA on chat and
+	// NO browser headers on any API path (bare Bun fetch) (#108/#109 fix
+	// option (a)): the utls ClientHello impersonation stays, the browser
+	// header persona does not. x-codebuff-api-key is never sent — Bearer is
+	// the only credential (#107, reference/freebuff codebuff-api.ts:337-345).
+	req.Header.Set("User-Agent", cliUserAgent)
 	ctx = req.Context()
 	if profile := c.currentStealthProfile(); profile != nil {
 		// Resolve the concrete profile ONCE per request and stash it: the
-		// dialer reads the stash for the ClientHello, so the browser headers
-		// applied here always match the TLS fingerprint. Pinned profiles
-		// resolve to themselves; auto/random get one concrete draw.
+		// dialer reads the stash for the ClientHello, so the TLS fingerprint
+		// matches the profile. Pinned profiles resolve to themselves;
+		// auto/random get one concrete draw. Only SanitizeHeaders runs here
+		// (protective strip of proxy-identifying headers) — the profile's
+		// browser headers are deliberately NOT applied to upstream API calls.
 		connProf := stealth.GetProfileForConnection(profile)
 		ctx = withStealthProfile(ctx, connProf)
-		stealth.SanitizeAndApply(req.Header, connProf)
-	} else {
-		ver := c.cliVersion
-		if ver == "" {
-			ver = "0.10.7"
-		}
-		req.Header.Set("User-Agent", fmt.Sprintf("ai-sdk/openai-compatible/%s/codebuff", ver))
+		stealth.SanitizeHeaders(req.Header)
 	}
 	if ctx != req.Context() {
 		req = req.WithContext(ctx)
@@ -1373,11 +1483,11 @@ func (c *Client) currentStealthProfile() *stealth.Profile {
 
 // dialProfileFor returns the stealth profile the transport dialer should use
 // for a connection under ctx. For ProfileAuto/ProfileRandom the concrete
-// profile stashed by newRequest wins, so the ClientHello matches the browser
-// headers applied to that request; a bare context (no stash) resolves per
+// profile stashed by newRequest wins, so the ClientHello matches the profile
+// resolved for that request; a bare context (no stash) resolves per
 // connection as before. For pinned profiles the current c.stealthProfile is
-// authoritative: the retry loop swaps it (and re-applies headers) ahead of a
-// retry, so the stash would be stale.
+// authoritative: the retry loop swaps it ahead of a retry, so the stash
+// would be stale.
 func (c *Client) dialProfileFor(ctx context.Context) *stealth.Profile {
 	profile := c.currentStealthProfile()
 	if profile != nil && (profile.ID == stealth.ProfileIDAuto || profile.ID == stealth.ProfileIDRandom) {
@@ -1440,18 +1550,24 @@ func (c *Client) FireWaitingRoomChain(ctx context.Context) {
 // (freebuff2api-optimized config.py: ad_providers=("gravity","zeroclick")).
 var waitingRoomAdProviders = []string{"gravity", "zeroclick"}
 
-// requestAds POSTs one /api/v1/ads payload (reference codebuff.py
-// request_ads: provider + device block + userAgent).
+// requestAds POSTs one /api/v1/ads payload (reference cli/src/hooks/
+// use-gravity-ad.ts fetchAd + common/src/util/ad-user-agent.ts: provider +
+// device block + browser-like body userAgent + Freebuff-CLI header UA).
+// Faithful details kept: messages stays [] and sessionId is omitted (the
+// chain fires before a session exists — a fresh waiting-room).
 func (c *Client) requestAds(ctx context.Context, provider string) error {
 	payload := map[string]any{
 		"provider": provider,
 		"messages": []any{},
 		"device": map[string]any{
 			"os":       runtime.GOOS,
-			"timezone": "UTC",
-			"locale":   "en-US",
+			"timezone": egressDeviceTimezone(),
+			"locale":   egressDeviceLocale(),
 		},
-		"userAgent": freebuffLoginUserAgent,
+		// Body userAgent: the shared browser-like UA (NOT a runtime UA) so
+		// every ad provider sees a usable targeting signal — the CLI sends
+		// getAdUserAgent() here (#124).
+		"userAgent": adBrowserUserAgent,
 		"surface":   "waiting_room",
 	}
 	body, _ := json.Marshal(payload)
@@ -1459,7 +1575,10 @@ func (c *Client) requestAds(ctx context.Context, provider string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", freebuffLoginUserAgent)
+	// Header UA: Freebuff-CLI/<version> (getCliAdRequestUserAgent), NOT the
+	// chat ai-sdk UA newRequest set — the CLI's ads POST carries exactly
+	// this product UA (#124).
+	req.Header.Set("User-Agent", freebuffCliUA)
 	resp, cancel, err := c.do(req, c.sessionCallTimeout)
 	if err != nil {
 		return err
@@ -1477,13 +1596,55 @@ func (c *Client) requestAds(ctx context.Context, provider string) error {
 	return nil
 }
 
-// getStreak GETs /api/v1/freebuff/streak (reference codebuff.py get_streak).
+// egressDeviceTimezone returns the host IANA timezone name for the ads
+// device block, mirroring the CLI's
+// Intl.DateTimeFormat().resolvedOptions().timeZone (use-gravity-ad.ts
+// getDeviceInfo). time.Local.String() is the host zone when Go resolved a
+// real IANA name; "Local" is Go's placeholder when it could not, so that
+// (and anything LoadLocation rejects) falls back to the always-valid "UTC".
+func egressDeviceTimezone() string {
+	tz := time.Local.String()
+	if tz == "" || tz == "Local" {
+		return "UTC"
+	}
+	if _, err := time.LoadLocation(tz); err != nil {
+		return "UTC"
+	}
+	return tz
+}
+
+// egressDeviceLocale returns the host locale for the ads device block,
+// derived from LC_ALL/LC_MESSAGES/LANG (POSIX "en_US.UTF-8" → "en-US",
+// charset stripped, "_" → "-"), falling back to "en-US" — the CLI's
+// Intl.DateTimeFormat().resolvedOptions().locale shape (use-gravity-ad.ts
+// getDeviceInfo). "C"/"POSIX" are not real locales and are skipped.
+func egressDeviceLocale() string {
+	for _, env := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
+		raw := os.Getenv(env)
+		if raw == "" {
+			continue
+		}
+		lang := strings.SplitN(raw, ".", 2)[0]
+		lang = strings.ReplaceAll(lang, "_", "-")
+		if lang == "" || lang == "C" || lang == "POSIX" {
+			continue
+		}
+		return lang
+	}
+	return "en-US"
+}
+
+// getStreak GETs /api/v1/freebuff/streak (reference
+// cli/src/hooks/use-freebuff-streak-query.ts: the request() helper sets NO
+// UA override → bun's default). The proxy's equivalent of "no override" is
+// newRequest's cliUserAgent (ai-sdk 1.0.0), which is what this request
+// inherits — the old 2.0.42 login UA was never a real llm-providers
+// version (#124).
 func (c *Client) getStreak(ctx context.Context) error {
 	req, err := c.newRequest(ctx, http.MethodGet, "/api/v1/freebuff/streak", nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", freebuffLoginUserAgent)
 	resp, cancel, err := c.do(req, c.sessionCallTimeout)
 	if err != nil {
 		return err
@@ -1569,10 +1730,12 @@ var retryProfileRotation = []struct {
 }
 
 // rotateStealthProfileForRetry swaps the pinned TLS fingerprint to a
-// different profile before a retry and re-applies its browser headers to req,
-// so the retried connection does not repeat the fingerprint that just failed.
-// random/auto already rotate per connection and are left alone. No-op when
-// retries are disabled or no fingerprint is pinned.
+// different profile before a retry so the retried connection does not repeat
+// the fingerprint that just failed. The request keeps its CLI headers —
+// only proxy-identifying headers are re-stripped; no browser persona is
+// applied on API paths (#109). random/auto already rotate per connection and
+// are left alone. No-op when retries are disabled or no fingerprint is
+// pinned.
 func (c *Client) rotateStealthProfileForRetry(req *http.Request) {
 	c.profileMu.Lock()
 	defer c.profileMu.Unlock()
@@ -1589,7 +1752,7 @@ func (c *Client) rotateStealthProfileForRetry(req *http.Request) {
 	}
 	c.stealthProfile = next
 	c.fingerprintRotations.Add(1)
-	stealth.SanitizeAndApply(req.Header, next)
+	stealth.SanitizeHeaders(req.Header)
 }
 
 // nextStealthProfile returns the profile to rotate to after cur: the next
@@ -1721,6 +1884,10 @@ const (
 	cliSystemMarkerPhrase = "You are Buffy, the strategic coding assistant"
 )
 
+// ensureCliSystemMarker guarantees the canonical "You are Buffy…" opening at
+// byte position 0 of the first system message (the free-mode gate's trimmed
+// prefix test — see the check loop below). It prepends the marker rather
+// than replacing, so custom system instructions survive.
 func ensureCliSystemMarker(payload map[string]any) {
 	rawMsgs, ok := payload["messages"].([]any)
 	if !ok || len(rawMsgs) == 0 {
@@ -1736,13 +1903,18 @@ func ensureCliSystemMarker(payload map[string]any) {
 			continue
 		}
 		if msg["role"] == "system" {
-			if content, ok := msg["content"].(string); ok && strings.Contains(content, cliSystemMarkerPhrase) {
+			// The server gate is a TRIMMED PREFIX test at position 0
+			// (hasFreebuffRootSystemPromptOpening, free-agents.ts:617-645),
+			// hardened against the prepend-and-cancel proxy trick: a message
+			// that merely mentions the phrase mid-string must NOT suppress
+			// the canonical prefix (#110).
+			if content, ok := msg["content"].(string); ok && strings.HasPrefix(strings.TrimSpace(content), cliSystemMarkerPhrase) {
 				return // already present
 			}
 			if parts, ok := msg["content"].([]any); ok {
 				for _, p := range parts {
 					if partMap, ok := p.(map[string]any); ok {
-						if txt, ok := partMap["text"].(string); ok && strings.Contains(txt, cliSystemMarkerPhrase) {
+						if txt, ok := partMap["text"].(string); ok && strings.HasPrefix(strings.TrimSpace(txt), cliSystemMarkerPhrase) {
 							return // already present
 						}
 					}
@@ -1793,30 +1965,28 @@ func injectEnvelope(body []byte, costMode string, opts ChatOptions) ([]byte, err
 
 	ensureCliSystemMarker(payload)
 
-	// client_id is stable PER SESSION INSTANCE (derived from the instance
-	// id) so upstream traces correlate the whole session lifetime — the
-	// hardest identity signal the SDK keys on (issue #52 extension of #80,
-	// which made it stable per run). With no instance id (disabled session)
-	// it falls back to the run id, then to a fresh SDK-faithful draw.
-	// trace_session_id remains per run (minted once by the run manager,
-	// reused across the run's requests; run.ts: previousRun?.traceSessionId
-	// ?? randomUUID, proxy-freebuff lib/runs.js:43-46).
-	clientID := generateClientID()
-	switch {
-	case opts.SessionInstanceID != "":
-		clientID = "sess:" + opts.SessionInstanceID
-	case opts.RunID != "":
-		clientID = "run:" + opts.RunID
-	}
+	// client_id is a FRESH random SDK-faithful draw per chat call — never
+	// the sess:/run:-prefixed shapes the server fingerprints as a proxy
+	// (#103; reference/freebuff run.ts:646
+	// Math.random().toString(36).substring(2,15), cf-worker-signals.ts
+	// ^wf-[a-z0-9]{8}$). trace_session_id remains per run (minted once by
+	// the run manager, reused across the run's requests; run.ts:
+	// previousRun?.traceSessionId ?? randomUUID, proxy-freebuff
+	// lib/runs.js:43-46) and freebuff_instance_id stays per session.
 	metadata := map[string]any{
 		"run_id":    opts.RunID,
-		"client_id": clientID,
+		"client_id": generateClientID(),
 	}
 	if opts.TraceSessionID != "" {
 		metadata["trace_session_id"] = opts.TraceSessionID
 	}
 	if opts.SessionInstanceID != "" {
 		metadata["freebuff_instance_id"] = opts.SessionInstanceID
+	}
+	// llm_step_number is the 1-based per-run agent step, String(n) on the
+	// wire (#113; reference/freebuff run-agent-step.ts:1175-1177).
+	if opts.StepNumber > 0 {
+		metadata["llm_step_number"] = strconv.Itoa(opts.StepNumber)
 	}
 	if costMode != "" {
 		metadata["cost_mode"] = costMode
@@ -1897,9 +2067,10 @@ func classifyError(status int, body string, hdr http.Header) error {
 	case containsAny(lower, "ip_capped"):
 		// 429 ip_capped: too many DISTINCT users on the egress IP.
 		// Admission-only — existing sessions keep running, so unlike
-		// rate_limited this is NOT tied to a quota reset. Bounded cooldown
-		// to retryAfterMs only; no Pacific-midnight fallback
-		// (reference/freebuff freebuff-session.ts).
+		// rate_limited this is NOT tied to a quota reset. Cooldown is
+		// bounded by the proxy to retryAfterMs + jitter, with a per-token
+		// daily re-admission cap (3rd hit in a rolling window locks until
+		// Pacific midnight — #118) (reference/freebuff freebuff-session.ts).
 		return parseIpCapped(body, retryAfter)
 	case containsAny(lower, "waiting_room_queued"):
 		// 429 waiting_room_queued: transient admission race — the session
@@ -1927,7 +2098,18 @@ func classifyError(status int, body string, hdr http.Header) error {
 		// session slot. The server marks the refusal and the pool registry
 		// cools the (egress, model) pairing instead.
 		return &LimitedIpError{RetryAfter: retryAfter, Body: truncate(body, 200)}
-	case containsAny(lower, "freebuff_update_required", "session_superseded",
+	case containsAny(lower, "session_superseded"):
+		// #119: 409 session_superseded is a TERMINAL gate rejection
+		// (endsTheSession:true — another instance took over the account;
+		// reference/freebuff freebuff-session.ts FREEBUFF_GATE_CODES).
+		// Deliberately NOT ErrSessionInvalid: the server must never
+		// auto-reacquire in-request (auto-takeover risks ping-pong) — it
+		// surfaces 409 session_superseded and lets the NEXT request re-join
+		// fresh (send-message.ts handleFreebuffGateError marks the session
+		// superseded and stops polling; use-freebuff-session.ts
+		// nextDelayMs returns null).
+		return &SessionSupersededError{Status: status, Body: truncate(body, 200)}
+	case containsAny(lower, "freebuff_update_required",
 		"session_expired", "session_model_mismatch", "model_locked"):
 		return fmt.Errorf("%w: %s%s", ErrSessionInvalid, truncate(body, 200), retryDetail(retryAfter))
 	case status == http.StatusBadRequest && containsAny(lower, "runid not found", "runid not running"):
@@ -2033,9 +2215,11 @@ func getTime(m map[string]any, keys ...string) (time.Time, bool) {
 
 // parseIpCapped builds an IpCappedError from a 429 ip_capped body,
 // extracting retryAfterMs/activeUsersForIp/limit best-effort (absent fields
-// are tolerated). The cooldown is bounded to retryAfterMs ONLY — ip_capped
-// is admission-only and not tied to a quota reset, so the Pacific-midnight
-// fallback must never apply (reference/freebuff freebuff-session.ts).
+// are tolerated). The ERROR's retryAfter stays bounded to the body's
+// retryAfterMs (1m default) — ip_capped is admission-only and not a quota
+// reset upstream, so the parse never fabricates a Pacific-midnight window;
+// the proxy's bounded re-admission policy (full retryAfter + jitter, daily
+// cap — #118) is applied by runs.CooldownIpCapped at cooldown time.
 func parseIpCapped(body string, headerRetryAfter time.Duration) error {
 	ice := &IpCappedError{Body: truncate(body, 200), RetryAfter: headerRetryAfter}
 
@@ -2245,6 +2429,21 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// truncateRunes truncates s to at most max runes without an ellipsis. The
+// CLI's FINISH errorMessage cap is 5000 chars (truncateString in
+// reference/freebuff/sdk/src/impl/database.ts), applied on the whole
+// payload — a full Go stack trace must not blow the cap.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
 }
 
 // dump writes a debug record to dump/ when enabled.

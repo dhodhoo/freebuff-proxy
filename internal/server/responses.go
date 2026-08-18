@@ -481,6 +481,7 @@ func (s *Server) relayResponsesStream(ctx context.Context, w http.ResponseWriter
 			}
 			if usage, ok := chunk["usage"]; ok && usage != nil {
 				st.usage = usage
+				stats.usageTokens = usageTotalTokens(usage) // #122 spend ledger
 			}
 			s.accumulateResponsesChunk(st, chunk, send)
 		}
@@ -694,6 +695,7 @@ func (s *Server) relayResponsesJSON(ctx context.Context, w http.ResponseWriter, 
 	resp["output"] = out
 	if usage, ok := completion["usage"]; ok && usage != nil {
 		resp["usage"] = responsesUsage(usage)
+		stats.usageTokens = usageTotalTokens(usage) // #122 spend ledger
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
