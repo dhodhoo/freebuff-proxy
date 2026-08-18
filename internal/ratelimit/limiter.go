@@ -54,7 +54,14 @@ func New(rate float64, burst int, maxEntries int) *Limiter {
 // If rejected due to rate limit exhaustion, it returns (false, retryAfter) where
 // retryAfter is the duration until at least 1 token is available (minimum 1 second).
 func (l *Limiter) Allow(ip string) (bool, time.Duration) {
-	if l == nil || l.rate <= 0 {
+	if l == nil {
+		return true, 0
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.rate <= 0 {
 		return true, 0
 	}
 
@@ -65,10 +72,6 @@ func (l *Limiter) Allow(ip string) (bool, time.Duration) {
 	if ip == "" {
 		ip = "unknown"
 	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	now := l.nowFunc()
 	b, ok := l.buckets[ip]
 	if !ok {

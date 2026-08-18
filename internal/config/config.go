@@ -190,41 +190,41 @@ type rawConfig struct {
 	ActingUserID       string   `json:"ACTING_USER_ID"`
 	// LegacyActingUserID is the pre-rename JSON key (USER_ID) — merged at
 	// the end of Load when no ACTING_USER_ID source set a value (#126).
-	LegacyActingUserID               string `json:"USER_ID"`
-	TLSFingerprint                   string `json:"TLS_FINGERPRINT"`
-	RegistryRefresh                  string `json:"REGISTRY_REFRESH"`
-	DebugDump                        bool   `json:"DEBUG_DUMP"`
-	LogFile                          string `json:"LOG_FILE"`
-	LogLevel                         string `json:"LOG_LEVEL"`
-	LogFormat                        string `json:"LOG_FORMAT"`
-	LogAccess                        bool   `json:"LOG_ACCESS"`
-	LogRingSize                      *int   `json:"LOG_RING_SIZE"`
-	MaxMessagesPerDay                *int   `json:"MAX_MESSAGES_PER_DAY"`
-	MaxSpendPerDay                   *int   `json:"MAX_SPEND_PER_DAY"`
-	IdleRotationTimeout              string `json:"IDLE_ROTATION_TIMEOUT"`
-	SafeMode                         bool   `json:"SAFE_MODE"`
-	HybridMode                       bool   `json:"HYBRID_MODE"`
-	ModelsHideUnavailable            bool   `json:"MODELS_HIDE_UNAVAILABLE"`
-	CORSAllowedOrigin                string `json:"CORS_ALLOWED_ORIGIN"`
-	RequestJitter                    string `json:"REQUEST_JITTER"`
-	CLIVersion                       string `json:"CLI_VERSION"`
-	ModelAliases                     string `json:"MODEL_ALIASES"`
-	TransientRetries                 *int   `json:"TRANSIENT_RETRIES"`
-	SessionPersist                   bool   `json:"SESSION_PERSIST"`
-	SessionStateFile                 string `json:"SESSION_STATE_FILE"`
-	HTTP2Upstream                    bool   `json:"HTTP2_UPSTREAM"`
-	SessionCreateMaxParallelGlobal   *int   `json:"SESSION_CREATE_MAX_PARALLEL_GLOBAL"`
-	SessionCreateMaxParallelPerModel *int   `json:"SESSION_CREATE_MAX_PARALLEL_PER_MODEL"`
-	RunFinishQueueSize               *int   `json:"RUN_FINISH_QUEUE_SIZE"`
-	RunFinishInlineTimeout           string `json:"RUN_FINISH_INLINE_TIMEOUT"`
-	RunsDrainQueueCap                *int   `json:"RUNS_DRAIN_QUEUE_CAP"`
-	RunsDrainTTL                     string `json:"RUNS_DRAIN_TTL"`
-	SessionReAdmitLead               string `json:"SESSION_RE_ADMIT_LEAD"`
-	SessionProbeCacheTTL             string `json:"SESSION_PROBE_CACHE_TTL"`
-	WebhookURL                       string `json:"WEBHOOK_URL"`
-	FallbackAfter                    string `json:"FALLBACK_AFTER_MS"`
-	FallbackModels                   string `json:"FALLBACK_MODEL"`
-	AdoptCLISession                  bool   `json:"ADOPT_CLI_SESSION"`
+	LegacyActingUserID               string   `json:"USER_ID"`
+	TLSFingerprint                   string   `json:"TLS_FINGERPRINT"`
+	RegistryRefresh                  string   `json:"REGISTRY_REFRESH"`
+	DebugDump                        bool     `json:"DEBUG_DUMP"`
+	LogFile                          string   `json:"LOG_FILE"`
+	LogLevel                         string   `json:"LOG_LEVEL"`
+	LogFormat                        string   `json:"LOG_FORMAT"`
+	LogAccess                        bool     `json:"LOG_ACCESS"`
+	LogRingSize                      *int     `json:"LOG_RING_SIZE"`
+	MaxMessagesPerDay                *int     `json:"MAX_MESSAGES_PER_DAY"`
+	MaxSpendPerDay                   *int     `json:"MAX_SPEND_PER_DAY"`
+	IdleRotationTimeout              string   `json:"IDLE_ROTATION_TIMEOUT"`
+	SafeMode                         bool     `json:"SAFE_MODE"`
+	HybridMode                       bool     `json:"HYBRID_MODE"`
+	ModelsHideUnavailable            bool     `json:"MODELS_HIDE_UNAVAILABLE"`
+	CORSAllowedOrigin                string   `json:"CORS_ALLOWED_ORIGIN"`
+	RequestJitter                    string   `json:"REQUEST_JITTER"`
+	CLIVersion                       string   `json:"CLI_VERSION"`
+	ModelAliases                     string   `json:"MODEL_ALIASES"`
+	TransientRetries                 *int     `json:"TRANSIENT_RETRIES"`
+	SessionPersist                   bool     `json:"SESSION_PERSIST"`
+	SessionStateFile                 string   `json:"SESSION_STATE_FILE"`
+	HTTP2Upstream                    bool     `json:"HTTP2_UPSTREAM"`
+	SessionCreateMaxParallelGlobal   *int     `json:"SESSION_CREATE_MAX_PARALLEL_GLOBAL"`
+	SessionCreateMaxParallelPerModel *int     `json:"SESSION_CREATE_MAX_PARALLEL_PER_MODEL"`
+	RunFinishQueueSize               *int     `json:"RUN_FINISH_QUEUE_SIZE"`
+	RunFinishInlineTimeout           string   `json:"RUN_FINISH_INLINE_TIMEOUT"`
+	RunsDrainQueueCap                *int     `json:"RUNS_DRAIN_QUEUE_CAP"`
+	RunsDrainTTL                     string   `json:"RUNS_DRAIN_TTL"`
+	SessionReAdmitLead               string   `json:"SESSION_RE_ADMIT_LEAD"`
+	SessionProbeCacheTTL             string   `json:"SESSION_PROBE_CACHE_TTL"`
+	WebhookURL                       string   `json:"WEBHOOK_URL"`
+	FallbackAfter                    string   `json:"FALLBACK_AFTER_MS"`
+	FallbackModels                   string   `json:"FALLBACK_MODEL"`
+	AdoptCLISession                  bool     `json:"ADOPT_CLI_SESSION"`
 	WaitingRoomChain                 bool     `json:"WAITING_ROOM_CHAIN"`
 	RateLimitPerIP                   *float64 `json:"RATE_LIMIT_PER_IP"`
 	RateLimitBurst                   *int     `json:"RATE_LIMIT_BURST"`
@@ -1141,6 +1141,7 @@ func overrideIntFrom(target **int, get func(string) string, envName string) {
 		}
 	}
 }
+
 // overrideFloat sets target from RATE_LIMIT_PER_IP-style env vars; unset or
 // unparseable values leave the file/default value untouched.
 func overrideFloat(target **float64, envName string) {

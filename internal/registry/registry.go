@@ -71,6 +71,7 @@ const maxFetchBytes = 2 << 20
 var LimitedTierModels = map[string]bool{
 	"mimo/mimo-v2.5": true,
 }
+
 // fallbackAgents is the hardcoded model→agent fallback used when the sources
 // are unreachable. It mirrors the CURRENT upstream FREE_MODE_AGENT_MODELS
 // exactly: the rows below are the verbatim parse of the pinned snapshot
