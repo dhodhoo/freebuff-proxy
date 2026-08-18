@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -237,6 +240,107 @@ func TestPollCLILoginPendingThenComplete(t *testing.T) {
 	}
 	if mock.AuthCLIStatusRequests != 2 {
 		t.Errorf("AuthCLIStatusRequests = %d, want 2", mock.AuthCLIStatusRequests)
+	}
+}
+
+// TestPollCLILoginTransient5xxKeepsPolling verifies #125: a transient 5xx
+// from /api/auth/cli/status must report pending (Done=false, no error) so
+// the caller keeps polling until the 5-minute deadline — mirroring
+// login-flow.ts pollLoginStatus, which retries every non-401 status.
+func TestPollCLILoginTransient5xxKeepsPolling(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	client, err := NewForAuth(testConfig(mock.URL(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := client.StartCLILogin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The upstream answers 500 (transient blip). Handler is set AFTER
+	// StartCLILogin, so only status polls hit it.
+	mock.AuthCLIHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/auth/cli/status" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"boom"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}
+	status, err := client.PollCLILogin(context.Background(), code)
+	if err != nil {
+		t.Fatalf("PollCLILogin errored on transient 5xx, want pending (no error): %v", err)
+	}
+	if status.Done || status.AuthToken != "" {
+		t.Errorf("status = %+v, want Done=false on transient 5xx", status)
+	}
+}
+
+// TestPollCLILoginTransportErrorTransient verifies #125: a transport-level
+// failure (connection refused) must report pending, not abort — the CLI
+// keeps polling through network errors (login-flow.ts catch branch).
+func TestPollCLILoginTransportErrorTransient(t *testing.T) {
+	// A closed listener makes every request fail at dial time.
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+	client, err := NewForAuth(testConfig(closed.URL, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := &CLILoginCode{
+		FingerprintID:   "enhanced-x",
+		FingerprintHash: "h",
+		ExpiresAtRaw:    time.Now().Add(5 * time.Minute).UnixMilli(),
+	}
+	status, err := client.PollCLILogin(context.Background(), code)
+	if err != nil {
+		t.Fatalf("PollCLILogin errored on transport failure, want pending (no error): %v", err)
+	}
+	if status.Done || status.AuthToken != "" {
+		t.Errorf("status = %+v, want Done=false on transport failure", status)
+	}
+}
+
+// TestAuthLoginRequestsCarryCLIUA verifies #125: the /api/auth/cli/code and
+// /api/auth/cli/status calls send the real chat ai-sdk cliUserAgent (1.0.0),
+// never the fabricated 2.0.42 login UA (the CLI's request() sets no UA, and
+// the proxy's closest equivalent is the pinned cli UA).
+func TestAuthLoginRequestsCarryCLIUA(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var codeUA, statusUA string
+	mock.AuthCLIHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/cli/code":
+			codeUA = r.Header.Get("User-Agent")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"fingerprintId":"enhanced-x","fingerprintHash":"h","loginUrl":"https://github.com/login/oauth/authorize?auth_code=abc","expiresAt":`+strconv.FormatInt(time.Now().Add(5*time.Minute).UnixMilli(), 10)+`}`)
+		case "/api/auth/cli/status":
+			statusUA = r.Header.Get("User-Agent")
+			w.WriteHeader(http.StatusUnauthorized) // pending
+		default:
+			http.NotFound(w, r)
+		}
+	}
+	client, err := NewForAuth(testConfig(mock.URL(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := client.StartCLILogin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.PollCLILogin(context.Background(), code); err != nil {
+		t.Fatal(err)
+	}
+	if codeUA != cliUserAgent {
+		t.Errorf("/api/auth/cli/code User-Agent = %q, want %q", codeUA, cliUserAgent)
+	}
+	if statusUA != cliUserAgent {
+		t.Errorf("/api/auth/cli/status User-Agent = %q, want %q", statusUA, cliUserAgent)
 	}
 }
 

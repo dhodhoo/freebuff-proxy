@@ -2016,6 +2016,10 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	// endpoint). The response message id is not extracted from the stream;
 	// the CLI step schema allows a null messageId.
 	s.pool.RecordRunStep(lease, "")
+	// Issue #122: feed the per-token spend ledger once per successful chat
+	// completion with the usage total observed by the relay (0 when the
+	// upstream stream carried none — RecordSpend ignores non-positive).
+	s.pool.RecordSpend(lease, stats.usageTokens)
 	phases.Since(phasetiming.TotalMS, start)
 	ms := time.Since(start).Milliseconds()
 	s.logger.Info(kind+" done", chatDoneAttrs(model, lease.AgentID, stream, ms, stats.chunks, stats.bytes, reasoningEffort)...)
@@ -2059,8 +2063,10 @@ func chatErrClass(err error) string {
 		return "ip_capped"
 	case *upstream.SessionLimitError:
 		return "session_limit_reached"
-	case *upstream.WaitingRoomError, *session.WaitingRoomError:
+	case *upstream.WaitingRoomError, *session.WaitingRoomError, *upstream.WaitingRoomRequiredError:
 		return "waiting_room"
+	case *upstream.SessionSupersededError:
+		return "session_superseded"
 	case *upstream.UpstreamError:
 		return "upstream"
 	default:
@@ -2170,6 +2176,30 @@ func (s *Server) chatAttempt(
 			if attempts > 1 {
 				return nil, nil, err
 			}
+		case errors.Is(err, upstream.ErrWaitingRoomRequired):
+			// #116: 428 waiting_room_required is session-ENDING
+			// (endsTheSession:true — the seat is gone mid-chat;
+			// reference/freebuff freebuff-session.ts FREEBUFF_GATE_CODES).
+			// Drop the cached session and re-admit ONCE for this request
+			// (mirror the ErrSessionInvalid budget: attempts > 1 surfaces
+			// the error; the WAITING_ROOM_CHAIN fires before the next
+			// create). Never loops — a single reacquire, then surface.
+			release()
+			invalidateSession(lease)
+			if attempts > 1 {
+				return nil, nil, err
+			}
+		case errors.Is(err, upstream.ErrSessionSuperseded):
+			// #119: 409 session_superseded is TERMINAL — another instance
+			// took over the account. Drop the cached row so the NEXT
+			// request (operator/next-call) re-joins fresh, but NEVER
+			// auto-reacquire within this request: auto-takeover risks
+			// ping-pong with the other instance (reference/freebuff
+			// send-message.ts handleFreebuffGateError, use-freebuff-session.ts
+			// nextDelayMs returns null for superseded).
+			release()
+			invalidateSession(lease)
+			return nil, nil, err
 		case errors.Is(err, upstream.ErrRunInvalid):
 			release()
 			invalidateRun(lease, lease.AgentID)
@@ -2196,9 +2226,11 @@ func (s *Server) chatAttempt(
 			return nil, nil, err
 		case errors.Is(err, upstream.ErrIpCapped):
 			// ip_capped is admission-only (too many distinct users on the
-			// egress IP), NOT a quota reset: cool the token only until the
-			// body's retryAfterMs — never the Pacific-midnight lock — and
-			// never invalidate the session (existing sessions keep running).
+			// egress IP), NOT a quota reset: cool the token via
+			// cooldownIpCapped's bounded re-admission (#118) — full
+			// retryAfterMs + jitter, capped per token per day (the 3rd hit
+			// in a rolling window locks until Pacific midnight) — and never
+			// invalidate the session (existing sessions keep running).
 			var ice *upstream.IpCappedError
 			if errors.As(err, &ice) {
 				cooldownIpCapped(lease, ice)
@@ -2213,6 +2245,15 @@ func (s *Server) chatAttempt(
 			if errors.As(err, &cbe) {
 				cooldownCountry(lease, cbe)
 			}
+			release()
+			return nil, nil, err
+		case errors.Is(err, upstream.ErrCredits):
+			// #117: 402 is NEVER retried — the CLI throws immediately and
+			// 402 is NOT in RETRYABLE_STATUS_CODES (reference/freebuff sdk
+			// error-utils.ts line 16; run-agent-step.ts throws on 402). A
+			// blind retry would burn a fresh lease against the same quota
+			// wall (2 upstream chat POSTs). Surface for writeError, which
+			// maps it to 402 out_of_credits.
 			release()
 			return nil, nil, err
 		default:
@@ -2272,6 +2313,23 @@ func tokenLabel(lease *pool.Lease) string {
 type relayStats struct {
 	chunks int
 	bytes  int
+	// usageTokens is the upstream usage total of the completed chat (the
+	// final usage block), fed to the pool spend ledger once per successful
+	// completion (#122). 0 when the stream carried no usage.
+	usageTokens int64
+}
+
+// usageTotalTokens extracts the token total from a chat usage object
+// (total_tokens, falling back to prompt+completion). Returns 0 when absent.
+// Feeds the per-token spend ledger (#122).
+func usageTotalTokens(usage any) int64 {
+	u, _ := usage.(map[string]any)
+	if total, ok := intOf(u["total_tokens"]); ok && total > 0 {
+		return total
+	}
+	prompt, _ := intOf(u["prompt_tokens"])
+	completion, _ := intOf(u["completion_tokens"])
+	return prompt + completion
 }
 
 // keepaliveInterval is how long the relay may sit without relaying a data
@@ -2384,6 +2442,19 @@ func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Re
 				relayed = time.Now()
 				continue
 			}
+			// The final chunk carries the usage block (or a usage-only
+			// chunk when stream_options.include_usage is set); capture its
+			// total for the spend ledger (#122). Cheap substring probe, so
+			// the per-chunk path only pays for an unmarshal on the usage
+			// chunk itself.
+			if bytes.Contains(clean, []byte(`"usage"`)) {
+				var u struct {
+					Usage any `json:"usage"`
+				}
+				if json.Unmarshal(clean, &u) == nil {
+					stats.usageTokens = usageTotalTokens(u.Usage)
+				}
+			}
 			if first {
 				first = false
 				phasetiming.FromContext(ctx).Since(phasetiming.UpstreamTTFBMS, chatStart)
@@ -2434,6 +2505,13 @@ func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Read
 	}
 	out := acc.Finish()
 	stats.bytes = len(out)
+	// Capture the accumulated usage total for the spend ledger (#122).
+	var usageObj struct {
+		Usage any `json:"usage"`
+	}
+	if json.Unmarshal(out, &usageObj) == nil {
+		stats.usageTokens = usageTotalTokens(usageObj.Usage)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
@@ -2795,6 +2873,8 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 
 	var wr *session.WaitingRoomError
 	var uwr *upstream.WaitingRoomError
+	var wrr *upstream.WaitingRoomRequiredError
+	var sse *upstream.SessionSupersededError
 	var ue *upstream.UpstreamError
 	var rle *upstream.RateLimitError
 	var ice *upstream.IpCappedError
@@ -2841,6 +2921,26 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.As(err, &uwr):
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message, retryAfter = uwr.Error(), uwr.RetryAfter
+	case errors.As(err, &wrr):
+		// #116: 428 waiting_room_required (endsTheSession:true — the seat
+		// is gone; chatAttempt already dropped the cached session and
+		// re-admitted once). 503 + the refusal's Retry-After — NEVER a bare
+		// 502. MUST precede the generic UpstreamError branch.
+		status, code = http.StatusServiceUnavailable, "waiting_room_required"
+		message, retryAfter = wrr.Error(), wrr.RetryAfter
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+	case errors.As(err, &sse):
+		// #119: 409 session_superseded — another instance took over the
+		// account. Terminal for this request: 409 + the upstream body, no
+		// auto-rejoin (the cached row was dropped in chatAttempt so the
+		// next request re-joins fresh).
+		status, code = http.StatusConflict, "session_superseded"
+		message = sse.Body
+		if message == "" {
+			message = "session superseded"
+		}
 	case errors.As(err, &cde):
 		// #105 (server half): the client's capacity-deferred retry budget
 		// (TRANSIENT_RETRIES) is exhausted, so the free tier's transient

@@ -24,13 +24,14 @@ import (
 // Test models must map to agents with EXCLUSIVE ownership in the registry
 // FALLBACK map (see internal/registry/registry_test.go expectedFallback):
 // the five base2-free models are first-seen-assigned to the generic
-// base2-free agent, while glm-5.2 and laguna-s-2.1 are owned by their
-// dedicated one-model agents. Tests pin the offline (fallback) state.
+// base2-free agent, while glm-5.2 and fable-5 are owned by their dedicated
+// one-model agents (the laguna/ling/greg fixtures were removed upstream on
+// 2026-08-04/08-07, #121). Tests pin the offline (fallback) state.
 const (
 	modelA = "z-ai/glm-5.2"
-	modelB = "poolside/laguna-s-2.1"
+	modelB = "anthropic/claude-fable-5"
 	agentA = "base2-free-glm"
-	agentB = "base2-free-laguna-s-2-1"
+	agentB = "base2-free-fable"
 )
 
 // newTestPool wires one mock upstream per token through real clients and
@@ -2433,16 +2434,16 @@ func TestAcquireIpCappedCooldownBounded(t *testing.T) {
 		t.Errorf("RetryAfter = %s, want 45s (bounded to retryAfterMs)", ice.RetryAfter)
 	}
 
-	// Cooldown is bounded to the retry window, NOT the Pacific midnight
-	// quota lock (which would be many hours away).
+	// Cooldown is bounded to the retry window ±20% jitter (#118), NOT the
+	// Pacific midnight quota lock (which would be many hours away).
 	snap := p.Snapshot()[0]
 	if snap.CooldownUntil.IsZero() {
 		t.Fatal("CooldownUntil zero, want bounded window")
 	}
 	want := time.Now().Add(45 * time.Second)
 	diff := snap.CooldownUntil.Sub(want)
-	if diff < -2*time.Second || diff > 2*time.Second {
-		t.Errorf("CooldownUntil = %v, want ≈ now+45s (bounded), not Pacific midnight", snap.CooldownUntil)
+	if diff < -11*time.Second || diff > 11*time.Second {
+		t.Errorf("CooldownUntil = %v, want ≈ now+45s ±20%% jitter (bounded), not Pacific midnight", snap.CooldownUntil)
 	}
 
 	// While the window is active, a second acquire surfaces the remembered
@@ -2469,8 +2470,8 @@ func TestPoolCooldownTokenIpCappedBounded(t *testing.T) {
 	}
 	want := time.Now().Add(30 * time.Second)
 	diff := snap.CooldownUntil.Sub(want)
-	if diff < -2*time.Second || diff > 2*time.Second {
-		t.Errorf("CooldownUntil = %v, want ≈ now+30s (bounded), not Pacific midnight", snap.CooldownUntil)
+	if diff < -8*time.Second || diff > 8*time.Second {
+		t.Errorf("CooldownUntil = %v, want ≈ now+30s ±20%% jitter (bounded), not Pacific midnight", snap.CooldownUntil)
 	}
 
 	// Out-of-range tokens are ignored without panicking.

@@ -540,13 +540,16 @@ func TestChatCountryBlockCooldown(t *testing.T) {
 }
 
 // TestBridgeChatSessionInvalidBoundedRetry pins the bridge-path recovery
-// budget: a session_superseded chat error recreates the session once and
+// budget: a session-invalid chat error recreates the session once and
 // retries, then fails with 502 — never an unbounded recreate loop.
+// session_superseded is its OWN terminal sentinel (see
+// TestBridgeChatSessionSupersededTerminal) — this test uses session_expired
+// to pin the invalidate+reacquire-once budget for ErrSessionInvalid.
 func TestBridgeChatSessionInvalidBoundedRetry(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mock.ChatStatus = http.StatusBadRequest
-	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	mock.ChatErrorBody = `{"error":{"message":"session_expired"}}`
 	ts, _ := newBridgeTestServer(t, mock)
 
 	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA),
@@ -562,6 +565,32 @@ func TestBridgeChatSessionInvalidBoundedRetry(t *testing.T) {
 	}
 	if got := mock.SessionCreates; got != 2 {
 		t.Errorf("upstream session creates = %d, want exactly 2 (session recreated once)", got)
+	}
+}
+
+// TestBridgeChatSessionSupersededTerminal pins #119 on the bridge path: 409
+// session_superseded surfaces immediately (409 session_superseded) with NO
+// in-request reacquire — one chat attempt, one session create.
+func TestBridgeChatSessionSupersededTerminal(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatStatus = http.StatusBadRequest
+	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	ts, _ := newBridgeTestServer(t, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA),
+		map[string]string{"Authorization": "Bearer client-tok-ss"})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "session_superseded") {
+		t.Errorf("body missing session_superseded: %s", data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 1 {
+		t.Errorf("upstream chat attempts = %d, want exactly 1 (no auto-reacquire on superseded)", got)
+	}
+	if got := mock.SessionCreates; got != 1 {
+		t.Errorf("upstream session creates = %d, want exactly 1 (no in-request rejoin)", got)
 	}
 }
 

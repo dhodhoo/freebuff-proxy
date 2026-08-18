@@ -16,6 +16,7 @@ package runs
 import (
 	"context"
 	cryptoRand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,6 +38,31 @@ const DefaultCooldown = 30 * time.Minute
 // from re-hitting the blocked admission, short enough to re-probe after the
 // client switches egress/VPN.
 const countryBlockCooldown = 15 * time.Minute
+
+// ip_capped bounded re-admission (#118, gap item 16). The CLI treats
+// ip_capped as TERMINAL for its poll loop (nextDelayMs returns null —
+// reference/freebuff use-freebuff-session.ts) and relies on a human to pace
+// the retry. The proxy is a server (no interactive user), so full terminal
+// breaks service: instead, re-admission is bounded — each hit backs off the
+// FULL server retryAfterMs + ±20% jitter, and after ipCappedMaxDailyAttempts
+// hits within a rolling ipCappedDailyWindow the token stops re-admitting
+// until the Pacific-midnight reset (treated like rate_limited's reset) and
+// surfaces 429 ip_capped to clients. This is a documented proxy deviation
+// from the CLI's fully-terminal behavior.
+const (
+	// ipCappedMaxDailyAttempts is the per-token daily re-admission budget:
+	// the Nth ip_capped hit in one window locks the token until the
+	// Pacific-midnight reset.
+	ipCappedMaxDailyAttempts = 3
+	// ipCappedJitterSpan is the symmetric jitter fraction (1/5 = ±20%,
+	// mirroring the CLI's jitterPollIntervalMs / pool sessionPollJittered).
+	ipCappedJitterSpan = 5
+)
+
+// ipCappedDailyWindow is the rolling window over which ip_capped
+// re-admission attempts are counted (a test-shrinkable var so tests can
+// exercise window rollover without sleeping 24h).
+var ipCappedDailyWindow = 24 * time.Hour
 
 // shutdownTimeout bounds Shutdown when the caller passes a context without a
 // deadline (PRD §5: "10s force deadline").
@@ -205,6 +231,15 @@ type RunManager struct {
 	// ip_capped + Retry-After instead of a generic cooldown 502.
 	ipCapped      *upstream.IpCappedError
 	ipCappedUntil time.Time
+	// ip_capped bounded re-admission (#118): ipCappedCount counts
+	// re-admission attempts within the rolling ipCappedDailyWindow starting
+	// at ipCappedWindowStart; when it reaches ipCappedMaxDailyAttempts the
+	// token is locked until ipCappedTerminalUntil (the Pacific-midnight
+	// reset, treated like rate_limited) instead of re-admitting on the
+	// short retryAfter window.
+	ipCappedCount         int
+	ipCappedWindowStart   time.Time
+	ipCappedTerminalUntil time.Time
 	// totalRequests is the cumulative count of Acquire leases handed out.
 	// It is kept separate from the per-run counters because rotated runs
 	// that get FINISHed leave the active+draining sets and would otherwise
@@ -636,6 +671,10 @@ func (m *RunManager) ClearCooldowns() {
 	m.countryUntil = time.Time{}
 	m.ipCapped = nil
 	m.ipCappedUntil = time.Time{}
+	// Unlock also resets the ip_capped daily re-admission budget (#118).
+	m.ipCappedCount = 0
+	m.ipCappedWindowStart = time.Time{}
+	m.ipCappedTerminalUntil = time.Time{}
 	m.mu.Unlock()
 }
 
@@ -668,12 +707,16 @@ func (m *RunManager) CooldownRateLimit(rle *upstream.RateLimitError) {
 	m.ipCapped = nil
 }
 
-// CooldownIpCapped applies an ip_capped cooldown bounded to the body's
-// retryAfterMs ONLY — never the Pacific-midnight quota lock (ip_capped is
-// admission-only, not tied to a quota reset). Remembered so Acquires keep
-// surfacing 429 ip_capped + Retry-After during the short window instead of
-// re-hitting upstream (mirrors CooldownRateLimit). Errors with
-// RetryAfter <= 0 are ignored.
+// CooldownIpCapped applies an ip_capped cooldown with bounded re-admission
+// (#118): each hit backs off the FULL server retryAfterMs + ±20% jitter,
+// and once the token hits ipCappedMaxDailyAttempts within a rolling
+// ipCappedDailyWindow it stops re-admitting until the Pacific-midnight
+// reset (treated like rate_limited's reset) — the proxy's server-model
+// deviation from the CLI's fully-terminal ip_capped (use-freebuff-session.ts
+// nextDelayMs returns null). Remembered so Acquires keep surfacing
+// 429 ip_capped + Retry-After during the window instead of re-hitting
+// upstream (mirrors CooldownRateLimit). Errors with RetryAfter <= 0 are
+// ignored.
 func (m *RunManager) CooldownIpCapped(ice *upstream.IpCappedError) {
 	if ice == nil {
 		return
@@ -683,8 +726,30 @@ func (m *RunManager) CooldownIpCapped(ice *upstream.IpCappedError) {
 	if ice.RetryAfter <= 0 {
 		return
 	}
+	now := time.Now()
+	// Rolling window: slide to a fresh window when 24h have elapsed since
+	// the first hit, or when a previous terminal lock (Pacific-midnight
+	// reset) has already expired — so a token capped out yesterday re-admits
+	// today instead of inheriting yesterday's count.
+	if m.ipCappedWindowStart.IsZero() ||
+		now.Sub(m.ipCappedWindowStart) >= ipCappedDailyWindow ||
+		(!m.ipCappedTerminalUntil.IsZero() && now.After(m.ipCappedTerminalUntil)) {
+		m.ipCappedWindowStart = now
+		m.ipCappedCount = 0
+		m.ipCappedTerminalUntil = time.Time{}
+	}
+	m.ipCappedCount++
 	m.ipCapped = ice
-	m.ipCappedUntil = time.Now().Add(ice.RetryAfter)
+	if m.ipCappedCount >= ipCappedMaxDailyAttempts {
+		// Daily budget exhausted: no more re-admission until the
+		// Pacific-midnight reset (rate_limited-style lock); the remembered
+		// error keeps surfacing 429 ip_capped meanwhile.
+		m.ipCappedTerminalUntil = upstream.NextPacificMidnight()
+		m.ipCappedUntil = m.ipCappedTerminalUntil
+	} else {
+		m.ipCappedTerminalUntil = time.Time{}
+		m.ipCappedUntil = now.Add(ipCappedJitter(ice.RetryAfter))
+	}
 	m.cooldownUntil = m.ipCappedUntil
 	m.rateLimit = nil
 	m.ban = nil
@@ -700,6 +765,25 @@ func (m *RunManager) IpCappedError() *upstream.IpCappedError {
 		return m.ipCapped
 	}
 	return nil
+}
+
+// ipCappedJitter applies the CLI's symmetric ±20% jitter around d for the
+// ip_capped re-admission backoff (the CLI jitters its poll intervals the
+// same way — jitterPollIntervalMs; reference/freebuff sdk
+// polling-backoff.ts).
+func ipCappedJitter(d time.Duration) time.Duration {
+	span := d / ipCappedJitterSpan
+	return d - span + time.Duration(ipCappedRand()%uint64(2*span+1))
+}
+
+// ipCappedRand mints a jitter draw from crypto/rand, falling back to a
+// time-seeded value on failure (mirrors pool.sessionRand).
+func ipCappedRand() uint64 {
+	var b [8]byte
+	if _, err := cryptoRand.Read(b[:]); err != nil {
+		return uint64(time.Now().UnixNano())
+	}
+	return binary.BigEndian.Uint64(b[:])
 }
 
 // RateLimitError returns the remembered rate-limit error while its

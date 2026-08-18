@@ -267,7 +267,7 @@ func TestErrorClassification(t *testing.T) {
 	}{
 		{"run invalid", 400, `{"error":"runId not found"}`, ErrRunInvalid},
 		{"run not running", 400, `{"error":"runId not running"}`, ErrRunInvalid},
-		{"session superseded", 400, `{"error":"session_superseded"}`, ErrSessionInvalid},
+		{"session superseded", 400, `{"error":"session_superseded"}`, ErrSessionSuperseded},
 		{"session expired", 400, `{"error":"session_expired"}`, ErrSessionInvalid},
 		{"update required", 400, `{"error":"freebuff_update_required"}`, ErrSessionInvalid},
 		{"auth", 401, `{"error":"unauthorized"}`, ErrAuthRejected},
@@ -1533,8 +1533,11 @@ type flakyRT struct {
 
 func (f *flakyRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	f.calls.Add(1)
-	b, _ := io.ReadAll(req.Body)
-	_ = req.Body.Close()
+	var b []byte
+	if req.Body != nil {
+		b, _ = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+	}
 	f.seen = append(f.seen, b)
 	f.seenHeaders = append(f.seenHeaders, req.Header.Clone())
 	if int(f.calls.Load()) <= f.failN {
@@ -3300,16 +3303,17 @@ func TestClassifySessionLimitReached(t *testing.T) {
 	}
 }
 
-// TestChatSendsActingUserID verifies #79: when USER_ID is configured the
-// client sends x-freebuff-acting-user-id on the chat path (CLI parity);
-// when unset the header is omitted.
+// TestChatSendsActingUserID verifies #79: when ACTING_USER_ID is configured
+// the client sends x-freebuff-acting-user-id on the chat path (the CLI
+// sends the account's own id derived from /api/v1/me); when unset the
+// header is omitted.
 func TestChatSendsActingUserID(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mock.ChatBody = testutil.SSEEvent(`{"id":"x","object":"chat.completion.chunk","choices":[]}`)
 
 	t.Run("set", func(t *testing.T) {
-		client, err := New("tok-a", testConfig(mock.URL(), func(c *config.Config) { c.UserID = "user-123" }))
+		client, err := New("tok-a", testConfig(mock.URL(), func(c *config.Config) { c.ActingUserID = "user-123" }))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3339,6 +3343,89 @@ func TestChatSendsActingUserID(t *testing.T) {
 			t.Errorf("x-freebuff-acting-user-id = %q, want unset", got)
 		}
 	})
+}
+
+// TestWaitingRoomChainWireFidelity verifies #124: the pre-session ad chain
+// matches the CLI wire shape — header UA Freebuff-CLI/0.0.149 (never the
+// old 2.0.42 login UA), body userAgent = the Chrome-124 browser UA,
+// device carries the host IANA timezone/locale, messages stays [] with no
+// sessionId (fresh waiting-room), and the streak GET inherits newRequest's
+// cliUserAgent (no UA override).
+func TestWaitingRoomChainWireFidelity(t *testing.T) {
+	var mu sync.Mutex
+	var adsHeaders, streakHeaders http.Header
+	var adsBody map[string]any
+	adsHits, streakHits := 0, 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/api/v1/ads" && r.Method == http.MethodPost:
+			adsHits++
+			adsHeaders = r.Header.Clone()
+			_ = json.NewDecoder(r.Body).Decode(&adsBody)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"ads":[],"provider":"gravity"}`)
+		case r.URL.Path == "/api/v1/freebuff/streak" && r.Method == http.MethodGet:
+			streakHits++
+			streakHeaders = r.Header.Clone()
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New("tok-a", testConfig(ts.URL, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.FireWaitingRoomChain(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if adsHits == 0 {
+		t.Fatal("ads request not fired")
+	}
+	if streakHits == 0 {
+		t.Fatal("streak request not fired")
+	}
+	// Header UA: Freebuff-CLI/<installed binary version>.
+	if got := adsHeaders.Get("User-Agent"); got != freebuffCliUA {
+		t.Errorf("ads header User-Agent = %q, want %q", got, freebuffCliUA)
+	}
+	// Body userAgent: the shared Chrome-124 browser UA (ad targeting).
+	if got := adsBody["userAgent"]; got != adBrowserUserAgent {
+		t.Errorf("ads body userAgent = %q, want %q", got, adBrowserUserAgent)
+	}
+	// Device block: host-derived IANA tz/locale, not hardcoded UTC/en-US.
+	device, ok := adsBody["device"].(map[string]any)
+	if !ok {
+		t.Fatalf("ads body device = %T, want object", adsBody["device"])
+	}
+	tz, _ := device["timezone"].(string)
+	if tz == "" || tz == "Local" {
+		t.Errorf("ads device timezone = %q, want host IANA name or UTC", tz)
+	} else if _, err := time.LoadLocation(tz); err != nil {
+		t.Errorf("ads device timezone %q is not a valid IANA zone", tz)
+	}
+	loc, _ := device["locale"].(string)
+	if loc == "" || loc == "C" || loc == "POSIX" || strings.Contains(loc, "_") {
+		t.Errorf("ads device locale = %q, want a BCP-47-style locale (e.g. en-US)", loc)
+	}
+	// Faithful details kept: empty messages and NO sessionId (the chain
+	// fires before a session exists).
+	if msgs, _ := adsBody["messages"].([]any); len(msgs) != 0 {
+		t.Errorf("ads body messages = %v, want []", msgs)
+	}
+	if _, hasSession := adsBody["sessionId"]; hasSession {
+		t.Error("ads body carries sessionId, want omitted (fresh waiting-room)")
+	}
+	// Streak GET: no UA override — it inherits newRequest's cliUserAgent.
+	if got := streakHeaders.Get("User-Agent"); got != cliUserAgent {
+		t.Errorf("streak User-Agent = %q, want %q (cliUserAgent, no override)", got, cliUserAgent)
+	}
 }
 
 // TestInjectEnvelopeTraceSessionIDAndFreshClientID verifies #80+#103: the

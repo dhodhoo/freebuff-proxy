@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -38,18 +39,14 @@ import (
 	"freebuff-proxy/internal/config"
 )
 
-// freebuffLoginUserAgent is the official CLI login user agent (reference
-// account_login.go freebuffLoginUserAgent).
-const freebuffLoginUserAgent = "ai-sdk/openai-compatible/2.0.42/codebuff"
-
 // loginCallTimeout bounds each login HTTP call (code request, status poll,
 // protocol page walk).
 const loginCallTimeout = 30 * time.Second
 
 // loginPollInterval is how long between status polls (the upstream device
-// code takes a human to complete; 3s matches the reference
-// freebuffLoginPollSeconds).
-const loginPollInterval = 3 * time.Second
+// code takes a human to complete; 5s matches the reference CLI default
+// login-flow.ts pollLoginStatus intervalMs=5000, not the old 3s).
+const loginPollInterval = 5 * time.Second
 
 // NewForAuth builds a token-less client for the headless OAuth login flow
 // (#62/#66). The transport/stealth/proxy wiring is identical to a pooled
@@ -77,9 +74,11 @@ func newFingerprintID() (string, error) {
 	return "enhanced-" + hex.EncodeToString(b[:]), nil
 }
 
-// authLoginRequest builds an /api/auth/cli/* request with the official
-// login User-Agent, no credentials, and (for POST) the JSON content type
-// (reference freebuffLoginHeaders).
+// authLoginRequest builds an /api/auth/cli/* request with the chat ai-sdk
+// User-Agent (cliUserAgent — the fabricated 2.0.42 login UA is gone; the
+// real llm-providers version is 1.0.0), no credentials, and (for POST) the
+// JSON content type (reference freebuffLoginHeaders + login-flow.ts, whose
+// request() sets no UA at all).
 func (c *Client) authLoginRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
 	var reader io.Reader
 	if body != nil {
@@ -89,7 +88,7 @@ func (c *Client) authLoginRequest(ctx context.Context, method, path string, body
 	if err != nil {
 		return nil, fmt.Errorf("upstream: build %s %s: %w", method, path, err)
 	}
-	req.Header.Set("User-Agent", freebuffLoginUserAgent)
+	req.Header.Set("User-Agent", cliUserAgent)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -196,10 +195,12 @@ func loginExpiresAt(raw int64) time.Time {
 }
 
 // PollCLILogin polls GET /api/auth/cli/status for a started login.
-// Pending (401/2xx without a token — the backend answers 401 while the code
-// is pending) returns Done=false without error; a completed login returns
-// the token and user metadata (reference pollGitHubLogin +
-// login.ts pollLoginStatus).
+// Pending — 401 while the device code is unclaimed, a transient 5xx, or a
+// transport failure — returns Done=false WITHOUT error so callers keep
+// polling until the 5-minute deadline, mirroring login-flow.ts
+// pollLoginStatus (5xx + network errors are logged and retried; only the
+// deadline / shouldContinue abort). A completed login returns the token
+// and user metadata (reference pollGitHubLogin + login.ts pollLoginStatus).
 func (c *Client) PollCLILogin(ctx context.Context, code *CLILoginCode) (*CLILoginStatus, error) {
 	u, err := url.Parse(c.baseURL + "/api/auth/cli/status")
 	if err != nil {
@@ -219,16 +220,23 @@ func (c *Client) PollCLILogin(ctx context.Context, code *CLILoginCode) (*CLILogi
 	if err != nil {
 		return nil, fmt.Errorf("upstream: build login status request: %w", err)
 	}
-	req.Header.Set("User-Agent", freebuffLoginUserAgent)
+	req.Header.Set("User-Agent", cliUserAgent)
 	resp, cancel, err := c.do(req, loginCallTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("upstream: poll login: %w", err)
+		// Transient transport failure: login-flow.ts logs and keeps polling
+		// through network errors — return pending so the caller retries
+		// until its 5-minute deadline (#125).
+		slog.Warn("login status poll: transient transport error, will retry", "err", err)
+		return &CLILoginStatus{}, nil
 	}
 	defer cancel()
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 500 {
+		// Transient upstream error: login-flow.ts keeps polling on any
+		// non-401 status — return pending (#125).
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return nil, fmt.Errorf("upstream: poll login failed: status %d: %s", resp.StatusCode, truncate(string(raw), 200))
+		slog.Warn("login status poll: transient upstream status, will retry", "status", resp.StatusCode, "body", truncate(string(raw), 200))
+		return &CLILoginStatus{}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Pending: 401 while the device code is unclaimed (login.ts keeps
@@ -305,14 +313,14 @@ func (c *Client) ProtocolGitHubLogin(ctx context.Context, username, password, to
 	}
 
 	// 1. Load the login page so the jar picks up session cookies.
-	if _, err := getWithUA(ctx, client, code.LoginURL, freebuffLoginUserAgent); err != nil {
+	if _, err := getWithUA(ctx, client, code.LoginURL, cliUserAgent); err != nil {
 		return nil, fmt.Errorf("freebuff github protocol login: login page: %w", err)
 	}
 
 	// 2. Walk the OAuth authorize page: GET the sign-in URL (the login page
 	// redirects there), find the login form, submit username+password.
 	if authorizeURL := githubProtocolAuthorizeURL(code.LoginURL); authorizeURL != "" {
-		if _, err := getWithUA(ctx, client, authorizeURL, freebuffLoginUserAgent); err != nil {
+		if _, err := getWithUA(ctx, client, authorizeURL, cliUserAgent); err != nil {
 			return nil, fmt.Errorf("freebuff github protocol login: authorize page: %w", err)
 		}
 	}
@@ -320,7 +328,7 @@ func (c *Client) ProtocolGitHubLogin(ctx context.Context, username, password, to
 	// 3. The login page may live at the login URL itself (github.com/login)
 	// or on the authorize flow; submit the password form wherever it is.
 	// We track the most recent page body through the login form.
-	loginResp, err := getWithUA(ctx, client, code.LoginURL, freebuffLoginUserAgent)
+	loginResp, err := getWithUA(ctx, client, code.LoginURL, cliUserAgent)
 	if err != nil {
 		return nil, fmt.Errorf("freebuff github protocol login: login form: %w", err)
 	}
@@ -330,7 +338,7 @@ func (c *Client) ProtocolGitHubLogin(ctx context.Context, username, password, to
 	}
 	form.Fields.Set("login", username)
 	form.Fields.Set("password", password)
-	postResp, err := submitForm(ctx, client, form, loginResp.finalURL, freebuffLoginUserAgent)
+	postResp, err := submitForm(ctx, client, form, loginResp.finalURL, cliUserAgent)
 	if err != nil {
 		return nil, fmt.Errorf("freebuff github protocol login: password submit: %w", err)
 	}
@@ -348,7 +356,7 @@ func (c *Client) ProtocolGitHubLogin(ctx context.Context, username, password, to
 		if totpForm.Fields.Get("otp") != "" {
 			totpForm.Fields.Set("otp", code6)
 		}
-		postResp, err = submitForm(ctx, client, totpForm, postResp.finalURL, freebuffLoginUserAgent)
+		postResp, err = submitForm(ctx, client, totpForm, postResp.finalURL, cliUserAgent)
 		if err != nil {
 			return nil, fmt.Errorf("freebuff github protocol login: totp submit: %w", err)
 		}
@@ -360,7 +368,7 @@ func (c *Client) ProtocolGitHubLogin(ctx context.Context, username, password, to
 		if strings.HasPrefix(target, "/") {
 			target = "https://github.com" + target
 		}
-		if _, err := getWithUA(ctx, client, target, freebuffLoginUserAgent); err != nil {
+		if _, err := getWithUA(ctx, client, target, cliUserAgent); err != nil {
 			return nil, fmt.Errorf("freebuff github protocol login: oauth callback: %w", err)
 		}
 	}
@@ -369,7 +377,11 @@ func (c *Client) ProtocolGitHubLogin(ctx context.Context, username, password, to
 	return c.pollForCompletion(ctx, code, 0)
 }
 
-// pollForCompletion polls PollCLILogin until Done, up to pollTimeout.
+// pollForCompletion polls PollCLILogin until Done, up to the 5-minute
+// deadline. 5xx and transport failures are already transient inside
+// PollCLILogin (pending, no error), so the only errors landing here are
+// locally-built-request failures; the loop otherwise mirrors login-flow.ts
+// (keep polling, abort only on deadline / ctx cancel).
 func (c *Client) pollForCompletion(ctx context.Context, code *CLILoginCode, _ time.Duration) (*CLILoginStatus, error) {
 	deadline := time.Now().Add(5 * time.Minute)
 	for {

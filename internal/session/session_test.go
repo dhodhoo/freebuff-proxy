@@ -809,6 +809,52 @@ func TestPollInvalidatesRecreateStatuses(t *testing.T) {
 	}
 }
 
+// TestPollDropsRowOnWaitingRoomRequired verifies #116: a 428
+// waiting_room_required poll response is session-ENDING
+// (endsTheSession:true) — Poll drops the cached admission so the next
+// EnsureSession re-admits fresh, and surfaces the typed error for the
+// pool's failure backoff.
+func TestPollDropsRowOnWaitingRoomRequired(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var reAdmits atomic.Int32
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// 428 on the poll GET (the compact session poll).
+			w.WriteHeader(http.StatusTooEarly) // 428
+			_, _ = io.WriteString(w, `{"error":"waiting_room_required"}`)
+			return
+		}
+		// POST (re-admit after the 428 drop): a fresh active slot.
+		reAdmits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"active","instanceId":"inst-abc-123","expiresAt":"2030-01-01T00:00:00Z"}`)
+	}
+
+	err := mgr.Poll(context.Background())
+	if !errors.Is(err, upstream.ErrWaitingRoomRequired) {
+		t.Fatalf("Poll error = %v, want ErrWaitingRoomRequired", err)
+	}
+	if snap := mgr.Snapshot(); snap.Status != "" {
+		t.Errorf("status = %q, want empty (cached row dropped on 428)", snap.Status)
+	}
+
+	// The next EnsureSession re-admits fresh (the pool fires the
+	// WAITING_ROOM_CHAIN before the create).
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := reAdmits.Load(); got != 1 {
+		t.Errorf("re-admit session creates = %d, want 1 (fresh admission after 428 drop)", got)
+	}
+}
+
 // TestModelLockedReleasesOldSlot verifies the model_locked branch releases
 // the OLD upstream slot (SessionEnds == 1) before retrying with the desired
 // model: the model-switch invariant that a locked slot is not leaked.
@@ -988,28 +1034,39 @@ func TestPollTransportErrorKeepsCachedState(t *testing.T) {
 }
 
 // TestEndSessionSwallowsSessionInvalid verifies EndSession returns nil when
-// the upstream DELETE fails with a 400 session_superseded (ErrSessionInvalid
-// — the slot is already gone, nothing to do).
+// the upstream DELETE fails with a "slot already gone" rejection — 400
+// session_expired (ErrSessionInvalid) and 400 session_superseded
+// (ErrSessionSuperseded, #119) — nothing to do either way.
 func TestEndSessionSwallowsSessionInvalid(t *testing.T) {
-	mock := testutil.NewMock()
-	defer mock.Close()
-	mgr := newTestManager(t, mock)
+	for _, tc := range []struct {
+		body string
+		want error
+	}{
+		{`{"error":"session_expired"}`, upstream.ErrSessionInvalid},
+		{`{"error":"session_superseded"}`, upstream.ErrSessionSuperseded},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			mock := testutil.NewMock()
+			defer mock.Close()
+			mgr := newTestManager(t, mock)
 
-	if _, err := mgr.EnsureSession(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+			if _, err := mgr.EnsureSession(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 
-	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(w, `{"error":"session_superseded"}`)
-			return
-		}
-		http.NotFound(w, r)
-	}
+			mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, tc.body)
+					return
+				}
+				http.NotFound(w, r)
+			}
 
-	if err := mgr.EndSession(context.Background()); err != nil {
-		t.Fatalf("EndSession with 400 session_superseded = %v, want nil (ErrSessionInvalid swallowed)", err)
+			if err := mgr.EndSession(context.Background()); err != nil {
+				t.Fatalf("EndSession with 400 %s = %v, want nil (%v swallowed)", tc.body, err, tc.want)
+			}
+		})
 	}
 }
 
@@ -1305,6 +1362,8 @@ func TestModelLockedFallbackInstance(t *testing.T) {
 			_, _ = io.WriteString(w, `{"status":"active","instanceId":"active-inst-456","model":"model/new"}`)
 		case http.MethodDelete:
 			mu.Lock()
+			// #120: the CLI DELETEs with Bearer only — no instance header
+			// (reference/freebuff freebuff-session-api.ts releaseFreebuffSlot).
 			deleteInstanceIDs = append(deleteInstanceIDs, r.Header.Get("x-freebuff-instance-id"))
 			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
@@ -1328,8 +1387,8 @@ func TestModelLockedFallbackInstance(t *testing.T) {
 	if len(deleteInstanceIDs) != 1 {
 		t.Fatalf("EndSession calls = %d, want 1", len(deleteInstanceIDs))
 	}
-	if deleteInstanceIDs[0] != "locked-inst-123" {
-		t.Errorf("EndSession instanceID = %q, want locked-inst-123", deleteInstanceIDs[0])
+	if deleteInstanceIDs[0] != "" {
+		t.Errorf("DELETE x-freebuff-instance-id = %q, want absent (#120: session DELETE is Bearer-only)", deleteInstanceIDs[0])
 	}
 }
 

@@ -844,7 +844,10 @@ func (m *Manager) EndSession(ctx context.Context) error {
 		return nil
 	}
 	slog.Debug("session ended", "instance_id", instanceID)
-	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) {
+	// A superseded DELETE is the same "slot already gone" case as
+	// session-invalid (#119): swallow both so teardown never errors on a
+	// slot another instance took over.
+	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
 		return err
 	}
 	return nil
@@ -886,11 +889,11 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	// Release the upstream slot directly (not EndSession): EndSession's CAS
 	// commit(nil) would remove the store entry we just flushed, and the
 	// DELETE is keyed on the user, not the instance (reference/freebuff
-	// session wire: DELETE = Bearer only; the client still sends the
-	// instance header today — P2 #18 backlog). The cached state is kept
-	// in-memory so the store entry stays; the process is exiting.
+	// session wire: DELETE = Bearer only, #120 — EndSession never sends the
+	// instance header). The cached state is kept in-memory so the store
+	// entry stays; the process is exiting.
 	slog.Debug("session ended on shutdown", "instance_id", shortInstance(instanceID))
-	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) {
+	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
 		return err
 	}
 	return nil
@@ -992,6 +995,20 @@ func (m *Manager) Poll(ctx context.Context) error {
 
 	st, err := m.client.GetSessionWithOpts(ctx, instanceID, true)
 	if err != nil {
+		// #116: 428 waiting_room_required is session-ENDING
+		// (endsTheSession:true per FREEBUFF_GATE_CODES — the seat is gone;
+		// reference/freebuff freebuff-session.ts). Drop the cached admission
+		// so the next EnsureSession re-admits fresh (the pool's
+		// WAITING_ROOM_CHAIN fires before the create). Any other poll error
+		// is left for the pool's failure backoff.
+		if errors.Is(err, upstream.ErrWaitingRoomRequired) {
+			m.mu.Lock()
+			if m.state != nil && m.state.instanceID == instanceID {
+				m.commit(nil)
+				slog.Debug("session dropped during poll", "reason", "waiting_room_required", "instance_id", instanceID)
+			}
+			m.mu.Unlock()
+		}
 		return err
 	}
 	m.mu.Lock()

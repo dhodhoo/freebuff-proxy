@@ -251,7 +251,7 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `SESSION_CALL_TIMEOUT` | `30s` | Session call timeout |
 | `REGISTRY_REFRESH` | `6h` | Model catalog refresh interval |
 | `COST_MODE` | `free` | `free` (free-tier) or paid billing mode |
-| `USER_ID` | `""` | Optional FreeBuff account id; sent on every chat call as `x-freebuff-acting-user-id` (the real CLI sends it and the free-mode gate expects it). Empty = header omitted |
+| `ACTING_USER_ID` | `""` | Optional FreeBuff account id; sent on every chat call as `x-freebuff-acting-user-id`. BAN RISK: only the token's own account id is safe (the CLI derives it from `GET /api/v1/me`; the server honors the header only for the FreeBuff Web service account) — any other value impersonates another user. Pre-rename name `USER_ID` still works. Empty = header omitted |
 | `TLS_FINGERPRINT` | `auto` | `auto`, `chrome120`, `chrome126`, `safari17`, `safari18`, `firefox120`, `firefox128`, `edge126`, `random` |
 | `DEBUG_DUMP` | `false` | Persist redacted traffic dumps to `./dump/` (mode 0600) |
 | `LOG_FILE` | `""` | Append log lines to a file (e.g. `./logs/proxy.log`) |

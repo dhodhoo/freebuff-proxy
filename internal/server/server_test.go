@@ -275,6 +275,46 @@ func TestChatNonStream(t *testing.T) {
 	}
 }
 
+// TestChatFeedsSpendLedger pins the #122 spend feeder: every successful chat
+// completion records the upstream usage total into the token's spend ledger
+// (streaming and non-stream paths), so SpendDay/Spend24h reflect real usage
+// instead of the pre-wiring zeros.
+func TestChatFeedsSpendLedger(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-s1", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-s1", 1, `"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}`))
+	ts, pool := newTestServer(t, nil, mock)
+
+	req := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", []byte(req), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200: %s", resp.StatusCode, data)
+	}
+
+	snaps := pool.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("pool tokens = %d, want 1", len(snaps))
+	}
+	if snaps[0].SpendDay != 13 || snaps[0].Spend24h != 13 {
+		t.Errorf("spend after stream chat = %d/%d, want 13/13 (usage 11+2)", snaps[0].SpendDay, snaps[0].Spend24h)
+	}
+
+	// The non-stream path feeds the same ledger: a second completion
+	// accumulates on top.
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-s2", 2, `"choices":[{"index":0,"delta":{"content":"yo"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-s2", 2, `"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}`))
+	req2 := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	resp2, _ := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", []byte(req2), nil)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("non-stream status = %d, want 200", resp2.StatusCode)
+	}
+	snaps = pool.Snapshot()
+	if snaps[0].SpendDay != 25 || snaps[0].Spend24h != 25 {
+		t.Errorf("spend after two chats = %d/%d, want 25/25 (13+12)", snaps[0].SpendDay, snaps[0].Spend24h)
+	}
+}
+
 func TestWaitingRoom503ThenRetry(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
@@ -424,8 +464,11 @@ func TestChatSessionInvalidBoundedRetry(t *testing.T) {
 	// Every chat returns a session-invalid error. Without a retry budget the
 	// recovery loop re-creates the session and re-chats forever, hanging the
 	// client; the budget must cap it at one retry (2 chat attempts total).
+	// session_superseded is its OWN terminal sentinel (see
+	// TestChatSessionSupersededTerminal) — this test uses session_expired to
+	// pin the invalidate+reacquire-once budget for ErrSessionInvalid.
 	mock.ChatStatus = http.StatusBadRequest
-	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	mock.ChatErrorBody = `{"error":{"message":"session_expired"}}`
 	ts, _ := newTestServer(t, nil, mock)
 
 	// A client timeout makes a regression (unbounded loop) fail fast instead
@@ -449,6 +492,48 @@ func TestChatSessionInvalidBoundedRetry(t *testing.T) {
 	}
 	if got := mock.SessionCreates; got != 2 {
 		t.Errorf("upstream session creates = %d, want exactly 2 (bounded retry)", got)
+	}
+}
+
+// TestChatSessionSupersededTerminal pins #119: 409 session_superseded (another
+// instance took over the account, endsTheSession:true) is TERMINAL — the
+// cached session is dropped so the NEXT request re-joins fresh, but the
+// request NEVER auto-reacquires (auto-takeover risks ping-pong). One chat
+// attempt, one session create, 409 session_superseded surfaced.
+func TestChatSessionSupersededTerminal(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatStatus = http.StatusBadRequest
+	mock.ChatErrorBody = `{"error":{"message":"session_superseded"}}`
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "session_superseded") {
+		t.Errorf("body missing session_superseded: %s", data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 1 {
+		t.Errorf("upstream chat attempts = %d, want exactly 1 (no auto-reacquire on superseded)", got)
+	}
+	if got := mock.SessionCreates; got != 1 {
+		t.Errorf("upstream session creates = %d, want exactly 1 (no in-request rejoin)", got)
+	}
+
+	// The cached session was dropped: the NEXT request re-joins fresh (the
+	// CLI's "stop and rejoin later" semantic) — a second session create +
+	// chat happen, and the mock's persistent superseded chat surfaces again
+	// as 409.
+	resp2, data2 := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("second request status = %d, want 409 (superseded again): %s", resp2.StatusCode, data2)
+	}
+	if got := mock.SessionCreates; got != 2 {
+		t.Errorf("session creates after next request = %d, want 2 (fresh re-join)", got)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 2 {
+		t.Errorf("upstream chat attempts after next request = %d, want 2", got)
 	}
 }
 
@@ -610,8 +695,10 @@ func TestModelsEndpoint(t *testing.T) {
 	if out.Object != "list" {
 		t.Errorf("object = %q, want list", out.Object)
 	}
-	if len(out.Data) < 15 {
-		t.Errorf("models = %d, want >= 15", len(out.Data))
+	// #121: the offline fallback pruned 5 dead model ids (laguna/ling/greg),
+	// 15 -> 10 rows (registry fallbackAgents, free-agents.ts-verified).
+	if len(out.Data) < 10 {
+		t.Errorf("models = %d, want >= 10", len(out.Data))
 	}
 	for i, m := range out.Data {
 		if m.ID == "" || m.Object != "model" || m.OwnedBy == "" {
@@ -656,8 +743,9 @@ func TestHealthz(t *testing.T) {
 	if out.UptimeSeconds < 0 {
 		t.Errorf("uptime_seconds = %v, want >= 0", out.UptimeSeconds)
 	}
-	if out.Models < 15 {
-		t.Errorf("models = %d, want >= 15", out.Models)
+	// #121: fallback registry 15 -> 10 rows after pruning dead model ids.
+	if out.Models < 10 {
+		t.Errorf("models = %d, want >= 10", out.Models)
 	}
 	if len(out.Tokens) != 2 {
 		t.Errorf("tokens = %d, want 2", len(out.Tokens))

@@ -255,8 +255,10 @@ func TestSpendLedgerRollover(t *testing.T) {
 		t.Fatal("period starts not set")
 	}
 
-	// Day rollover: force yesterday's start, add → resets then accumulates.
-	l.dayStart = now.Add(-24 * time.Hour).Unix()
+	// Day rollover: force a start from the previous Pacific day (26h is
+	// safely past the previous midnight even on the 25h fall-back DST day),
+	// add → resets then accumulates.
+	l.dayStart = now.Add(-26 * time.Hour).Unix()
 	l.add(50, now)
 	v = ledgerView(l)
 	if v.Day != 50 {
@@ -267,6 +269,56 @@ func TestSpendLedgerRollover(t *testing.T) {
 	}
 	if v.Week != 150 {
 		t.Errorf("Week = %d, want 150 (week window still open)", v.Week)
+	}
+}
+
+// TestSpendDayBucketRollsAtPacificMidnight pins the #122 day-bucket
+// boundary: the daily bucket rolls at Pacific midnight
+// (America/Los_Angeles), NOT UTC midnight. In summer (PDT, UTC-7) the
+// boundary is 07:00Z: the UTC day turns over at 00:00Z hours earlier, so a
+// UTC-midnight bucket would reset at the wrong instant.
+func TestSpendDayBucketRollsAtPacificMidnight(t *testing.T) {
+	// Summer: Pacific midnight = 07:00Z (PDT).
+	before := time.Date(2026, 8, 17, 6, 59, 0, 0, time.UTC) // 23:59 PDT 08-16
+	after := time.Date(2026, 8, 17, 7, 0, 0, 0, time.UTC)   // 00:00 PDT 08-17
+
+	if got := bucketStart(before, "day"); got != time.Date(2026, 8, 16, 7, 0, 0, 0, time.UTC).Unix() {
+		t.Errorf("bucketStart(%v) = %v, want 08-16T07:00Z (Pacific midnight)", before, time.Unix(got, 0).UTC())
+	}
+	if got := bucketStart(after, "day"); got != time.Date(2026, 8, 17, 7, 0, 0, 0, time.UTC).Unix() {
+		t.Errorf("bucketStart(%v) = %v, want 08-17T07:00Z (Pacific midnight)", after, time.Unix(got, 0).UTC())
+	}
+	// Winter (PST, UTC-8): the boundary is 08:00Z.
+	winter := time.Date(2026, 1, 5, 8, 30, 0, 0, time.UTC) // 00:30 PST 01-05
+	if got := bucketStart(winter, "day"); got != time.Date(2026, 1, 5, 8, 0, 0, 0, time.UTC).Unix() {
+		t.Errorf("bucketStart(%v) = %v, want 01-05T08:00Z (Pacific midnight)", winter, time.Unix(got, 0).UTC())
+	}
+
+	p := newTestPool(t, testutil.NewMock())
+	p.spendMu.Lock()
+	l := p.spendPerToken[0]
+	p.spendMu.Unlock()
+
+	l.add(100, before)
+	v := ledgerView(l)
+	if v.Day != 100 {
+		t.Fatalf("Day after 100 at %v = %d, want 100", before, v.Day)
+	}
+	// 00:00Z is 00:00 PDT the same Pacific day: the UTC date rolled, the
+	// Pacific day has not — no reset.
+	l.add(50, time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC))
+	v = ledgerView(l)
+	if v.Day != 150 {
+		t.Errorf("Day after add at 00:00Z = %d, want 150 (no Pacific rollover yet)", v.Day)
+	}
+	// 07:00Z = 00:00 PDT: the Pacific day rolled — reset then accumulate.
+	l.add(75, after)
+	v = ledgerView(l)
+	if v.Day != 75 {
+		t.Errorf("Day after add at 07:00Z = %d, want 75 (rolled at Pacific midnight)", v.Day)
+	}
+	if want := time.Date(2026, 8, 17, 7, 0, 0, 0, time.UTC); !v.DayStart.Equal(want) {
+		t.Errorf("DayStart = %v, want %v (Pacific midnight)", v.DayStart, want)
 	}
 }
 

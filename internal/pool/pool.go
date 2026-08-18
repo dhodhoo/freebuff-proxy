@@ -146,9 +146,10 @@ type TokenSnapshot struct {
 	UsagePct             int    // percentage of daily limit used (0 when unlimited)
 	RiskLevel            string // "low", "moderate", "high", "critical" account safety indicator (#6)
 	// Spend24h / SpendDay / SpendWeek / SpendMonth are the local per-token
-	// spend ledger (issue #87): tokens spent in the rolling 24h window and
-	// the current UTC day/week/month buckets (with rollover). Fed by
-	// pool.RecordSpend from chat usage blocks; surfaced next to Messages24h.
+	// spend ledger (issue #87): tokens spent in the rolling 24h window, the
+	// Pacific-midnight day bucket (issue #122) and the UTC week/month
+	// buckets (with rollover). Fed by pool.RecordSpend from chat usage
+	// blocks; surfaced next to Messages24h.
 	Spend24h        int64
 	SpendDay        int64
 	SpendWeek       int64
@@ -1170,7 +1171,11 @@ func (p *Pool) MarkRunFailed(lease *Lease) {
 
 // RecordSpend adds tokens to the lease's backing token spend ledger (issue
 // #87): the server reports the usage block of a completed chat. Non-positive
-// deltas are ignored.
+// deltas are ignored. Production caller: chatCore feeds the relay's observed
+// usage total once per successful chat completion (#122). The daily $15/$5/
+// $0.50 ceilings are server-enforced and cohort-dependent, so this
+// token-count ledger is a heuristic proxy, not exact USD accounting — see
+// spend.go's package comment.
 func (p *Pool) RecordSpend(lease *Lease, tokens int64) {
 	if lease == nil || tokens <= 0 {
 		return
@@ -1283,9 +1288,12 @@ func (p *Pool) CooldownTokenRateLimit(token int, rle *upstream.RateLimitError) {
 	(*toks)[token].runs.CooldownRateLimit(rle)
 }
 
-// CooldownTokenIpCapped applies an ip_capped cooldown to token, bounded to
-// the error's RetryAfter ONLY (no Pacific-midnight fallback — ip_capped is
-// admission-only, not a quota reset). Out-of-range tokens are ignored.
+// CooldownTokenIpCapped applies an ip_capped cooldown to token via
+// runs.CooldownIpCapped: each hit backs off the error's RetryAfter + ±20%
+// jitter, with a per-token daily re-admission cap (#118 — the 3rd hit in a
+// rolling window locks until the Pacific-midnight reset and surfaces
+// 429 ip_capped; upstream itself is admission-only, not a quota reset).
+// Out-of-range tokens are ignored.
 func (p *Pool) CooldownTokenIpCapped(token int, ice *upstream.IpCappedError) {
 	toks := p.toks.Load()
 	if token < 0 || token >= len(*toks) || ice == nil {
@@ -1353,8 +1361,9 @@ func (p *Pool) CooldownBridgeRateLimit(lease *Lease, rle *upstream.RateLimitErro
 	lease.Bridge.runs.CooldownRateLimit(rle)
 }
 
-// CooldownBridgeIpCapped applies an ip_capped cooldown to the bridge entry,
-// bounded to the error's RetryAfter ONLY (no Pacific-midnight fallback).
+// CooldownBridgeIpCapped applies an ip_capped cooldown to the bridge entry
+// via runs.CooldownIpCapped (full RetryAfter + jitter, per-token daily cap
+// until Pacific midnight — #118).
 func (p *Pool) CooldownBridgeIpCapped(lease *Lease, ice *upstream.IpCappedError) {
 	if lease == nil || lease.Bridge == nil || ice == nil {
 		return
