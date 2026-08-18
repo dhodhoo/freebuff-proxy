@@ -172,7 +172,9 @@ func runTokenRefresh(configPath string, index int, autoYes bool) {
 		case <-ctx.Done():
 			fmt.Fprintln(os.Stderr, "freebuff-proxy: login timed out")
 			os.Exit(1)
-		case <-time.After(3 * time.Second):
+		// 5s matches the CLI's pollLoginStatus intervalMs=5000 (#125; the
+		// upstream const loginPollInterval is the same value).
+		case <-time.After(5 * time.Second):
 		}
 	}
 }

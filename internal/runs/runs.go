@@ -16,11 +16,13 @@ package runs
 import (
 	"context"
 	cryptoRand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"freebuff-proxy/internal/session"
@@ -36,6 +38,31 @@ const DefaultCooldown = 30 * time.Minute
 // from re-hitting the blocked admission, short enough to re-probe after the
 // client switches egress/VPN.
 const countryBlockCooldown = 15 * time.Minute
+
+// ip_capped bounded re-admission (#118, gap item 16). The CLI treats
+// ip_capped as TERMINAL for its poll loop (nextDelayMs returns null —
+// reference/freebuff use-freebuff-session.ts) and relies on a human to pace
+// the retry. The proxy is a server (no interactive user), so full terminal
+// breaks service: instead, re-admission is bounded — each hit backs off the
+// FULL server retryAfterMs + ±20% jitter, and after ipCappedMaxDailyAttempts
+// hits within a rolling ipCappedDailyWindow the token stops re-admitting
+// until the Pacific-midnight reset (treated like rate_limited's reset) and
+// surfaces 429 ip_capped to clients. This is a documented proxy deviation
+// from the CLI's fully-terminal behavior.
+const (
+	// ipCappedMaxDailyAttempts is the per-token daily re-admission budget:
+	// the Nth ip_capped hit in one window locks the token until the
+	// Pacific-midnight reset.
+	ipCappedMaxDailyAttempts = 3
+	// ipCappedJitterSpan is the symmetric jitter fraction (1/5 = ±20%,
+	// mirroring the CLI's jitterPollIntervalMs / pool sessionPollJittered).
+	ipCappedJitterSpan = 5
+)
+
+// ipCappedDailyWindow is the rolling window over which ip_capped
+// re-admission attempts are counted (a test-shrinkable var so tests can
+// exercise window rollover without sleeping 24h).
+var ipCappedDailyWindow = 24 * time.Hour
 
 // shutdownTimeout bounds Shutdown when the caller passes a context without a
 // deadline (PRD §5: "10s force deadline").
@@ -66,13 +93,14 @@ type Options struct {
 }
 
 // asyncJobKind discriminates the deferred-side-effect jobs carried by the
-// bounded finish queue (issue #90/#91): FINISH a rotated/drained run,
-// record a completed chat step, or create the context-pruner child run.
+// bounded finish queue (issue #90/#91): FINISH a rotated/drained run, or
+// create the context-pruner child run. Chat-step recording used to be a
+// third kind (#91) but is now a synchronous in-memory append (issue #114:
+// steps are batched and sent WITH FINISH — the CLI has no /steps endpoint).
 type asyncJobKind uint8
 
 const (
 	jobFinish asyncJobKind = iota
-	jobStep
 	jobChildRun
 )
 
@@ -80,10 +108,8 @@ const (
 // single background worker per RunManager; when the bounded queue is full
 // the caller runs the job inline bounded by the inline timeout.
 type asyncJob struct {
-	kind      asyncJobKind
-	run       *Run
-	messageID string
-	startTime time.Time
+	kind asyncJobKind
+	run  *Run
 }
 
 // newTraceSessionID mints a UUIDv4 trace session id from crypto/rand,
@@ -101,7 +127,9 @@ func newTraceSessionID() string {
 }
 
 // Run is one agent run leased to a caller. Requests counts acquires served
-// by this run; it is sent as totalSteps when the run is FINISHed.
+// by this run; it is used as the totalSteps fallback when no steps were
+// recorded (issue #114 — a step is one chat call, recorded in memory and
+// batched with FINISH).
 type Run struct {
 	AgentID   string
 	RunID     string
@@ -112,6 +140,25 @@ type Run struct {
 	// exactly like the CLI (run.ts: previousRun?.traceSessionId ??
 	// randomUUID; reference/proxy-freebuff lib/runs.js:43-46).
 	TraceSessionID string
+
+	// StepCount is the run's 1-based per-chat-call step counter, stamped
+	// as codebuff_metadata["llm_step_number"] (issue #113, CLI parity:
+	// run-agent-step.ts increments per step). Atomic: chatAttempt
+	// increments it while the manager goroutines may rotate/finish the
+	// run, so the server reaches it without the manager mutex.
+	StepCount atomic.Int64
+
+	// Steps accumulates the run's completed chat steps in memory (issue
+	// #114): they are batched and sent WITH FINISH — the CLI has no /steps
+	// endpoint, so step recording is local-only. Guarded by the manager
+	// mutex; snapshot under the lock at FINISH time.
+	Steps []upstream.RunStep
+
+	// Status is the run's terminal disposition reported in FINISH
+	// (completed/cancelled/failed, CLI parity run-agent-step.ts
+	// 1237-1341). Empty means completed. Set by ReleaseAbandoned
+	// (cancelled) and MarkFailed (failed); guarded by the manager mutex.
+	Status string
 
 	inflight  int  // leases outstanding; guarded by the manager mutex
 	finishing bool // FINISH in flight; guarded by the manager mutex
@@ -124,6 +171,13 @@ type Run struct {
 	// #55): the TTL eviction drops entries stuck draining past DrainTTL.
 	// Guarded by the manager mutex.
 	drainedAt time.Time
+}
+
+// NextStepNumber increments the run's 1-based per-chat step counter and
+// returns the new value. The server calls it once per chat call to stamp
+// codebuff_metadata["llm_step_number"] (issue #113).
+func (r *Run) NextStepNumber() int64 {
+	return r.StepCount.Add(1)
 }
 
 // runFlight coordinates single-flight coalescing for concurrent StartRun calls.
@@ -177,6 +231,15 @@ type RunManager struct {
 	// ip_capped + Retry-After instead of a generic cooldown 502.
 	ipCapped      *upstream.IpCappedError
 	ipCappedUntil time.Time
+	// ip_capped bounded re-admission (#118): ipCappedCount counts
+	// re-admission attempts within the rolling ipCappedDailyWindow starting
+	// at ipCappedWindowStart; when it reaches ipCappedMaxDailyAttempts the
+	// token is locked until ipCappedTerminalUntil (the Pacific-midnight
+	// reset, treated like rate_limited) instead of re-admitting on the
+	// short retryAfter window.
+	ipCappedCount         int
+	ipCappedWindowStart   time.Time
+	ipCappedTerminalUntil time.Time
 	// totalRequests is the cumulative count of Acquire leases handed out.
 	// It is kept separate from the per-run counters because rotated runs
 	// that get FINISHed leave the active+draining sets and would otherwise
@@ -372,16 +435,18 @@ func (m *RunManager) InflightCount() int {
 	return n
 }
 
-// FinishRun FINISHes the run upstream with the given step accounting and
-// drops it from the active set. On upstream failure the run is put back on
-// the draining list so Maintain retries it. It does not touch inflight —
-// callers should have already Released the lease.
-func (m *RunManager) FinishRun(ctx context.Context, run *Run, totalSteps int) {
+// FinishRun FINISHes the run upstream with its recorded terminal status,
+// completed steps, and totalSteps (issue #114), then drops it from the
+// active set. On upstream failure the run is put back on the draining list
+// so Maintain retries it. It does not touch inflight — callers should have
+// already Released the lease.
+func (m *RunManager) FinishRun(ctx context.Context, run *Run) {
 	if run == nil {
 		return
 	}
 	m.drop(run)
-	if err := m.client.FinishRun(ctx, run.RunID, totalSteps); err != nil {
+	status, steps, totalSteps := m.finishPayload(run)
+	if err := m.client.FinishRun(ctx, run.RunID, status, totalSteps, steps, ""); err != nil {
 		// Keep the run around for a Maintain retry; the id is not
 		// necessarily dead upstream (network errors, 5xx).
 		m.mu.Lock()
@@ -478,13 +543,15 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 	// counter survives.
 	if m.store != nil && m.key != "" {
 		m.mu.Lock()
-		snapshot := make([]Run, 0, len(m.runs))
+		snapshot := make([]*Run, 0, len(m.runs))
 		for _, run := range m.runs {
-			snapshot = append(snapshot, *run)
+			// cloneRun, never *run: the Run carries an atomic.Int64 step
+			// counter that must not be copied after first use.
+			snapshot = append(snapshot, m.cloneRun(run))
 		}
 		m.mu.Unlock()
-		for i := range snapshot {
-			m.persistRun(&snapshot[i])
+		for _, run := range snapshot {
+			m.persistRun(run)
 		}
 		m.keptForPersistence = true
 		if err := m.session.Shutdown(ctx); err != nil {
@@ -520,7 +587,8 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 
 	var errs []string
 	for _, run := range all {
-		if err := m.client.FinishRun(ctx, run.RunID, run.Requests); err != nil {
+		status, steps, totalSteps := m.finishPayload(run)
+		if err := m.client.FinishRun(ctx, run.RunID, status, totalSteps, steps, ""); err != nil {
 			errs = append(errs, fmt.Sprintf("finish run %s: %v", run.RunID, err))
 		}
 	}
@@ -548,7 +616,8 @@ func (m *RunManager) FinishAllRuns(ctx context.Context) {
 
 	var errs []string
 	for _, run := range all {
-		if err := m.client.FinishRun(ctx, run.RunID, run.Requests); err != nil {
+		status, steps, totalSteps := m.finishPayload(run)
+		if err := m.client.FinishRun(ctx, run.RunID, status, totalSteps, steps, ""); err != nil {
 			errs = append(errs, fmt.Sprintf("finish run %s: %v", run.RunID, err))
 		} else {
 			m.removeRun(run)
@@ -602,6 +671,10 @@ func (m *RunManager) ClearCooldowns() {
 	m.countryUntil = time.Time{}
 	m.ipCapped = nil
 	m.ipCappedUntil = time.Time{}
+	// Unlock also resets the ip_capped daily re-admission budget (#118).
+	m.ipCappedCount = 0
+	m.ipCappedWindowStart = time.Time{}
+	m.ipCappedTerminalUntil = time.Time{}
 	m.mu.Unlock()
 }
 
@@ -634,12 +707,16 @@ func (m *RunManager) CooldownRateLimit(rle *upstream.RateLimitError) {
 	m.ipCapped = nil
 }
 
-// CooldownIpCapped applies an ip_capped cooldown bounded to the body's
-// retryAfterMs ONLY — never the Pacific-midnight quota lock (ip_capped is
-// admission-only, not tied to a quota reset). Remembered so Acquires keep
-// surfacing 429 ip_capped + Retry-After during the short window instead of
-// re-hitting upstream (mirrors CooldownRateLimit). Errors with
-// RetryAfter <= 0 are ignored.
+// CooldownIpCapped applies an ip_capped cooldown with bounded re-admission
+// (#118): each hit backs off the FULL server retryAfterMs + ±20% jitter,
+// and once the token hits ipCappedMaxDailyAttempts within a rolling
+// ipCappedDailyWindow it stops re-admitting until the Pacific-midnight
+// reset (treated like rate_limited's reset) — the proxy's server-model
+// deviation from the CLI's fully-terminal ip_capped (use-freebuff-session.ts
+// nextDelayMs returns null). Remembered so Acquires keep surfacing
+// 429 ip_capped + Retry-After during the window instead of re-hitting
+// upstream (mirrors CooldownRateLimit). Errors with RetryAfter <= 0 are
+// ignored.
 func (m *RunManager) CooldownIpCapped(ice *upstream.IpCappedError) {
 	if ice == nil {
 		return
@@ -649,8 +726,30 @@ func (m *RunManager) CooldownIpCapped(ice *upstream.IpCappedError) {
 	if ice.RetryAfter <= 0 {
 		return
 	}
+	now := time.Now()
+	// Rolling window: slide to a fresh window when 24h have elapsed since
+	// the first hit, or when a previous terminal lock (Pacific-midnight
+	// reset) has already expired — so a token capped out yesterday re-admits
+	// today instead of inheriting yesterday's count.
+	if m.ipCappedWindowStart.IsZero() ||
+		now.Sub(m.ipCappedWindowStart) >= ipCappedDailyWindow ||
+		(!m.ipCappedTerminalUntil.IsZero() && now.After(m.ipCappedTerminalUntil)) {
+		m.ipCappedWindowStart = now
+		m.ipCappedCount = 0
+		m.ipCappedTerminalUntil = time.Time{}
+	}
+	m.ipCappedCount++
 	m.ipCapped = ice
-	m.ipCappedUntil = time.Now().Add(ice.RetryAfter)
+	if m.ipCappedCount >= ipCappedMaxDailyAttempts {
+		// Daily budget exhausted: no more re-admission until the
+		// Pacific-midnight reset (rate_limited-style lock); the remembered
+		// error keeps surfacing 429 ip_capped meanwhile.
+		m.ipCappedTerminalUntil = upstream.NextPacificMidnight()
+		m.ipCappedUntil = m.ipCappedTerminalUntil
+	} else {
+		m.ipCappedTerminalUntil = time.Time{}
+		m.ipCappedUntil = now.Add(ipCappedJitter(ice.RetryAfter))
+	}
 	m.cooldownUntil = m.ipCappedUntil
 	m.rateLimit = nil
 	m.ban = nil
@@ -666,6 +765,25 @@ func (m *RunManager) IpCappedError() *upstream.IpCappedError {
 		return m.ipCapped
 	}
 	return nil
+}
+
+// ipCappedJitter applies the CLI's symmetric ±20% jitter around d for the
+// ip_capped re-admission backoff (the CLI jitters its poll intervals the
+// same way — jitterPollIntervalMs; reference/freebuff sdk
+// polling-backoff.ts).
+func ipCappedJitter(d time.Duration) time.Duration {
+	span := d / ipCappedJitterSpan
+	return d - span + time.Duration(ipCappedRand()%uint64(2*span+1))
+}
+
+// ipCappedRand mints a jitter draw from crypto/rand, falling back to a
+// time-seeded value on failure (mirrors pool.sessionRand).
+func ipCappedRand() uint64 {
+	var b [8]byte
+	if _, err := cryptoRand.Read(b[:]); err != nil {
+		return uint64(time.Now().UnixNano())
+	}
+	return binary.BigEndian.Uint64(b[:])
 }
 
 // RateLimitError returns the remembered rate-limit error while its
@@ -947,8 +1065,8 @@ func (m *RunManager) startFinishWorker() {
 	})
 }
 
-// finishLoop is the deferred-job worker: FINISH rotated/drained runs,
-// record chat steps, and create context-pruner child runs, all best-effort.
+// finishLoop is the deferred-job worker: FINISH rotated/drained runs and
+// create context-pruner child runs, all best-effort.
 func (m *RunManager) finishLoop() {
 	defer m.finishWg.Done()
 	defer close(m.finishExited)
@@ -975,19 +1093,12 @@ func (m *RunManager) finishLoop() {
 	}
 }
 
-// runJob executes one deferred job (FINISH / step / child run). Best-effort:
+// runJob executes one deferred job (FINISH or child run). Best-effort:
 // failures are logged, never surfaced to a caller.
 func (m *RunManager) runJob(ctx context.Context, job asyncJob) {
 	switch job.kind {
 	case jobFinish:
 		m.finishIfReadyCtx(ctx, job.run)
-	case jobStep:
-		if job.run == nil || job.run.RunID == "" || m.client == nil {
-			return
-		}
-		if err := m.client.RecordRunStep(ctx, job.run.RunID, job.messageID, job.startTime); err != nil {
-			slog.Debug("runs: record step failed", "run_id", job.run.RunID, "err", err)
-		}
 	case jobChildRun:
 		m.createChildRun(ctx, job.run)
 	}
@@ -1005,19 +1116,86 @@ func (m *RunManager) createChildRun(ctx context.Context, parent *Run) {
 		slog.Debug("runs: context-pruner child start failed", "parent_run_id", parent.RunID, "err", err)
 		return
 	}
-	if err := m.client.FinishRun(ctx, childID, 1); err != nil {
+	if err := m.client.FinishRun(ctx, childID, "completed", 1, nil, ""); err != nil {
 		slog.Debug("runs: context-pruner child finish failed", "child_run_id", childID, "err", err)
 	}
 }
 
-// RecordStep queues a completed-chat step recording for run (issue #91):
-// the server fires it after a successful chat with the response message id.
-// Best-effort through the bounded queue; failures are logged only.
+// RecordStep appends a completed-chat step to run's in-memory step list
+// (issue #114): steps are batched and sent WITH FINISH — the CLI has no
+// /steps endpoint, so recording is local-only and never touches the
+// network. The server fires it after a successful chat; messageID is the
+// completed chat response id ("" → null on the wire, allowed by the CLI
+// step schema). Step numbers are sequential 1,2,3… in completion order.
 func (m *RunManager) RecordStep(run *Run, messageID string) {
 	if run == nil || run.RunID == "" {
 		return
 	}
-	m.enqueue(asyncJob{kind: jobStep, run: run, messageID: messageID, startTime: time.Now()})
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var msgID *string
+	if messageID != "" {
+		msgID = &messageID
+	}
+	run.Steps = append(run.Steps, upstream.RunStep{
+		ID:         newTraceSessionID(),
+		StepNumber: len(run.Steps) + 1,
+		MessageID:  msgID,
+		Status:     "completed",
+		StartTime:  time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// MarkFailed records that run's chat died on a terminal upstream error so
+// its eventual FINISH reports status "failed" instead of "completed"
+// (issue #114: a gateway with zero failed runs looks synthetic). The server
+// calls it from the chat error path; the run stays active — only its
+// terminal status is recorded.
+func (m *RunManager) MarkFailed(run *Run) {
+	if run == nil {
+		return
+	}
+	m.mu.Lock()
+	run.Status = "failed"
+	m.mu.Unlock()
+}
+
+// finishPayload snapshots the run's recorded terminal status, steps, and
+// totalSteps for its FINISH (issue #114): status is honest
+// (completed/cancelled/failed), steps are batched and sent WITH FINISH, and
+// totalSteps prefers the recorded step count, falling back to the request
+// count when no steps were recorded (a prewarmed run that served no
+// successful chats still reports its activity). Caller does not hold m.mu.
+func (m *RunManager) finishPayload(run *Run) (status string, steps []upstream.RunStep, totalSteps int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	status = run.Status
+	if status == "" {
+		status = "completed"
+	}
+	steps = append([]upstream.RunStep(nil), run.Steps...)
+	totalSteps = len(steps)
+	if totalSteps == 0 {
+		totalSteps = run.Requests
+	}
+	return status, steps, totalSteps
+}
+
+// cloneRun copies run's snapshot-able fields without copying the atomic
+// step counter by value (atomic.Int64 must never be copied after first
+// use). Used by Shutdown's persistence snapshot.
+func (m *RunManager) cloneRun(run *Run) *Run {
+	c := &Run{
+		AgentID:        run.AgentID,
+		RunID:          run.RunID,
+		StartedAt:      run.StartedAt,
+		Requests:       run.Requests,
+		TraceSessionID: run.TraceSessionID,
+		Status:         run.Status,
+		Steps:          append([]upstream.RunStep(nil), run.Steps...),
+	}
+	c.StepCount.Store(run.StepCount.Load())
+	return c
 }
 
 // Precreate starts the run for agentID if none is fresh, without leasing it
@@ -1114,7 +1292,8 @@ func (m *RunManager) finishIfReadyCtx(ctx context.Context, run *Run) {
 	run.finishing = true
 	m.mu.Unlock()
 
-	if err := m.client.FinishRun(ctx, run.RunID, run.Requests); err != nil {
+	status, steps, totalSteps := m.finishPayload(run)
+	if err := m.client.FinishRun(ctx, run.RunID, status, totalSteps, steps, ""); err != nil {
 		m.mu.Lock()
 		run.finishing = false
 		m.mu.Unlock()
@@ -1142,7 +1321,9 @@ func (m *RunManager) finishIfReadyCtx(ctx context.Context, run *Run) {
 // abandoned agent run alive until rotation. Concurrent requests on the same
 // run keep it alive (inflight stays > 0). The decrement and the finish
 // decision happen under the manager mutex, so a racing Acquire can never
-// lease a run that is about to be finished.
+// lease a run that is about to be finished. The abandoned run FINISHes as
+// "cancelled" (issue #114): a run killed by a client disconnect must not
+// report completed — a gateway with zero cancelled runs looks synthetic.
 func (m *RunManager) ReleaseAbandoned(run *Run) {
 	if run == nil {
 		return
@@ -1156,9 +1337,12 @@ func (m *RunManager) ReleaseAbandoned(run *Run) {
 		m.mu.Unlock()
 		return
 	}
-	// Last lease on the run. If it is still the current run, drop it from
-	// the active set so no new acquire reuses it, then FINISH it. A run
-	// that already rotated away is owned by the draining queue.
+	// Last lease abandoned: the run must FINISH as cancelled, whichever
+	// finish path owns it (active drop or the draining queue).
+	run.Status = "cancelled"
+	// If it is still the current run, drop it from the active set so no
+	// new acquire reuses it, then FINISH it. A run that already rotated
+	// away is owned by the draining queue.
 	if current, ok := m.runs[run.AgentID]; ok && current == run {
 		delete(m.runs, run.AgentID)
 		m.mu.Unlock()

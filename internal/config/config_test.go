@@ -16,7 +16,7 @@ import (
 // them all first so machine-level env can never leak into assertions.
 var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
-	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "COST_MODE", "USER_ID",
+	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "COST_MODE", "ACTING_USER_ID", "USER_ID",
 	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
 	"MODELS_HIDE_UNAVAILABLE", "CORS_ALLOWED_ORIGIN", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
@@ -1769,11 +1769,13 @@ func TestReadDotenvQuotingAndComments(t *testing.T) {
 	}
 }
 
-// ── Wave 1 issue tests (#79: USER_ID) ────────────────────────────────────
+// ── Wave 1 issue tests (#79: ACTING_USER_ID) ─────────────────────────────
 
-// TestUserID verifies USER_ID resolves from the environment, the .env file,
-// and the JSON config (optional key; empty default), issue #79.
-func TestUserID(t *testing.T) {
+// TestActingUserID verifies ACTING_USER_ID resolves from the environment,
+// the .env file, and the JSON config (optional key; empty default), issue
+// #79, and that the pre-rename USER_ID knob still works as a backward-compat
+// alias (#126; the new name always wins when both are set).
+func TestActingUserID(t *testing.T) {
 	t.Run("default empty", func(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("AUTH_TOKENS", "tok-1")
@@ -1781,46 +1783,97 @@ func TestUserID(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.UserID != "" {
-			t.Errorf("UserID = %q, want empty default", cfg.UserID)
+		if cfg.ActingUserID != "" {
+			t.Errorf("ActingUserID = %q, want empty default", cfg.ActingUserID)
 		}
 	})
 	t.Run("env override", func(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("AUTH_TOKENS", "tok-1")
-		t.Setenv("USER_ID", "user-abc")
+		t.Setenv("ACTING_USER_ID", "user-abc")
 		cfg, err := Load("")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.UserID != "user-abc" {
-			t.Errorf("UserID = %q, want user-abc", cfg.UserID)
+		if cfg.ActingUserID != "user-abc" {
+			t.Errorf("ActingUserID = %q, want user-abc", cfg.ActingUserID)
+		}
+	})
+	t.Run("env legacy alias", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		t.Setenv("USER_ID", "user-legacy")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-legacy" {
+			t.Errorf("ActingUserID = %q, want user-legacy (USER_ID alias)", cfg.ActingUserID)
+		}
+	})
+	t.Run("new name wins over legacy", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("AUTH_TOKENS", "tok-1")
+		t.Setenv("ACTING_USER_ID", "user-new")
+		t.Setenv("USER_ID", "user-legacy")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-new" {
+			t.Errorf("ActingUserID = %q, want user-new (ACTING_USER_ID wins)", cfg.ActingUserID)
 		}
 	})
 	t.Run("dotenv", func(t *testing.T) {
 		clearEnv(t)
-		if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok-1\nUSER_ID=user-dotenv\n"), 0o644); err != nil {
+		if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok-1\nACTING_USER_ID=user-dotenv\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		cfg, err := Load("")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.UserID != "user-dotenv" {
-			t.Errorf("UserID = %q, want user-dotenv (from .env)", cfg.UserID)
+		if cfg.ActingUserID != "user-dotenv" {
+			t.Errorf("ActingUserID = %q, want user-dotenv (from .env)", cfg.ActingUserID)
+		}
+	})
+	t.Run("dotenv legacy alias", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok-1\nUSER_ID=user-dotenv-legacy\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-dotenv-legacy" {
+			t.Errorf("ActingUserID = %q, want user-dotenv-legacy (USER_ID alias in .env)", cfg.ActingUserID)
 		}
 	})
 	t.Run("JSON config", func(t *testing.T) {
 		clearEnv(t)
-		if err := os.WriteFile("cfg.json", []byte(`{"AUTH_TOKENS":["tok-1"],"USER_ID":"user-json"}`), 0o644); err != nil {
+		if err := os.WriteFile("cfg.json", []byte(`{"AUTH_TOKENS":["tok-1"],"ACTING_USER_ID":"user-json"}`), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		cfg, err := Load("cfg.json")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.UserID != "user-json" {
-			t.Errorf("UserID = %q, want user-json (from JSON config)", cfg.UserID)
+		if cfg.ActingUserID != "user-json" {
+			t.Errorf("ActingUserID = %q, want user-json (from JSON config)", cfg.ActingUserID)
+		}
+	})
+	t.Run("JSON legacy key", func(t *testing.T) {
+		clearEnv(t)
+		if err := os.WriteFile("cfg.json", []byte(`{"AUTH_TOKENS":["tok-1"],"USER_ID":"user-json-legacy"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load("cfg.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ActingUserID != "user-json-legacy" {
+			t.Errorf("ActingUserID = %q, want user-json-legacy (legacy USER_ID JSON key)", cfg.ActingUserID)
 		}
 	})
 }

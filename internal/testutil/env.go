@@ -18,7 +18,8 @@ var configEnvKeys = []string{
 	"CLI_VERSION", "MODEL_ALIASES", "TRANSIENT_RETRIES", "SESSION_PERSIST",
 	"SESSION_STATE_FILE", "AUTO_DISCOVER_TOKEN",
 	"HTTP2_UPSTREAM",
-	"USER_ID",
+	"ACTING_USER_ID",
+	"USER_ID", // legacy alias (pre-rename knob, #126)
 }
 
 // UnsetConfigEnv removes every ambient freebuff-proxy config env var for the

@@ -47,7 +47,7 @@ func TestFinishRunFailureRetriesOnMaintain(t *testing.T) {
 	// The first FINISH fails upstream; the run must stay around for a
 	// Maintain retry, not be dropped.
 	mock.FinishFailures = 1
-	mgr.FinishRun(context.Background(), run, 3)
+	mgr.FinishRun(context.Background(), run)
 
 	if got := mock.FinishesStartedSnapshot(); got != 2 {
 		t.Fatalf("FINISH attempts = %d, want 2 (child + failed run)", got)

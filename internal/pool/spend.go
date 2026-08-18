@@ -1,12 +1,21 @@
 package pool
 
 // Local per-token spend ledger (issue #87): an in-memory rolling 24h token
-// spend window plus UTC day/week/month buckets with rollover, mirroring the
-// reference account quota bookkeeping (reference/freebuff-reverse
-// internal/accounts/record.go QuotaUsed/QuotaPeriodStart and
-// internal/quota/quota.go BucketStart/NeedsRollover). Updated from chat
-// usage (pool.RecordSpend, fed by the server's parsed usage blocks) and
-// surfaced next to Messages24h in the healthz token snapshot.
+// spend window plus a Pacific-midnight day bucket (issue #122) and UTC
+// week/month buckets with rollover, mirroring the reference account quota
+// bookkeeping (reference/freebuff-reverse internal/accounts/record.go
+// QuotaUsed/QuotaPeriodStart and internal/quota/quota.go
+// BucketStart/NeedsRollover). Updated from chat usage (pool.RecordSpend,
+// fed by the server's parsed usage blocks) and surfaced next to Messages24h
+// in the healthz token snapshot.
+//
+// The account's $15/$5/$0.50 daily spend ceilings (reference/freebuff
+// freebuff-spend-ceilings.ts) are SERVER-enforced at Pacific midnight, and
+// the proxy cannot know which cohort (full/limited/restricted) a token's
+// account sits in — so this ledger is a token-count heuristic, not an exact
+// USD accounting. Per-token granularity is the right level: one proxy token
+// is one upstream account, so the per-token ledger tracks the same
+// per-account spend the server counts.
 
 import (
 	"time"
@@ -23,8 +32,9 @@ type spendEntry struct {
 type spendLedger struct {
 	// rolling is the 24h window: amounts with timestamps, pruned on access.
 	rolling []spendEntry
-	// UTC day/week/month buckets with their period start (unix); roll over
-	// per BucketStart/NeedsRollover semantics.
+	// Pacific-midnight day bucket (#122) plus UTC week/month buckets, each
+	// with their period start (unix); roll over per BucketStart/NeedsRollover
+	// semantics.
 	dayUsed    int64
 	dayStart   int64
 	weekUsed   int64
@@ -65,13 +75,17 @@ func rollBucket(used, start int64, period string, now time.Time, tokens int64) (
 	return used + tokens, start
 }
 
-// bucketStart is the UTC start of the period containing now (mirrors
-// reference quota.BucketStart: day = UTC midnight, week = UTC Monday,
-// month = UTC 1st).
+// bucketStart is the start of the period containing now: the day bucket
+// rolls at Pacific midnight (America/Los_Angeles), matching the CLI's
+// per-account daily ceilings reset "since midnight Pacific"
+// (reference/freebuff freebuff-spend-ceilings.ts:5-8 and zoned-time.ts
+// getZonedDayBounds) — UTC midnight would split one Pacific day across two
+// proxy buckets and misreport the ceiling window (#122). Week stays UTC
+// Monday and month UTC 1st (the CLI only models daily ceilings).
 func bucketStart(now time.Time, period string) int64 {
-	u := now.UTC()
 	switch period {
 	case "week":
+		u := now.UTC()
 		weekday := int(u.Weekday())
 		if weekday == 0 {
 			weekday = 7
@@ -79,9 +93,10 @@ func bucketStart(now time.Time, period string) int64 {
 		return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).
 			AddDate(0, 0, -(weekday - 1)).Unix()
 	case "month":
+		u := now.UTC()
 		return time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC).Unix()
 	default: // day
-		return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).Unix()
+		return pacificDayStart(now).Unix()
 	}
 }
 
@@ -98,9 +113,84 @@ func needsRollover(start int64, period string, now time.Time) bool {
 	case "month":
 		end = end.AddDate(0, 1, 0)
 	default:
-		end = end.Add(24 * time.Hour)
+		// The day window ends at the NEXT Pacific midnight, which is
+		// 23/24/25 hours after the start on DST transition days — a fixed
+		// 24h window would roll the bucket at the wrong instant (#122).
+		end = nextPacificMidnight(end)
 	}
 	return !now.Before(end)
+}
+
+// pacificDayStart is the Pacific-midnight (America/Los_Angeles) start of the
+// day containing now. Prefers the system tz database; when unavailable it
+// derives the boundary from the US DST rule (PDT = UTC-7 from the second
+// Sunday of March 09:00Z to the first Sunday of November 08:00Z; PST = UTC-8
+// otherwise) — never a fixed UTC hour, so the 07:00Z/08:00Z midnight is
+// DST-aware (#122, reference/freebuff zoned-time.ts getZonedDayBounds).
+func pacificDayStart(now time.Time) time.Time {
+	if loc, err := time.LoadLocation("America/Los_Angeles"); err == nil {
+		y, m, d := now.In(loc).Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, loc)
+	}
+	// No system tzdata: compute the Pacific calendar date of now via the
+	// offset in effect at this instant, then that date's midnight via the
+	// offset in effect at 00:00 local (the transition Sundays keep the OLD
+	// offset at their own midnight — the spring-forward day starts in PST
+	// and the fall-back day starts in PDT).
+	u := now.UTC()
+	local := u.Add(-pacificOffsetAt(u))
+	y, m, d := local.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Add(pacificOffsetAtLocalMidnight(y, m, d))
+}
+
+// nextPacificMidnight returns the first Pacific midnight strictly after the
+// Pacific-midnight instant start (23/24/25 hours later — the DST day
+// length). Wall-clock calendar math, so the offset is re-resolved for the
+// new date instead of naively adding 24h.
+func nextPacificMidnight(start time.Time) time.Time {
+	if loc, err := time.LoadLocation("America/Los_Angeles"); err == nil {
+		return start.In(loc).AddDate(0, 0, 1)
+	}
+	// tzdata-less: derive start's Pacific wall-clock date, add one day, and
+	// resolve that date's midnight with the offset in effect at 00:00 local.
+	u := start.UTC()
+	local := u.Add(-pacificOffsetAt(u))
+	y, m, d := local.AddDate(0, 0, 1).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Add(pacificOffsetAtLocalMidnight(y, m, d))
+}
+
+// pacificOffsetAt returns the Pacific UTC offset in effect at the instant t:
+// PDT (UTC-7) from the second Sunday of March 09:00Z (02:00 PST) to the
+// first Sunday of November 08:00Z (02:00 PDT), PST (UTC-8) otherwise.
+func pacificOffsetAt(t time.Time) time.Duration {
+	u := t.UTC()
+	spring := nthSunday(u.Year(), time.March, 2).Add(9 * time.Hour)
+	fall := nthSunday(u.Year(), time.November, 1).Add(8 * time.Hour)
+	if !u.Before(spring) && u.Before(fall) {
+		return 7 * time.Hour
+	}
+	return 8 * time.Hour
+}
+
+// pacificOffsetAtLocalMidnight returns the Pacific UTC offset in effect at
+// 00:00 local on the calendar date y-m-d. The transition Sundays keep the
+// OLD offset at their own midnight (both transitions happen at 02:00 local),
+// so the date is compared strictly inside the DST span.
+func pacificOffsetAtLocalMidnight(y int, m time.Month, d int) time.Duration {
+	spring := nthSunday(y, time.March, 2)
+	fall := nthSunday(y, time.November, 1)
+	date := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	if date.After(spring) && date.Before(fall.AddDate(0, 0, 1)) {
+		return 7 * time.Hour
+	}
+	return 8 * time.Hour
+}
+
+// nthSunday returns the calendar date of the nth Sunday in month m of year
+// y (US DST rule: second Sunday of March, first Sunday of November).
+func nthSunday(y int, m time.Month, n int) time.Time {
+	first := time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
+	return first.AddDate(0, 0, (7-int(first.Weekday()))%7+(n-1)*7)
 }
 
 // rolling24h prunes the window and returns the total within the last 24h.

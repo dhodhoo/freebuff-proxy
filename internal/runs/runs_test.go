@@ -110,11 +110,18 @@ func TestFinishRunDropsFromActive(t *testing.T) {
 	}
 	mgr.Release(run)
 
-	mgr.FinishRun(context.Background(), run, 3)
+	// Issue #114: record 3 completed steps — totalSteps must come from the
+	// recorded steps (preferred over the request-count fallback) and the
+	// steps must ride IN the FINISH payload.
+	for i := 0; i < 3; i++ {
+		mgr.RecordStep(run, "")
+	}
+	mgr.FinishRun(context.Background(), run)
 
 	eventually(t, "FINISH payload", func() bool {
 		f, ok := finishedRun(mock, "run-0001")
-		return ok && f.Status == "completed" && f.TotalSteps == 3
+		return ok && f.Status == "completed" && f.TotalSteps == 3 && len(f.Steps) == 3 &&
+			f.Steps[0].StepNumber == 1 && f.Steps[2].StepNumber == 3
 	})
 
 	// Dropped from active: the next acquire must START afresh.
@@ -676,6 +683,66 @@ func TestClearCooldowns(t *testing.T) {
 	}
 	if m.BanError() != nil {
 		t.Error("ban window not cleared")
+	}
+}
+
+// TestCooldownIpCappedDailyCap verifies #118: after ipCappedMaxDailyAttempts
+// hits within one window the token stops re-admitting until the
+// Pacific-midnight reset (rate_limited-style lock) while still surfacing the
+// remembered 429 ip_capped error; ClearCooldowns resets the budget.
+func TestCooldownIpCappedDailyCap(t *testing.T) {
+	m := NewRunManager(nil, nil, time.Hour)
+	for i := 0; i < ipCappedMaxDailyAttempts; i++ {
+		m.CooldownIpCapped(&upstream.IpCappedError{RetryAfter: time.Second})
+	}
+	midnight := upstream.NextPacificMidnight()
+	until := m.CooldownUntil()
+	if until.Sub(midnight) > time.Second || until.Before(midnight) {
+		t.Errorf("CooldownUntil after %d hits = %v, want ≈ Pacific midnight %v (daily cap)", ipCappedMaxDailyAttempts, until, midnight)
+	}
+	if m.IpCappedError() == nil {
+		t.Error("remembered ip_capped error not surfaced during terminal window")
+	}
+
+	// Dashboard unlock resets the budget: the next hit gets a short jittered
+	// window again, not an immediate midnight lock.
+	m.ClearCooldowns()
+	if !m.CooldownUntil().IsZero() {
+		t.Fatal("ClearCooldowns did not clear the terminal window")
+	}
+	m.CooldownIpCapped(&upstream.IpCappedError{RetryAfter: time.Second})
+	if until := m.CooldownUntil(); until.After(time.Now().Add(2*time.Second)) || until.Before(time.Now()) {
+		t.Errorf("CooldownUntil after ClearCooldowns + hit = %v, want short jittered window", until)
+	}
+}
+
+// TestCooldownIpCappedJitterBounds verifies #118: the re-admission backoff
+// is the FULL server retryAfterMs + symmetric ±20% jitter, never shortened.
+func TestCooldownIpCappedJitterBounds(t *testing.T) {
+	m := NewRunManager(nil, nil, time.Hour)
+	m.CooldownIpCapped(&upstream.IpCappedError{RetryAfter: 60 * time.Second})
+	rem := time.Until(m.CooldownUntil())
+	if rem < 47*time.Second || rem > 72*time.Second {
+		t.Errorf("re-admission backoff = %s, want 60s ±20%% jitter in [48s,72s]", rem)
+	}
+}
+
+// TestCooldownIpCappedWindowSlides verifies #118: the attempt counter lives
+// in a rolling window — once the window slides (or a previous terminal lock
+// expires), the next hit starts fresh instead of inheriting yesterday's
+// count.
+func TestCooldownIpCappedWindowSlides(t *testing.T) {
+	orig := ipCappedDailyWindow
+	ipCappedDailyWindow = 5 * time.Millisecond
+	t.Cleanup(func() { ipCappedDailyWindow = orig })
+
+	m := NewRunManager(nil, nil, time.Hour)
+	m.CooldownIpCapped(&upstream.IpCappedError{RetryAfter: 100 * time.Millisecond})
+	time.Sleep(20 * time.Millisecond) // slide past the tiny window
+	m.CooldownIpCapped(&upstream.IpCappedError{RetryAfter: 100 * time.Millisecond})
+	until := m.CooldownUntil()
+	if until.Before(time.Now()) || until.After(time.Now().Add(time.Second)) {
+		t.Errorf("CooldownUntil after window slide = %v, want short ~100ms window (counter reset), not midnight", until)
 	}
 }
 

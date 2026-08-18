@@ -19,9 +19,13 @@ import (
 
 // FinishedRun records an agent-run FINISH payload received by the mock.
 type FinishedRun struct {
-	RunID      string `json:"runId"`
-	Status     string `json:"status"`
-	TotalSteps int    `json:"totalSteps"`
+	RunID        string `json:"runId"`
+	Status       string `json:"status"`
+	TotalSteps   int    `json:"totalSteps"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	// Steps mirrors the CLI step wire shape, captured from the FINISH
+	// payload (issue #114): steps are batched and sent WITH FINISH.
+	Steps []RecordedStep `json:"steps,omitempty"`
 }
 
 // StartRequest records one agent-runs START payload (issue #91).
@@ -30,13 +34,17 @@ type StartRequest struct {
 	AncestorRunIDs []string `json:"ancestorRunIds"`
 }
 
-// RecordedStep records one /api/v1/agent-runs/{runID}/steps payload
-// (issue #91).
+// RecordedStep mirrors one agent-run step as received in a FINISH payload
+// (issue #114): steps are batched and sent WITH FINISH — the CLI has no
+// /steps endpoint.
 type RecordedStep struct {
-	RunID      string `json:"-"`
-	StepNumber int    `json:"stepNumber"`
-	MessageID  string `json:"messageId"`
-	Status     string `json:"status"`
+	ID          string   `json:"id"`
+	StepNumber  int      `json:"stepNumber"`
+	Credits     int      `json:"credits,omitempty"`
+	ChildRunIDs []string `json:"childRunIds,omitempty"`
+	MessageID   *string  `json:"messageId"`
+	Status      string   `json:"status,omitempty"`
+	StartTime   string   `json:"startTime"`
 }
 
 // MockUpstream is a scriptable codebuff.com stand-in.
@@ -89,9 +97,6 @@ type MockUpstream struct {
 	// StartRequests records every agent-runs START payload (agentId +
 	// ancestorRunIds) so tests can assert the run-tree wiring.
 	StartRequests []StartRequest
-
-	// RecordedSteps records /steps POST payloads (issue #91).
-	RecordedSteps []RecordedStep
 
 	ChatStatus    int    // 200 by default
 	ChatBody      string // SSE body served on 200
@@ -247,8 +252,6 @@ func (m *MockUpstream) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.URL.Path == "/api/v1/agent-runs" && r.Method == http.MethodPost:
 		m.handleAgentRuns(w, r)
-	case strings.HasPrefix(r.URL.Path, "/api/v1/agent-runs/") && strings.HasSuffix(r.URL.Path, "/steps") && r.Method == http.MethodPost:
-		m.handleSteps(w, r)
 	case r.URL.Path == "/api/v1/chat/completions" && r.Method == http.MethodPost:
 		m.handleChat(w, r)
 	case r.URL.Path == "/api/auth/cli/code" && r.Method == http.MethodPost:
@@ -427,12 +430,14 @@ func (m *MockUpstream) handleProbe(w http.ResponseWriter) {
 func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	var payload struct {
-		Action         string   `json:"action"`
-		AgentID        string   `json:"agentId"`
-		RunID          string   `json:"runId"`
-		Status         string   `json:"status"`
-		Steps          int      `json:"totalSteps"`
-		AncestorRunIDs []string `json:"ancestorRunIds"`
+		Action         string         `json:"action"`
+		AgentID        string         `json:"agentId"`
+		RunID          string         `json:"runId"`
+		Status         string         `json:"status"`
+		TotalSteps     int            `json:"totalSteps"`
+		ErrorMessage   string         `json:"errorMessage"`
+		StepList       []RecordedStep `json:"steps"`
+		AncestorRunIDs []string       `json:"ancestorRunIds"`
 	}
 	_ = json.Unmarshal(body, &payload)
 
@@ -491,9 +496,11 @@ func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		m.mu.Lock()
 		m.FinishedRuns = append(m.FinishedRuns, FinishedRun{
-			RunID:      payload.RunID,
-			Status:     payload.Status,
-			TotalSteps: payload.Steps,
+			RunID:        payload.RunID,
+			Status:       payload.Status,
+			TotalSteps:   payload.TotalSteps,
+			ErrorMessage: payload.ErrorMessage,
+			Steps:        append([]RecordedStep(nil), payload.StepList...),
 		})
 		m.mu.Unlock()
 		writeJSON(w, 200, map[string]any{"ok": true})
@@ -502,47 +509,12 @@ func (m *MockUpstream) handleAgentRuns(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleSteps records a /api/v1/agent-runs/{runID}/steps POST (issue #91).
-func (m *MockUpstream) handleSteps(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
-	var payload struct {
-		StepNumber int    `json:"stepNumber"`
-		MessageID  string `json:"messageId"`
-		Status     string `json:"status"`
-	}
-	_ = json.Unmarshal(body, &payload)
-	runID := stepsRunID(r.URL.Path)
-	m.mu.Lock()
-	m.RecordedSteps = append(m.RecordedSteps, RecordedStep{
-		RunID:      runID,
-		StepNumber: payload.StepNumber,
-		MessageID:  payload.MessageID,
-		Status:     payload.Status,
-	})
-	m.mu.Unlock()
-	writeJSON(w, 200, map[string]any{"ok": true})
-}
-
-// stepsRunID extracts the run id from /api/v1/agent-runs/{id}/steps.
-func stepsRunID(path string) string {
-	trimmed := strings.TrimPrefix(path, "/api/v1/agent-runs/")
-	trimmed = strings.TrimSuffix(trimmed, "/steps")
-	return trimmed
-}
-
 // firstOf returns the first element, or "" for an empty slice.
 func firstOf(s []string) string {
 	if len(s) == 0 {
 		return ""
 	}
 	return s[0]
-}
-
-// StepsSnapshot returns a locked copy of the recorded /steps payloads.
-func (m *MockUpstream) StepsSnapshot() []RecordedStep {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]RecordedStep(nil), m.RecordedSteps...)
 }
 
 // StartRequestsSnapshot returns a locked copy of the START payloads.

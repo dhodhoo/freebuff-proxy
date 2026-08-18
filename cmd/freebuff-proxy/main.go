@@ -237,16 +237,14 @@ func main() {
 	// Prewarm + the 60s maintain loop run until ctx is canceled (shutdown).
 	p.Start(ctx)
 
-	// Egress probing: report the country/IP the direct outbound path appears
-	// to come from (ban-avoidance diagnostics; the upstream hard-blocks
-	// proxy/VPN egress, so the direct route is the only outbound path).
-	// Results are cached and refreshed every 10 minutes; failures are
-	// logged and cached with Err set (fail-open).
-	egressCache := egress.NewCache()
-	if paths := egressPaths(); len(paths) > 0 {
-		go egress.RunLoop(ctx, logger, egressCache, paths, egress.ProbeTimeout, egress.DefaultTTL)
-		logger.Info("egress probes started", "paths", len(paths))
-	}
+	// Egress probing is deliberately NOT wired into startup (#123): the
+	// official CLI never talks to cloudflare.com (the probe target), and
+	// the background loop's risk-engine feed has no consumer (Score()
+	// reads only upstream privacy signals + ip-cap ratios, never the
+	// probe's IP/country). The probe still runs on demand — `-doctor`
+	// re-probes with its own cache (doctor.go egressRegionRow) — so
+	// operators keep the "Egress region" readout without an extra
+	// recurring request the CLI would never make.
 
 	// Issue #62: the dashboard login wizard drives the same headless OAuth
 	// flow as the CLI against the proxy's own transport/stealth wiring; the
@@ -287,8 +285,12 @@ func main() {
 		"log_level", level.String(),
 		"verbose", *verbose,
 	)
-	if cfg.UserID != "" {
-		logger.Info("acting user id set — x-freebuff-acting-user-id will be sent on chat calls", "user_id", cfg.UserID)
+	if cfg.ActingUserID != "" {
+		// #126: the header is only safe with the token's OWN account id (the
+		// CLI derives it from /api/v1/me; the server honors it only for the
+		// FreeBuff Web service account) — any other value impersonates a
+		// foreign user and can flag the account.
+		logger.Info("acting user id set — x-freebuff-acting-user-id will be sent on chat calls (only safe with the token's own account id; any other value impersonates another user)", "acting_user_id", cfg.ActingUserID)
 	}
 	// /admin/reload and the admin dashboard are open in default deployments
 	// (no API_KEYS, or bridge mode): warn loudly so operators can decide
@@ -451,10 +453,13 @@ func ignoredExeAdjacentEnv(cwd, exePath string) string {
 	return p
 }
 
-// egressPaths returns the outbound probe paths: the direct connection only
-// (proxy routes were removed — the upstream hard-blocks proxy/VPN egress,
-// so any proxied path is pure ban risk). The risk engine's geo feed and the
-// doctor's "Egress region" row read results back from the shared cache.
+// egressPaths returns the outbound probe paths for on-demand probing: the
+// direct connection only (proxy routes were removed — the upstream
+// hard-blocks proxy/VPN egress, so any proxied path is pure ban risk).
+// The background RunLoop is no longer wired into startup (#123 — the CLI
+// never talks to cloudflare.com and the risk-engine geo feed has no
+// reader); `-doctor` re-probes with its own cache, and this stays as the
+// canonical path list for that on-demand use / future opt-in.
 func egressPaths() []egress.Path {
 	return []egress.Path{{Key: "direct", Dialer: egress.DirectDialer(egress.ProbeTimeout)}}
 }
