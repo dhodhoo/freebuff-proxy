@@ -646,6 +646,8 @@ func TestValidate(t *testing.T) {
 		{"bad cost mode", func(c *Config) { c.CostMode = "Free" }},
 		{"negative max messages", func(c *Config) { c.MaxMessagesPerDay = -1 }},
 		{"negative max spend", func(c *Config) { c.MaxSpendPerDay = -1 }},
+		{"negative rate limit per ip", func(c *Config) { c.RateLimitPerIP = -1 }},
+		{"negative rate limit burst", func(c *Config) { c.RateLimitBurst = -1 }},
 		{"session persist with empty state file", func(c *Config) { c.SessionPersist = true; c.SessionStateFile = "" }},
 		{"invalid listen port non-int", func(c *Config) { c.ListenAddr = "127.0.0.1:abc" }},
 		{"invalid listen port overflow", func(c *Config) { c.ListenAddr = "127.0.0.1:99999" }},
@@ -1308,6 +1310,30 @@ func TestMaxMessagesPerDay(t *testing.T) {
 		t.Fatalf("Load (file): %v", err)
 	} else if cfg.MaxMessagesPerDay != 3 {
 		t.Errorf("MaxMessagesPerDay = %d, want 3 (file)", cfg.MaxMessagesPerDay)
+	}
+}
+func TestRateLimitConfig(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	// Default is disabled (0, 0)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load default: %v", err)
+	}
+	if cfg.RateLimitPerIP != 0 || cfg.RateLimitBurst != 0 {
+		t.Errorf("default RateLimit = (%v, %v), want (0, 0)", cfg.RateLimitPerIP, cfg.RateLimitBurst)
+	}
+
+	// Override via environment variables
+	t.Setenv("RATE_LIMIT_PER_IP", "25.5")
+	t.Setenv("RATE_LIMIT_BURST", "50")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load with env: %v", err)
+	}
+	if cfg.RateLimitPerIP != 25.5 || cfg.RateLimitBurst != 50 {
+		t.Errorf("RateLimit from env = (%v, %v), want (25.5, 50)", cfg.RateLimitPerIP, cfg.RateLimitBurst)
 	}
 }
 

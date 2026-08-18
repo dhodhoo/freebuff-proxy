@@ -136,6 +136,11 @@ type Config struct {
 	// session create after an upstream 428 waiting_room_required (issue
 	// #94(b), gated stub — best-effort, never blocks the request).
 	WaitingRoomChain bool
+	// RateLimitPerIP / RateLimitBurst cap client request rates per source IP
+	// (issue #137): RATE_LIMIT_PER_IP default 0 (disabled; e.g. 20 req/s);
+	// RATE_LIMIT_BURST default 0 (defaults to 2 * RateLimitPerIP).
+	RateLimitPerIP float64
+	RateLimitBurst int
 	// EnvFile is the .env path actually loaded ("" when none existed).
 	// Resolved via ResolveEnvFile (issue #39): ./.env in the working
 	// directory wins; otherwise the platform config dir is tried.
@@ -220,7 +225,9 @@ type rawConfig struct {
 	FallbackAfter                    string `json:"FALLBACK_AFTER_MS"`
 	FallbackModels                   string `json:"FALLBACK_MODEL"`
 	AdoptCLISession                  bool   `json:"ADOPT_CLI_SESSION"`
-	WaitingRoomChain                 bool   `json:"WAITING_ROOM_CHAIN"`
+	WaitingRoomChain                 bool     `json:"WAITING_ROOM_CHAIN"`
+	RateLimitPerIP                   *float64 `json:"RATE_LIMIT_PER_IP"`
+	RateLimitBurst                   *int     `json:"RATE_LIMIT_BURST"`
 }
 
 func defaultRawConfig() rawConfig {
@@ -419,6 +426,8 @@ func Load(configPath string) (Config, error) {
 	overrideString(&raw.FallbackModels, "FALLBACK_MODEL")
 	overrideBool(&raw.AdoptCLISession, "ADOPT_CLI_SESSION")
 	overrideBool(&raw.WaitingRoomChain, "WAITING_ROOM_CHAIN")
+	overrideFloat(&raw.RateLimitPerIP, "RATE_LIMIT_PER_IP")
+	overrideInt(&raw.RateLimitBurst, "RATE_LIMIT_BURST")
 
 	parseDuration := func(raw, name string) (time.Duration, error) {
 		d, err := time.ParseDuration(strings.TrimSpace(raw))
@@ -558,6 +567,16 @@ func Load(configPath string) (Config, error) {
 	// LOG_RING_SIZE: nil (unset/empty) defaults to 500; an explicit value
 	// must stay within 50..5000 (validated in Validate).
 	logRingSize := 500
+	// RATE_LIMIT_PER_IP / RATE_LIMIT_BURST (issue #137): per-source-IP rate
+	// limiter to protect upstream from bursts and spam. 0 = disabled.
+	rateLimitPerIP := 0.0
+	if raw.RateLimitPerIP != nil {
+		rateLimitPerIP = *raw.RateLimitPerIP
+	}
+	rateLimitBurst := 0
+	if raw.RateLimitBurst != nil {
+		rateLimitBurst = *raw.RateLimitBurst
+	}
 	if raw.LogRingSize != nil {
 		logRingSize = *raw.LogRingSize
 	}
@@ -659,6 +678,8 @@ func Load(configPath string) (Config, error) {
 		FallbackModels:                   fallbackModels,
 		AdoptCLISession:                  raw.AdoptCLISession,
 		WaitingRoomChain:                 raw.WaitingRoomChain,
+		RateLimitPerIP:                   rateLimitPerIP,
+		RateLimitBurst:                   rateLimitBurst,
 		EnvFile:                          envFileUsed,
 	}
 
@@ -789,6 +810,10 @@ func (c Config) Validate() error {
 		return errors.New("MAX_SPEND_PER_DAY cannot be negative")
 	case c.LogRingSize != 0 && (c.LogRingSize < 50 || c.LogRingSize > 5000):
 		return errors.New("LOG_RING_SIZE must be between 50 and 5000 (default 500)")
+	case c.RateLimitPerIP < 0:
+		return errors.New("RATE_LIMIT_PER_IP cannot be negative")
+	case c.RateLimitBurst < 0:
+		return errors.New("RATE_LIMIT_BURST cannot be negative")
 	}
 
 	if c.WebhookURL != "" {
@@ -989,6 +1014,8 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideStringFrom(&raw.FallbackModels, get, "FALLBACK_MODEL")
 	overrideBoolFrom(&raw.AdoptCLISession, get, "ADOPT_CLI_SESSION")
 	overrideBoolFrom(&raw.WaitingRoomChain, get, "WAITING_ROOM_CHAIN")
+	overrideFloatFrom(&raw.RateLimitPerIP, get, "RATE_LIMIT_PER_IP")
+	overrideIntFrom(&raw.RateLimitBurst, get, "RATE_LIMIT_BURST")
 	return nil
 }
 
@@ -1110,6 +1137,19 @@ func overrideInt(target **int, envName string) {
 func overrideIntFrom(target **int, get func(string) string, envName string) {
 	if value := strings.TrimSpace(get(envName)); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil {
+			*target = &parsed
+		}
+	}
+}
+// overrideFloat sets target from RATE_LIMIT_PER_IP-style env vars; unset or
+// unparseable values leave the file/default value untouched.
+func overrideFloat(target **float64, envName string) {
+	overrideFloatFrom(target, os.Getenv, envName)
+}
+
+func overrideFloatFrom(target **float64, get func(string) string, envName string) {
+	if value := strings.TrimSpace(get(envName)); value != "" {
+		if parsed, err := strconv.ParseFloat(value, 64); err == nil {
 			*target = &parsed
 		}
 	}

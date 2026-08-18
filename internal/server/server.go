@@ -48,6 +48,7 @@ import (
 	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/phasetiming"
 	"freebuff-proxy/internal/pool"
+	"freebuff-proxy/internal/ratelimit"
 	"freebuff-proxy/internal/registry"
 	"freebuff-proxy/internal/runs"
 	"freebuff-proxy/internal/session"
@@ -107,6 +108,10 @@ type Server struct {
 	// the authToken lands (then AddToken + persist).
 	loginMu    sync.Mutex
 	loginFlows map[string]*loginFlow
+	// rateLimiter caps client request rates per source IP (issue #137).
+	rateLimiter *ratelimit.Limiter
+	// rateLimitRejections tracks total client requests rejected by local rate limiter.
+	rateLimitRejections atomic.Int64
 }
 
 // loginFlow is one in-flight headless login (issue #62).
@@ -158,6 +163,7 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 	}
 	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath, loginFlows: make(map[string]*loginFlow), logs: logs}
 	s.cfg.Store(cfg)
+	s.rateLimiter = ratelimit.New(cfg.RateLimitPerIP, cfg.RateLimitBurst, 10000)
 	// The token estimator shares one o200k_base codec process-wide, so
 	// count_tokens requests never rebuild the vocabulary.
 	est, err := tokenestimate.New()
@@ -1392,6 +1398,7 @@ func (s *Server) syncTokensAfterMutation(tokens []string) error {
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
+	s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 	return nil
 }
 
@@ -1565,6 +1572,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
 		s.pool.SetConfig(&newCfg)
+		s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 		s.pool.RemoveAllTokens(r.Context())
 		s.logger.Info("dashboard switched to bridge mode")
 		s.dash.RenderConfigResult(w, r, true, "Switched to bridge mode — AUTH_TOKENS cleared; clients now send their own token.")
@@ -1599,6 +1607,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
 		s.pool.SetConfig(&newCfg)
+		s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 		s.logger.Info("dashboard switched to pooled mode", "auth_tokens", len(newCfg.AuthTokens))
 		s.dash.RenderConfigResult(w, r, true, "Switched to pooled mode — HYBRID_MODE cleared; all requests now use the pool.")
 	case "hybrid":
@@ -1628,6 +1637,7 @@ func (s *Server) handleModeSwitch(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Store(&newCfg)
 		s.reg.SetConfig(&newCfg)
 		s.pool.SetConfig(&newCfg)
+		s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 		msg := "Switched to hybrid mode — clients with a token relay it; token-less requests use the pool."
 		if len(newCfg.AuthTokens) == 0 {
 			msg += " Warning: no AUTH_TOKENS — token-less requests will fail (502) until a token is added."
@@ -1817,6 +1827,7 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
+	s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 	s.logger.Info("dashboard config saved and reloaded",
 		"remote", remoteHost(r), "changed_keys", changedConfigKeys(oldCfg, &newCfg),
 		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
@@ -2103,6 +2114,26 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 		reqAttrs = append(reqAttrs, "reasoning_effort", reasoningEffort)
 	}
 	s.logger.Info(kind+" request", reqAttrs...)
+	// Client-side rate limiting per source IP (issue #137): reject rapid-fire
+	// bursts and spam locally before token lease acquisition or upstream calls.
+	if allowed, retryAfter := s.rateLimiter.Allow(r.RemoteAddr); !allowed {
+		phases.Since(phasetiming.TotalMS, start)
+		retrySec := int(math.Ceil(retryAfter.Seconds()))
+		if retrySec < 1 {
+			retrySec = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retrySec))
+		s.logger.Warn(kind+" rate limit exceeded",
+			"remote", remoteHost(r),
+			"req_id", reqID,
+			"retry_after_sec", retrySec,
+		)
+		s.rateLimitRejections.Add(1)
+		s.writeJSONError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("client rate limit exceeded (Retry-After: %ds)", retrySec),
+			"rate_limit_exceeded", "rate_limit_exceeded", 0)
+		return
+	}
 	// Bridge routing: pure bridge (no AUTH_TOKENS, not hybrid) always relays
 	// the client's Authorization header as the upstream token; hybrid mode
 	// relays when a token is present and falls back to the pool otherwise.
@@ -3160,6 +3191,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("# TYPE freebuff_proxy_tokens_total gauge\n")
 	fmt.Fprintf(&sb, "freebuff_proxy_tokens_total %d\n\n", len(snaps))
 
+	sb.WriteString("# HELP freebuff_proxy_rate_limit_rejected_total Total client requests rejected by local rate limiter\n")
+	sb.WriteString("# TYPE freebuff_proxy_rate_limit_rejected_total counter\n")
+	fmt.Fprintf(&sb, "freebuff_proxy_rate_limit_rejected_total %d\n\n", s.rateLimitRejections.Load())
 	sb.WriteString("# HELP freebuff_proxy_token_messages_24h Rolling 24h message count per token\n")
 	sb.WriteString("# TYPE freebuff_proxy_token_messages_24h gauge\n")
 	for _, snap := range snaps {
@@ -3276,6 +3310,7 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
+	s.rateLimiter.SetRate(newCfg.RateLimitPerIP, newCfg.RateLimitBurst)
 	s.logger.Info("config reloaded successfully", "remote", remoteHost(r), "path", r.URL.Path,
 		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	w.Header().Set("Content-Type", "application/json")
