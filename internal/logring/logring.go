@@ -168,16 +168,18 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 }
 
 // flatten renders an attr subtree into "key=value" strings; group keys are
-// dotted (group.subkey=value).
+// dotted (group.subkey=value) and empty-key groups are inlined.
 func flatten(prefix string, a slog.Attr) []string {
 	if a.Value.Kind() == slog.KindGroup {
-		// Recurse with the GROUP's own key as the new prefix so
-		// slog.Group("http", slog.Int("status", 200)) renders
-		// "http.status=200" — the child keys extend the group, they do not
-		// replace it.
-		key := a.Key
-		if prefix != "" {
-			key = prefix + "." + key
+		// The group's own key extends the prefix ("http.status=200"); an
+		// empty key inlines the group, so children keep the current prefix
+		// with no extra separator.
+		key := prefix
+		if a.Key != "" {
+			key = a.Key
+			if prefix != "" {
+				key = prefix + "." + a.Key
+			}
 		}
 		var out []string
 		for _, child := range a.Value.Group() {

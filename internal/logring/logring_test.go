@@ -323,3 +323,55 @@ func TestCountsConcurrent(t *testing.T) {
 		t.Errorf("Counts()[warn|retry] = %d, want %d", got, goroutines*per)
 	}
 }
+
+// TestRingEmptyGroupInlined is the empty-key group regression: a group with
+// an empty key must be inlined (slog contract: "If a group's key is empty,
+// inline the group's Attrs"), so its children keep the current prefix with
+// no extra separator — "svc.status=200", never "svc..status=200".
+func TestRingEmptyGroupInlined(t *testing.T) {
+	cases := []struct {
+		name      string
+		withGroup string
+		group     slog.Attr
+		want      string
+	}{
+		{
+			name:      "empty group under named prefix",
+			withGroup: "svc",
+			group:     slog.Group("", slog.Int("status", 200)),
+			want:      "svc.status=200",
+		},
+		{
+			name:      "nested empty group",
+			withGroup: "svc",
+			group:     slog.Group("", slog.Group("inner", slog.Int("status", 200))),
+			want:      "svc.inner.status=200",
+		},
+		{
+			name:      "consecutive empty groups",
+			withGroup: "svc",
+			group:     slog.Group("", slog.Group("", slog.Int("status", 200))),
+			want:      "svc.status=200",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHandler(discarding{}, 10)
+			logger := slog.New(h)
+			if tc.withGroup != "" {
+				logger = logger.WithGroup(tc.withGroup)
+			}
+			logger.Info("msg", tc.group)
+			recent := h.Recent(1)
+			if len(recent) != 1 {
+				t.Fatalf("Recent(1) = %d entries, want 1", len(recent))
+			}
+			// One record with one attr: Fields must equal the expected
+			// single field exactly, so any malformed "svc..status=200"
+			// shape fails the equality implicitly.
+			if got := recent[0].Fields; len(got) != 1 || got[0] != tc.want {
+				t.Errorf("fields = %v, want [%s]", got, tc.want)
+			}
+		})
+	}
+}
