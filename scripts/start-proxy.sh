@@ -24,7 +24,13 @@ fi
 
 # 2. If no token, offer to generate one (skipped when piped/CI)
 if [ -f "$ENV_FILE" ] && ! grep -qE '^AUTH_TOKENS=[^[:space:]]' "$ENV_FILE"; then
-  GEN_SCRIPT="$ROOT/gen-freebuff-token.sh"
+  GEN_SCRIPT="$ROOT/gen-token.sh"
+  if [ ! -f "$GEN_SCRIPT" ] && [ -f "$ROOT/scripts/gen-token.sh" ]; then
+    GEN_SCRIPT="$ROOT/scripts/gen-token.sh"
+  fi
+  if [ ! -f "$GEN_SCRIPT" ] && [ -f "$ROOT/gen-freebuff-token.sh" ]; then
+    GEN_SCRIPT="$ROOT/gen-freebuff-token.sh"
+  fi
   if [ ! -f "$GEN_SCRIPT" ] && [ -f "$ROOT/scripts/gen-freebuff-token.sh" ]; then
     GEN_SCRIPT="$ROOT/scripts/gen-freebuff-token.sh"
   fi

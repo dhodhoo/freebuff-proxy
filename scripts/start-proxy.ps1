@@ -32,7 +32,13 @@ if (-not (Test-Path $envFile)) {
 if (Test-Path $envFile) {
     $envText = [System.IO.File]::ReadAllText($envFile, [System.Text.Encoding]::UTF8)
     if ($envText -notmatch '(?m)^AUTH_TOKENS=\S') {
-        $genScript = Join-Path $root "gen-freebuff-token.ps1"
+        $genScript = Join-Path $root "gen-token.ps1"
+        if (-not (Test-Path $genScript)) {
+            $genScript = Join-Path (Join-Path $root "scripts") "gen-token.ps1"
+        }
+        if (-not (Test-Path $genScript)) {
+            $genScript = Join-Path $root "gen-freebuff-token.ps1"
+        }
         if (-not (Test-Path $genScript)) {
             $genScript = Join-Path (Join-Path $root "scripts") "gen-freebuff-token.ps1"
         }
