@@ -3329,7 +3329,7 @@ func defaultHintForCode(code, message string) string {
 	case code == "upstream_timeout":
 		return "The upstream request exceeded its deadline. Retry, or raise REQUEST_TIMEOUT/SESSION_CALL_TIMEOUT in .env."
 	case code == "upstream_auth_rejected" || code == "invalid_api_key" || strings.Contains(lowerMsg, "invalid api key"):
-		return "Token invalid or expired. Get a fresh token by running freebuff or scripts/get-freebuff-token.sh"
+		return "Token invalid or expired. Get a fresh token by running scripts/gen-token.cmd (Windows) or scripts/gen-token.sh (Linux/macOS)"
 	case code == "rate_limited":
 		return "Daily message cap or rate limit reached. Wait for quota reset or add another token."
 	case code == "missing_bearer_token":

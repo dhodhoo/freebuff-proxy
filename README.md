@@ -162,16 +162,16 @@ git fetch --tags 2>/dev/null || true
 VERSION=$(git describe --tags 2>/dev/null || echo dev) docker compose up -d --build
 ```
 
-**Or** download a release binary from [Releases](https://github.com/trefeon/freebuff-proxy/releases) (Linux/macOS/Windows × amd64/arm64), unzip it, right-click the extracted folder → **Open in Terminal**, and run `./start-proxy.sh` (Windows: `.\start-proxy.cmd`; the `.cmd` wrappers bypass the PowerShell execution policy). The bundled scripts also include a headless token generator (`gen-freebuff-token.sh` / `gen-token.cmd`).
+**Or** download a release binary from [Releases](https://github.com/trefeon/freebuff-proxy/releases) (Linux/macOS/Windows × amd64/arm64), unzip it, right-click the extracted folder → **Open in Terminal**, and run `./start-proxy.sh` (Windows: `.\start-proxy.cmd`; the `.cmd` wrappers bypass the PowerShell execution policy). The bundled scripts also include a headless token generator (`gen-token.sh` / `gen-token.cmd`).
 
 ### 2. Obtain an Auth Token
 
 Generate one headlessly (opens a browser OAuth login). Run with no flags for an interactive menu; the recommended default (Enter) appends the token to `.env`, auto-creating it from `.env.example` if missing:
 
-**Windows (PowerShell):**
+**Windows (PowerShell / CMD):**
 
 ```powershell
-.\scripts\gen-token.ps1            # menu; Enter = append to .env (auto-create)
+.\scripts\gen-token.cmd            # menu; Enter = append to .env (auto-create)
 ```
 
 **Linux / macOS (bash):**
@@ -180,7 +180,7 @@ Generate one headlessly (opens a browser OAuth login). Run with no flags for an 
 ./scripts/gen-token.sh             # menu; Enter = append to .env (auto-create)
 ```
 
-`gen-token.*` are aliases for `gen-freebuff-token.*`, which also supports explicit modes that skip the menu: `--clipboard`, `--save` (store in the CLI credentials file), `--append` (add to `.env` `AUTH_TOKENS`), and `--env <path>`.
+`gen-token.*` also supports explicit modes that skip the menu: `--clipboard` / `-ToClipboard`, `--save` / `-Save` (store in the CLI credentials file), `--append` / `-Append` (add to `.env` `AUTH_TOKENS`), and `--env <path>` / `-EnvFile <path>`.
 
 Alternatively, log in with the official CLI (`npm i -g freebuff && freebuff`): the proxy auto-discovers the token from its credentials file on startup.
 
