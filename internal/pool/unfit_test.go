@@ -200,3 +200,30 @@ func TestAcquireBanBeatsLimitedIp(t *testing.T) {
 		t.Fatal("ModelUnfit not marked by the limited token during the pass")
 	}
 }
+
+// TestClearModelUnfitBeforeSemantics pins the success-clear race fix: a mark
+// created after the given admission instant survives the clear (an in-flight
+// chat admitted earlier must not erase it — that would reopen the
+// limited_ip re-admission burn), while an older or same-instant mark (the
+// retry re-acquire, which program order guarantees ran after the mark) is
+// removed.
+func TestClearModelUnfitBeforeSemantics(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+
+	// Mark created after admission (admission strictly in the past, well
+	// before the mark): must survive the clear.
+	p.MarkModelUnfit(modelA, &upstream.LimitedIpError{Body: "limited"})
+	p.ClearModelUnfitBefore(modelA, time.Now().Add(-time.Hour))
+	if until, _ := p.ModelUnfit(modelA); until.IsZero() {
+		t.Fatal("mark created after admission was wrongly cleared")
+	}
+
+	// A clear with a now-or-later boundary removes it (clock granularity:
+	// created is never strictly after a later time.Now()).
+	p.ClearModelUnfitBefore(modelA, time.Now())
+	if until, _ := p.ModelUnfit(modelA); !until.IsZero() {
+		t.Fatal("mark older than or equal to admission not cleared")
+	}
+}

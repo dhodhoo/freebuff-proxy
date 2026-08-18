@@ -172,10 +172,11 @@ func pacificDate(t time.Time) (int, time.Month, int) {
 // via AddDate, which shifts the UTC instant across DST transitions exactly
 // like the CLI's getZonedDayBounds / getZonedWeekBounds
 // (reference/freebuff/common/src/util/zoned-time.ts:78-92; AddDate
-// normalizes like Date, go/src/time/time.go). Without tzdata the day bucket
-// rolls at the exact-rule nextPacificMidnight; the fallback week/month
-// buckets are fixed-hour (07:00/08:00 UTC), so their windows are exact
-// there.
+// normalizes like Date, go/src/time/time.go). Without tzdata the boundaries
+// are derived from the exact US DST rule in Pacific wall-clock (the same
+// derivation as bucketStartFallback): a fixed-UTC AddDate window would be
+// 1h off across transition weeks (the spring-forward week is 169h, the
+// fall-back week 167h).
 func needsRollover(start int64, period string, now time.Time) bool {
 	if start == 0 {
 		return true
@@ -187,9 +188,17 @@ func needsRollover(start int64, period string, now time.Time) bool {
 	}
 	switch period {
 	case "week":
-		end = end.AddDate(0, 0, 7)
+		if loc == nil {
+			end = fallbackNextBoundary(end, 0, 7)
+		} else {
+			end = end.AddDate(0, 0, 7)
+		}
 	case "month":
-		end = end.AddDate(0, 1, 0)
+		if loc == nil {
+			end = fallbackNextBoundary(end, 1, 0)
+		} else {
+			end = end.AddDate(0, 1, 0)
+		}
 	default:
 		if loc == nil {
 			// tzdata-less: the day window ends at the NEXT Pacific
@@ -202,6 +211,19 @@ func needsRollover(start int64, period string, now time.Time) bool {
 		}
 	}
 	return !now.Before(end)
+}
+
+// fallbackNextBoundary resolves the tzdata-less Pacific-wall-clock boundary
+// months/days after the instant start: derive start's Pacific calendar date,
+// step the calendar, and resolve that date's midnight with the offset in
+// effect at 00:00 local (the transition Sundays keep the OLD offset at their
+// own midnight). start is always a period start (Monday / 1st midnight), so
+// the AddDate steps land on the next period's first day.
+func fallbackNextBoundary(start time.Time, months, days int) time.Time {
+	u := start.UTC()
+	local := u.Add(-pacificOffsetAt(u))
+	y, m, d := local.AddDate(0, months, days).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Add(pacificOffsetAtLocalMidnight(y, m, d))
 }
 
 // pacificDayStart is the Pacific-midnight (America/Los_Angeles) start of the
@@ -243,12 +265,14 @@ func nextPacificMidnight(start time.Time) time.Time {
 }
 
 // pacificOffsetAt returns the Pacific UTC offset in effect at the instant t:
-// PDT (UTC-7) from the second Sunday of March 09:00Z (02:00 PST) to the
-// first Sunday of November 08:00Z (02:00 PDT), PST (UTC-8) otherwise.
+// PDT (UTC-7) from the second Sunday of March 10:00Z (02:00 PST) to the
+// first Sunday of November 09:00Z (02:00 PDT), PST (UTC-8) otherwise. The
+// transition instants are the wall-clock 02:00 local times: spring 02:00
+// PST = 10:00Z, fall 02:00 PDT = 09:00Z.
 func pacificOffsetAt(t time.Time) time.Duration {
 	u := t.UTC()
-	spring := nthSunday(u.Year(), time.March, 2).Add(9 * time.Hour)
-	fall := nthSunday(u.Year(), time.November, 1).Add(8 * time.Hour)
+	spring := nthSunday(u.Year(), time.March, 2).Add(10 * time.Hour)
+	fall := nthSunday(u.Year(), time.November, 1).Add(9 * time.Hour)
 	if !u.Before(spring) && u.Before(fall) {
 		return 7 * time.Hour
 	}

@@ -2222,3 +2222,118 @@ func TestChatModelIPLimitedAdmissionPath(t *testing.T) {
 		t.Error("pool unfit not set after admission-path limited refusal")
 	}
 }
+
+// TestChatModelIPLimitedConcurrentRefusals pins the unfit-guard race fix
+// (SEC-1): concurrent requests to an unfit model are all fast-refused at the
+// entry guard with 409 and never reach the upstream. CI runs the suite with
+// -race, which the pre-fix in-place RetryAfter mutation of the shared
+// registry error would flag.
+func TestChatModelIPLimitedConcurrentRefusals(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		writeRawJSON(w, http.StatusConflict, limitedChatBody())
+	}
+	ts, p := newTestServer(t, nil, mock)
+	chatURL := ts.URL + "/v1/chat/completions"
+	body := chatBody(modelA)
+
+	// Prime the unfit mark with one limited response.
+	resp, _ := doJSON(t, http.MethodPost, chatURL, body, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("prime status = %d, want 409", resp.StatusCode)
+	}
+	if until, _ := p.ModelUnfit(modelA); until.IsZero() {
+		t.Fatal("unfit not marked after prime")
+	}
+	before := mock.Requests
+
+	// Now the entry guard fast-refuses; hammer it concurrently. Every
+	// refusal must be 409 and the upstream must see no new calls.
+	const n = 16
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r, err := http.Post(chatURL, "application/json", bytes.NewReader(body))
+			if err != nil {
+				codes[i] = -1
+				return
+			}
+			defer func() { _ = r.Body.Close() }()
+			_, _ = io.Copy(io.Discard, r.Body)
+			codes[i] = r.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusConflict {
+			t.Errorf("request %d status = %d, want 409", i, c)
+		}
+	}
+	if mock.Requests != before {
+		t.Errorf("upstream requests = %d, want %d (prime baseline; guard refusals never reach upstream)", mock.Requests, before)
+	}
+}
+
+// TestChatSpendLedgerIgnoresUsageNull pins the relayStream usage guard: a
+// trailing chunk carrying "usage":null must not zero the spend ledger — only
+// chunks that actually carry a usage block may update it.
+func TestChatSpendLedgerIgnoresUsageNull(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.ChatBody = testutil.SSEEvent(chunk("chatcmpl-u1", 1, `"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]`)) +
+		testutil.SSEEvent(chunk("chatcmpl-u1", 1, `"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}`)) +
+		testutil.SSEEvent(chunk("chatcmpl-u1", 1, `"choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":null`))
+	ts, pool := newTestServer(t, nil, mock)
+	req := `{"model":"` + modelA + `","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", []byte(req), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	snaps := pool.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("pool tokens = %d, want 1", len(snaps))
+	}
+	if snaps[0].SpendDay != 13 || snaps[0].Spend24h != 13 {
+		t.Errorf("spend after usage-null trailing chunk = %d/%d, want 13/13 (not zeroed)", snaps[0].SpendDay, snaps[0].Spend24h)
+	}
+}
+
+// TestAdminSensitiveLoopbackHostGate pins the SEC-2 rebinding guard: in open
+// mode (ADMIN_TOKEN unset) a loopback-remote request with a non-loopback
+// Host header is refused on secret-bearing routes, while a loopback Host is
+// served.
+func TestAdminSensitiveLoopbackHostGate(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	ts, _ := newTestServer(t, nil, mock)
+
+	// Loopback remote + loopback Host (127.0.0.1): served.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/config", nil)
+	req.Host = "127.0.0.1:3457"
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("loopback Host was restricted")
+	}
+
+	// Loopback remote + attacker Host (DNS rebinding): restricted 403.
+	req2, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/config", nil)
+	req2.Host = "attacker.example:3457"
+	resp2, err := ts.Client().Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp2.Body)
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Errorf("non-loopback Host status = %d, want 403 (restricted)", resp2.StatusCode)
+	}
+}

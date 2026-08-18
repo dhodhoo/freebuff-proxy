@@ -141,8 +141,14 @@ type Run struct {
 	// Steps accumulates the run's completed chat steps in memory (issue
 	// #114): they are batched and sent WITH FINISH — the CLI has no /steps
 	// endpoint, so step recording is local-only. Guarded by the manager
-	// mutex; snapshot under the lock at FINISH time.
+	// mutex; snapshot under the lock at FINISH time. Bounded to the newest
+	// maxRecordedSteps (the FINISH payload must not grow without bound).
 	Steps []upstream.RunStep
+
+	// stepTotal is the monotonic count of recorded steps (Steps may have
+	// dropped the oldest beyond maxRecordedSteps; FINISH's totalSteps stays
+	// honest). Guarded by the manager mutex.
+	stepTotal int
 
 	// Status is the run's terminal disposition reported in FINISH
 	// (completed/cancelled/failed, CLI parity run-agent-step.ts
@@ -512,6 +518,12 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 	// must not stall shutdown for minutes (review P2).
 	m.finishDrainCtx = ctx
 	m.finishOnce.Do(func() { close(m.finishStop) })
+	// Ensure the worker exists BEFORE waiting: its finishWg.Add(1) must be
+	// ordered before the Wait below — a lazy first-start racing Shutdown
+	// would be a WaitGroup Add/Wait race and Shutdown could proceed without
+	// the late worker. If it was never started, it exits immediately on
+	// the closed stop channel and balances the count.
+	m.startFinishWorker()
 	// Wait for the drain, but never past the caller's deadline: if the
 	// worker is still draining after ctx expires, the remaining jobs are
 	// abandoned (best-effort FINISHes; the upstream connection dies with
@@ -541,13 +553,37 @@ func (m *RunManager) Shutdown(ctx context.Context) {
 			// counter that must not be copied after first use.
 			snapshot = append(snapshot, m.cloneRun(run))
 		}
+		// Drained (rotated) runs are finished, never resumed: best-effort
+		// FINISH them NOW — the worker is stopped, so this is their last
+		// chance, and a stale store entry must not resurrect a finished
+		// run on the next boot.
+		draining := make([]*Run, 0, len(m.draining))
+		for _, run := range m.draining {
+			if run.finishing {
+				continue
+			}
+			run.finishing = true
+			draining = append(draining, run)
+		}
 		m.mu.Unlock()
 		for _, run := range snapshot {
 			m.persistRun(run)
 		}
+		var errs []string
+		for _, run := range draining {
+			status, steps, totalSteps := m.finishPayload(run)
+			if err := m.client.FinishRun(ctx, run.RunID, status, totalSteps, steps, ""); err != nil {
+				errs = append(errs, fmt.Sprintf("finish run %s: %v", run.RunID, err))
+			} else {
+				m.removeRun(run)
+			}
+		}
 		m.keptForPersistence = true
 		if err := m.session.Shutdown(ctx); err != nil {
-			slog.Warn("runs: shutdown session with errors", "errors", err)
+			errs = append(errs, fmt.Sprintf("shutdown session: %v", err))
+		}
+		if len(errs) > 0 {
+			slog.Warn("runs: shutdown with errors", "errors", strings.Join(errs, "; "))
 		}
 		return
 	}
@@ -1106,12 +1142,21 @@ func (m *RunManager) createChildRun(ctx context.Context, parent *Run) {
 	}
 }
 
+// maxRecordedSteps bounds a run's in-memory step list and FINISH payload:
+// a busy 6h run can otherwise accumulate thousands of steps (each with a
+// fresh UUID + timestamps) and emit a multi-MB FINISH. The oldest steps are
+// dropped; the monotonic stepTotal keeps FINISH's totalSteps honest.
+const maxRecordedSteps = 512
+
 // RecordStep appends a completed-chat step to run's in-memory step list
 // (issue #114): steps are batched and sent WITH FINISH — the CLI has no
 // /steps endpoint, so recording is local-only and never touches the
 // network. The server fires it after a successful chat; messageID is the
 // completed chat response id ("" → null on the wire, allowed by the CLI
-// step schema). Step numbers are sequential 1,2,3… in completion order.
+// step schema). Step numbers come from the run's per-attempt counter — the
+// SAME counter stamped as llm_step_number on the wire — so FINISH's steps
+// agree with the stamps already sent even when earlier attempts failed
+// (#113/#114; the CLI numbers both from one per-run counter).
 func (m *RunManager) RecordStep(run *Run, messageID string) {
 	if run == nil || run.RunID == "" {
 		return
@@ -1122,13 +1167,24 @@ func (m *RunManager) RecordStep(run *Run, messageID string) {
 	if messageID != "" {
 		msgID = &messageID
 	}
+	run.stepTotal++
+	stepNumber := run.StepCount.Load()
+	if stepNumber == 0 {
+		// No attempt ever stamped llm_step_number (recording fired without
+		// a server chat attempt, e.g. pool-level direct use): fall back to
+		// sequential numbering in completion order.
+		stepNumber = int64(len(run.Steps) + 1)
+	}
 	run.Steps = append(run.Steps, upstream.RunStep{
 		ID:         newTraceSessionID(),
-		StepNumber: len(run.Steps) + 1,
+		StepNumber: int(stepNumber),
 		MessageID:  msgID,
 		Status:     "completed",
 		StartTime:  time.Now().UTC().Format(time.RFC3339Nano),
 	})
+	if len(run.Steps) > maxRecordedSteps {
+		run.Steps = run.Steps[len(run.Steps)-maxRecordedSteps:]
+	}
 }
 
 // MarkFailed records that run's chat died on a terminal upstream error so
@@ -1159,7 +1215,10 @@ func (m *RunManager) finishPayload(run *Run) (status string, steps []upstream.Ru
 		status = "completed"
 	}
 	steps = append([]upstream.RunStep(nil), run.Steps...)
-	totalSteps = len(steps)
+	totalSteps = run.stepTotal
+	if totalSteps == 0 {
+		totalSteps = len(steps)
+	}
 	if totalSteps == 0 {
 		totalSteps = run.Requests
 	}
@@ -1178,6 +1237,7 @@ func (m *RunManager) cloneRun(run *Run) *Run {
 		TraceSessionID: run.TraceSessionID,
 		Status:         run.Status,
 		Steps:          append([]upstream.RunStep(nil), run.Steps...),
+		stepTotal:      run.stepTotal,
 	}
 	c.StepCount.Store(run.StepCount.Load())
 	return c
@@ -1323,13 +1383,23 @@ func (m *RunManager) ReleaseAbandoned(run *Run) {
 		return
 	}
 	// Last lease abandoned: the run must FINISH as cancelled, whichever
-	// finish path owns it (active drop or the draining queue).
-	run.Status = "cancelled"
+	// finish path owns it (active drop or the draining queue). A run that
+	// already died on a terminal upstream error keeps its "failed" status
+	// (issue #114) — cancelled only fills an unset status.
+	if run.Status == "" {
+		run.Status = "cancelled"
+	}
 	// If it is still the current run, drop it from the active set so no
-	// new acquire reuses it, then FINISH it. A run that already rotated
-	// away is owned by the draining queue.
+	// new acquire reuses it, then FINISH it. Join the draining list BEFORE
+	// enqueueing (mirrors rotate): if the FINISH fails transiently,
+	// Maintain re-drains it — without draining membership the run would be
+	// in no set and its cancelled FINISH would be lost forever, leaking
+	// the upstream agent run. A run that already rotated away is owned by
+	// the draining queue.
 	if current, ok := m.runs[run.AgentID]; ok && current == run {
 		delete(m.runs, run.AgentID)
+		run.drainedAt = time.Now()
+		m.draining = append(m.draining, run)
 		m.mu.Unlock()
 		m.enqueueFinish(run)
 		return

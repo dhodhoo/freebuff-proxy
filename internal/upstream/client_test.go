@@ -378,7 +378,7 @@ func TestSessionControlCalls(t *testing.T) {
 	}
 
 	// end + tolerated 404
-	if err := client.EndSession(context.Background(), "inst-abc-123"); err != nil {
+	if err := client.EndSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2726,7 +2726,7 @@ func TestEndSession404Tolerated(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := client.EndSession(context.Background(), "inst-1"); err != nil {
+		if err := client.EndSession(context.Background()); err != nil {
 			t.Errorf("EndSession 404 = %v, want nil", err)
 		}
 	})
@@ -2742,7 +2742,7 @@ func TestEndSession404Tolerated(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := client.EndSession(context.Background(), "inst-1"); err == nil {
+		if err := client.EndSession(context.Background()); err == nil {
 			t.Error("EndSession 500 succeeded, want error")
 		}
 	})
@@ -3041,7 +3041,7 @@ func TestFullChatLifecycleChained(t *testing.T) {
 	if err := client.FinishRun(ctx, runID, "completed", 3, nil, ""); err != nil {
 		t.Fatalf("FinishRun: %v", err)
 	}
-	if err := client.EndSession(ctx, st.InstanceID); err != nil {
+	if err := client.EndSession(ctx); err != nil {
 		t.Fatalf("EndSession: %v", err)
 	}
 
@@ -3430,9 +3430,10 @@ func TestWaitingRoomChainWireFidelity(t *testing.T) {
 	if got := adsHeaders.Get("User-Agent"); got != freebuffCliUA {
 		t.Errorf("ads header User-Agent = %q, want %q", got, freebuffCliUA)
 	}
-	// Body userAgent: the shared Chrome-124 browser UA (ad targeting).
-	if got := adsBody["userAgent"]; got != adBrowserUserAgent {
-		t.Errorf("ads body userAgent = %q, want %q", got, adBrowserUserAgent)
+	// Body userAgent: the platform-consistent Chrome-124 browser UA (ad
+	// targeting) — must agree with the device block's os.
+	if got := adsBody["userAgent"]; got != adBrowserUserAgent() {
+		t.Errorf("ads body userAgent = %q, want %q", got, adBrowserUserAgent())
 	}
 	// Device block: host-derived IANA tz/locale, not hardcoded UTC/en-US.
 	device, ok := adsBody["device"].(map[string]any)
@@ -3448,6 +3449,11 @@ func TestWaitingRoomChainWireFidelity(t *testing.T) {
 	loc, _ := device["locale"].(string)
 	if loc == "" || loc == "C" || loc == "POSIX" || strings.Contains(loc, "_") {
 		t.Errorf("ads device locale = %q, want a BCP-47-style locale (e.g. en-US)", loc)
+	}
+	// The device os follows the host's wire mapping (darwin→macos) and the
+	// body UA agrees with it — the CLI picks both from the same platform.
+	if os, _ := device["os"].(string); os != deviceOS() {
+		t.Errorf("ads device os = %q, want %q (host wire mapping)", os, deviceOS())
 	}
 	// Faithful details kept: empty messages and NO sessionId (the chain
 	// fires before a session exists).

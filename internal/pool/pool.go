@@ -110,6 +110,13 @@ type Lease struct {
 	// reused by a later AddToken), and a bounds-checked release would leak
 	// the run's inflight or hit an unrelated manager.
 	entry *tokenEntry
+	// AcquiredAt is when this lease was handed out (per acquire attempt,
+	// not per run — a chat retry re-acquires and gets a fresh timestamp).
+	// The chat success path uses it to clear unfit marks that PREDATE this
+	// admission (a retry's fresh acquire proves the mark stale, while an
+	// older in-flight chat's success must not erase a mark that landed
+	// after its admission).
+	AcquiredAt time.Time
 }
 
 // bridgeEntry is one lazily-created client-token slot in bridge mode: the
@@ -703,7 +710,11 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 				// its admitted model — so nothing is invalidated or cooled
 				// per-token: the (egress, model) pair is marked unfit so
 				// new requests are refused fast instead of re-admitting and
-				// burning a daily session slot on every token.
+				// burning a daily session slot on every token. The lie is
+				// pool-owned here (fresh from the admission error), so
+				// stamping Model makes the surfaced refusal self-describing;
+				// the registry stores its own copy.
+				lie.Model = model
 				p.MarkModelUnfit(model, lie)
 				modelLimited = append(modelLimited, lie)
 				errs = append(errs, fmt.Sprintf("%s: %v", name, err))
@@ -774,7 +785,7 @@ func (p *Pool) Acquire(ctx context.Context, model string) (*Lease, error) {
 		p.idleFinished = false
 		p.lastActiveMu.Unlock()
 		return &Lease{Token: idx, Model: model, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
-			TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, entry: tok}, nil
+			TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, entry: tok, AcquiredAt: time.Now()}, nil
 	}
 
 	// Failover precedence (PRD §6 error matrix): when buckets are mixed the
@@ -1138,7 +1149,7 @@ func (p *Pool) AcquireBridge(ctx context.Context, clientToken, model string) (*L
 	p.idleFinished = false
 	p.lastActiveMu.Unlock()
 	return &Lease{Token: -1, Model: model, AgentID: agentID, Run: run, SessionInstanceID: instanceID,
-		TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, Bridge: entry}, nil
+		TierAccess: ss.TierAccess, TierCountry: ss.TierCountry, Bridge: entry, AcquiredAt: time.Now()}, nil
 }
 
 // LeaseRelease decrements the leased run's inflight counter. Call when the

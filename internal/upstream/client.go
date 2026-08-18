@@ -614,13 +614,28 @@ const cliUserAgent = "ai-sdk/openai-compatible/1.0.0/codebuff"
 // "Freebuff-CLI/<CODEBUFF_CLI_VERSION>"; 0.0.149 = the vendored binary).
 const freebuffCliUA = "Freebuff-CLI/0.0.149"
 
-// adBrowserUserAgent is the browser-like user agent passed to ad providers
-// for targeting/fraud screening (#124). The CLI ships one per platform and
-// warns that native runtime UAs look bot-like to ad networks
-// (reference common/src/util/ad-user-agent.ts: Chrome 124; use-gravity-ad.ts
-// sends it as the body userAgent). The proxy runs on Windows by default, so
-// the win32 entry is the faithful choice.
-const adBrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+// adUserAgents maps runtime.GOOS to the browser-like Chrome-124 UA sent to
+// ad providers for targeting/fraud screening (#124). The CLI ships one entry
+// per platform (reference common/src/util/ad-user-agent.ts: darwin/win32/
+// linux AD_USER_AGENTS; use-gravity-ad.ts sends it as the body userAgent)
+// and warns that native runtime UAs look bot-like to ad networks. The body
+// UA must agree with the device block's os (deviceOS): a mixed signal (e.g.
+// os:"linux" with a Windows UA) reads as spoofing to ad networks.
+var adUserAgents = map[string]string{
+	"darwin":  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"linux":   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+
+// adBrowserUserAgent returns the platform-consistent ads body UA for the
+// host, falling back to the Linux entry exactly like the CLI's
+// getAdUserAgent (AD_USER_AGENTS[platformKey] ?? linux).
+func adBrowserUserAgent() string {
+	if ua, ok := adUserAgents[runtime.GOOS]; ok {
+		return ua
+	}
+	return adUserAgents["linux"]
+}
 
 // New builds the client for one token.
 func New(token string, cfg *config.Config) (*Client, error) {
@@ -974,8 +989,7 @@ func (c *Client) ProbeAccount(ctx context.Context) (*SessionState, error) {
 // is keyed on the user, not the instance: the CLI releases its slot with
 // Authorization only, no x-freebuff-instance-id header (#120,
 // reference/freebuff freebuff-session-api.ts releaseFreebuffSlot → DELETE).
-// instanceID is kept for call-site logging; it is never sent.
-func (c *Client) EndSession(ctx context.Context, instanceID string) error {
+func (c *Client) EndSession(ctx context.Context) error {
 	req, err := c.newRequest(ctx, http.MethodDelete, "/api/v1/freebuff/session", nil)
 	if err != nil {
 		return err
@@ -1567,7 +1581,7 @@ func (c *Client) requestAds(ctx context.Context, provider string) error {
 		// Body userAgent: the shared browser-like UA (NOT a runtime UA) so
 		// every ad provider sees a usable targeting signal — the CLI sends
 		// getAdUserAgent() here (#124).
-		"userAgent": adBrowserUserAgent,
+		"userAgent": adBrowserUserAgent(),
 		"surface":   "waiting_room",
 	}
 	body, _ := json.Marshal(payload)
@@ -2110,12 +2124,15 @@ func classifyError(status int, body string, hdr http.Header) error {
 		// Client.classify wrapper records the flag so the pool can fire the
 		// gated WAITING_ROOM_CHAIN before the next create.
 		return &WaitingRoomRequiredError{RetryAfter: retryAfter, Detail: truncate(body, 200)}
-	case containsAny(lower, "session_model_mismatch") && containsAny(lower, "limited"):
+	case containsAny(lower, "session_model_mismatch") && containsAny(lower, "limited") && containsAny(lower, "on this"):
 		// The egress IP cannot serve the requested model. The session row is
 		// fine — it stays bound to its admitted model — so this is NOT
 		// session-invalid: invalidating would re-admit and burn a daily
 		// session slot. The server marks the refusal and the pool registry
-		// cools the (egress, model) pairing instead.
+		// cools the (egress, model) pairing instead. The verified egress
+		// message is "model <id> is limited on this IP", so "on this"
+		// disambiguates from tier/plan wording ("limited to your current
+		// plan") that must fall through to ErrSessionInvalid below.
 		return &LimitedIpError{RetryAfter: retryAfter, Body: truncate(body, 200)}
 	case containsAny(lower, "session_superseded"):
 		// #119: 409 session_superseded is a TERMINAL gate rejection

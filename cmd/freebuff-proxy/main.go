@@ -27,7 +27,6 @@ import (
 	_ "time/tzdata"
 
 	"freebuff-proxy/internal/config"
-	"freebuff-proxy/internal/egress"
 	"freebuff-proxy/internal/logring"
 	"freebuff-proxy/internal/notify"
 	"freebuff-proxy/internal/pool"
@@ -451,17 +450,6 @@ func ignoredExeAdjacentEnv(cwd, exePath string) string {
 		return ""
 	}
 	return p
-}
-
-// egressPaths returns the outbound probe paths for on-demand probing: the
-// direct connection only (proxy routes were removed — the upstream
-// hard-blocks proxy/VPN egress, so any proxied path is pure ban risk).
-// The background RunLoop is no longer wired into startup (#123 — the CLI
-// never talks to cloudflare.com and the risk-engine geo feed has no
-// reader); `-doctor` re-probes with its own cache, and this stays as the
-// canonical path list for that on-demand use / future opt-in.
-func egressPaths() []egress.Path {
-	return []egress.Path{{Key: "direct", Dialer: egress.DirectDialer(egress.ProbeTimeout)}}
 }
 
 // refreshLoop refreshes the registry immediately, then every interval.

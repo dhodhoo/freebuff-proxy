@@ -367,13 +367,11 @@ func Load(configPath string) (Config, error) {
 	overrideCSV(&raw.APIKeys, "API_KEYS")
 	overrideString(&raw.AdminToken, "ADMIN_TOKEN")
 	overrideString(&raw.CostMode, "COST_MODE")
-	overrideString(&raw.ActingUserID, "ACTING_USER_ID")
-	// Backward-compat alias (#126): the pre-rename USER_ID knob still works
-	// when the new name is unset/empty (an operator .env keeps sending the
-	// header after upgrade). ACTING_USER_ID always wins when both are set.
-	if raw.ActingUserID == "" {
-		overrideString(&raw.ActingUserID, "USER_ID")
-	}
+	// ACTING_USER_ID / legacy USER_ID (#126): the alias is read from the
+	// SAME env source as the primary, so a real-environment USER_ID beats a
+	// lower-precedence .env/JSON ACTING_USER_ID instead of being silently
+	// dropped; ACTING_USER_ID wins when both are set in one source.
+	overrideStringAlias(&raw.ActingUserID, os.Getenv, "ACTING_USER_ID", "USER_ID")
 	overrideString(&raw.TLSFingerprint, "TLS_FINGERPRINT")
 	overrideString(&raw.RegistryRefresh, "REGISTRY_REFRESH")
 	overrideBool(&raw.DebugDump, "DEBUG_DUMP")
@@ -911,10 +909,10 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideCSVFrom(&raw.APIKeys, get, "API_KEYS")
 	overrideStringFrom(&raw.AdminToken, get, "ADMIN_TOKEN")
 	overrideStringFrom(&raw.CostMode, get, "COST_MODE")
-	overrideStringFrom(&raw.ActingUserID, get, "ACTING_USER_ID")
-	if raw.ActingUserID == "" {
-		overrideStringFrom(&raw.ActingUserID, get, "USER_ID")
-	}
+	// ACTING_USER_ID / legacy USER_ID (#126), same-source: a .env USER_ID
+	// beats a JSON ACTING_USER_ID (dotenv outranks JSON), ACTING_USER_ID
+	// wins when both are in the .env.
+	overrideStringAlias(&raw.ActingUserID, get, "ACTING_USER_ID", "USER_ID")
 	overrideStringFrom(&raw.TLSFingerprint, get, "TLS_FINGERPRINT")
 	overrideStringFrom(&raw.RegistryRefresh, get, "REGISTRY_REFRESH")
 	overrideBoolFrom(&raw.DebugDump, get, "DEBUG_DUMP")
@@ -1015,6 +1013,23 @@ func overrideString(target *string, envName string) {
 
 func overrideStringFrom(target *string, get func(string) string, envName string) {
 	if value := strings.TrimSpace(get(envName)); value != "" {
+		*target = value
+	}
+}
+
+// overrideStringAlias overrides target from source get, preferring the
+// primary env name and falling back to the legacy alias name when the
+// primary is empty at THIS source. Both names are read from the same
+// source, so cross-source precedence (JSON < .env < env) holds for either
+// name (#126): a higher-precedence USER_ID beats a lower-precedence
+// ACTING_USER_ID instead of being silently dropped, while ACTING_USER_ID
+// wins when both appear in one source.
+func overrideStringAlias(target *string, get func(string) string, primary, alias string) {
+	value := strings.TrimSpace(get(primary))
+	if value == "" {
+		value = strings.TrimSpace(get(alias))
+	}
+	if value != "" {
 		*target = value
 	}
 }

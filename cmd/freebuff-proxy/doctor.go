@@ -227,9 +227,10 @@ func runDoctor(configPath string) {
 	}
 
 	// Egress region check: one live probe of the direct outbound path
-	// through a plain dialer, read back from the cache the doctor shares
-	// with the runtime. A failed probe is a warning, not a doctor failure —
-	// the proxy keeps working, only the region readout is missing.
+	// through a plain dialer. The probe result lands in a doctor-local
+	// cache (the runtime no longer probes — #123); a failed probe is a
+	// warning, not a doctor failure — the proxy keeps working, only the
+	// region readout is missing.
 	egressCache := egress.NewCache()
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	res := egress.Probe(probeCtx, egress.DirectDialer(5*time.Second), 5*time.Second)

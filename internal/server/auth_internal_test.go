@@ -506,3 +506,23 @@ func TestWriteErrorModelIPLimited(t *testing.T) {
 		t.Errorf("Retry-After with zero RetryAfter = %q, want empty", got)
 	}
 }
+
+// TestWriteErrorBareModelIPLimitedSentinel pins the #74 P2 contract for the
+// bare sentinel (a registry entry stored without refusal detail): 409 +
+// code model_ip_limited, no Retry-After header.
+func TestWriteErrorBareModelIPLimitedSentinel(t *testing.T) {
+	status, _, body := errorResponse(t, upstream.ErrModelIPLimited)
+	if status != http.StatusConflict {
+		t.Errorf("status = %d, want 409", status)
+	}
+	if body.Error.Code != "model_ip_limited" {
+		t.Errorf("code = %q, want model_ip_limited", body.Error.Code)
+	}
+	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	s.writeError(w, r, upstream.ErrModelIPLimited)
+	if got := w.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q, want none for bare sentinel", got)
+	}
+}

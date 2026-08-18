@@ -161,19 +161,6 @@ func TestEgressCacheTTL(t *testing.T) {
 	}
 }
 
-// TestEgressPaths pins the probe-path construction (the cmd package's
-// highest-value pure function): the direct connection is the only outbound
-// route (proxy routes were removed — the upstream hard-blocks proxy egress).
-func TestEgressPaths(t *testing.T) {
-	paths := egressPaths()
-	if len(paths) != 1 {
-		t.Fatalf("paths = %d, want 1 (direct only)", len(paths))
-	}
-	if paths[0].Key != "direct" {
-		t.Errorf("paths[0].Key = %q, want direct", paths[0].Key)
-	}
-}
-
 // TestVersionFlagPrintsVersion re-executes the test binary with -version
 // (main() os.Exit's, so it cannot run in-process) and pins the output:
 // "freebuff-proxy <version>" on stdout, exit 0.

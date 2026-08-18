@@ -703,16 +703,9 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 			// Previous session is locked to a different model.
 			// Release the old slot and retry with the desired model.
 			m.mu.Lock()
-			oldInstance := ""
-			if m.state != nil {
-				oldInstance = m.state.instanceID
-			}
 			m.commit(nil)
 			m.mu.Unlock()
-			if oldInstance == "" && st.InstanceID != "" {
-				oldInstance = st.InstanceID
-			}
-			_ = m.client.EndSession(ctx, oldInstance)
+			_ = m.client.EndSession(ctx)
 			slog.Debug("session released on model lock, retrying", "current", st.CurrentModel, "target", targetModel)
 		case "model_unavailable":
 			// Requested model is not available; fall back to default model.
@@ -859,7 +852,7 @@ func (m *Manager) EndSession(ctx context.Context) error {
 	// A superseded DELETE is the same "slot already gone" case as
 	// session-invalid (#119): swallow both so teardown never errors on a
 	// slot another instance took over.
-	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
+	if err := m.client.EndSession(ctx); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
 		return err
 	}
 	return nil
@@ -905,7 +898,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	// instance header). The cached state is kept in-memory so the store
 	// entry stays; the process is exiting.
 	slog.Debug("session ended on shutdown", "instance_id", shortInstance(instanceID))
-	if err := m.client.EndSession(ctx, instanceID); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
+	if err := m.client.EndSession(ctx); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
 		return err
 	}
 	return nil

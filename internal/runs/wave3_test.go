@@ -8,6 +8,7 @@ package runs
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -482,4 +483,71 @@ func nonChildFinished(mock *testutil.MockUpstream) []testutil.FinishedRun {
 		out = append(out, f)
 	}
 	return out
+}
+
+// TestReleaseAbandonedFinishFailureRedrains pins the abandoned-run re-drain
+// fix: when the abandoned run's FINISH fails transiently, the run must stay
+// on the draining list so Maintain retries it — without membership it would
+// be in no set and its cancelled FINISH would be lost forever, leaking the
+// upstream agent run.
+func TestReleaseAbandonedFinishFailureRedrains(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mock.FinishFailures = 1
+	mgr, _ := newTestManager(t, mock, time.Hour)
+
+	run, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.ReleaseAbandoned(run)
+
+	// The first FINISH fails (500): the run must be re-drained, not dropped.
+	eventually(t, "run re-drained after failed FINISH", func() bool {
+		mgr.mu.Lock()
+		defer mgr.mu.Unlock()
+		for _, d := range mgr.draining {
+			if d == run {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Maintain retries the FINISH and it lands.
+	mgr.Maintain(context.Background())
+	eventually(t, "abandoned run FINISH after retry", func() bool {
+		f, ok := finishedRun(mock, run.RunID)
+		return ok && f.Status == "cancelled"
+	})
+	mgr.Shutdown(context.Background())
+}
+
+// TestRecordStepCap pins the FINISH payload bound: a run recording more than
+// maxRecordedSteps keeps only the newest steps, while totalSteps stays
+// honest via the monotonic stepTotal.
+func TestRecordStepCap(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr, _ := newTestManager(t, mock, time.Hour)
+	run, err := mgr.Acquire(context.Background(), agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Release(run)
+	const total = maxRecordedSteps + 50
+	for i := 0; i < total; i++ {
+		mgr.RecordStep(run, fmt.Sprintf("msg-%d", i))
+	}
+	_, steps, totalSteps := mgr.finishPayload(run)
+	if len(steps) != maxRecordedSteps {
+		t.Errorf("steps kept = %d, want %d", len(steps), maxRecordedSteps)
+	}
+	if totalSteps != total {
+		t.Errorf("totalSteps = %d, want %d (monotonic, not capped)", totalSteps, total)
+	}
+	if last := steps[len(steps)-1].MessageID; last == nil || *last != fmt.Sprintf("msg-%d", total-1) {
+		t.Errorf("newest step = %v, want msg-%d", steps[len(steps)-1].MessageID, total-1)
+	}
+	mgr.Shutdown(context.Background())
 }

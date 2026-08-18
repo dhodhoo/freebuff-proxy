@@ -604,11 +604,14 @@ func (s *Server) dashboardAuth(next http.Handler) http.Handler {
 // logs) in the default-open mode: when ADMIN_TOKEN is unset, only loopback
 // clients may access them, so a remotely reachable proxy cannot leak or let
 // anyone rewrite the .env. With ADMIN_TOKEN set the cookie gate already ran
-// (this middleware is wrapped inside dashboardAuth).
+// (this middleware is wrapped inside dashboardAuth). The Host header must
+// also be loopback-named: a DNS-rebinding page (attacker.com → 127.0.0.1)
+// arrives from a loopback RemoteAddr while its Host stays attacker-owned,
+// which would otherwise defeat the gate (SEC-2).
 func (s *Server) adminSensitive(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfg.Load()
-		if cfg.AdminToken == "" && !isLoopback(r) {
+		if cfg.AdminToken == "" && (!isLoopback(r) || !isLoopbackHost(r.Host)) {
 			s.dash.RenderRestricted(w, r, "This page is only available to loopback clients while ADMIN_TOKEN is unset.")
 			return
 		}
@@ -624,6 +627,21 @@ func isLoopback(r *http.Request) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// isLoopbackHost reports whether the request's Host header names a loopback
+// target (127.0.0.1, ::1, localhost, *.localhost). Used by the open-mode
+// adminSensitive gate to stop DNS-rebinding access.
+func isLoopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport // bare host (no port)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	return h == "localhost" || strings.HasSuffix(h, ".localhost")
 }
 
 // adminCSRF rejects cross-origin mutating admin requests. Browsers send
@@ -1885,14 +1903,14 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	// ever is nil.
 	if !bridge {
 		if until, lie := s.pool.ModelUnfit(model); !until.IsZero() && time.Now().Before(until) {
-			if lie != nil {
-				lie.RetryAfter = time.Until(until)
-			}
 			phases.Since(phasetiming.TotalMS, start)
 			s.logger.Info(kind+" request refused", "model", model, "reason", "model_limited_on_egress", "until", until.Format(time.RFC3339))
-			var refuseErr = upstream.ErrModelIPLimited
+			// Never mutate the registry's stored error (SEC-1): concurrent
+			// refusals would race on RetryAfter. Surface a per-request
+			// shallow copy carrying the computed window.
+			refuseErr := upstream.ErrModelIPLimited
 			if lie != nil {
-				refuseErr = lie
+				refuseErr = &upstream.LimitedIpError{Model: lie.Model, Body: lie.Body, RetryAfter: time.Until(until)}
 			}
 			s.traceChat(nil, model, time.Since(start).Milliseconds(), "error", "model_ip_limited", phases.All())
 			s.writeError(w, r, refuseErr)
@@ -2193,7 +2211,14 @@ func (s *Server) chatAttempt(
 		if err == nil {
 			// Issue #74 P2: a successful chat is egress-level proof the
 			// model is servable again — drop any (egress, model) unfit mark.
-			s.pool.ClearModelUnfit(effectiveModel)
+			// Only marks created before THIS lease's acquisition (a retry
+			// re-acquires after the mark, so its success clears it; an
+			// older in-flight chat succeeding must not erase a mark that
+			// landed after its admission — that would reopen the
+			// limited_ip re-admission burn).
+			if !lease.AcquiredAt.IsZero() {
+				s.pool.ClearModelUnfitBefore(effectiveModel, lease.AcquiredAt)
+			}
 			released = true // Disarm deferred release: ownership transferred to caller
 			return up, lease, nil
 		}
@@ -2498,7 +2523,10 @@ func (s *Server) relayStream(ctx context.Context, w http.ResponseWriter, r io.Re
 				var u struct {
 					Usage any `json:"usage"`
 				}
-				if json.Unmarshal(clean, &u) == nil {
+				// Only adopt the total when the chunk actually carries a
+				// usage block: a trailing "usage":null or a content chunk
+				// merely mentioning the word must not zero the ledger.
+				if json.Unmarshal(clean, &u) == nil && u.Usage != nil {
 					stats.usageTokens = usageTotalTokens(u.Usage)
 				}
 			}
@@ -2552,11 +2580,12 @@ func (s *Server) relayJSON(ctx context.Context, w http.ResponseWriter, r io.Read
 	}
 	out := acc.Finish()
 	stats.bytes = len(out)
-	// Capture the accumulated usage total for the spend ledger (#122).
+	// Capture the accumulated usage total for the spend ledger (#122);
+	// only adopt when the response actually carries a usage block.
 	var usageObj struct {
 		Usage any `json:"usage"`
 	}
-	if json.Unmarshal(out, &usageObj) == nil {
+	if json.Unmarshal(out, &usageObj) == nil && usageObj.Usage != nil {
 		stats.usageTokens = usageTotalTokens(usageObj.Usage)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -2985,6 +3014,12 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		if retryAfter < 0 {
 			retryAfter = 0
 		}
+	case errors.Is(err, upstream.ErrModelIPLimited):
+		// Bare sentinel (registry entry stored without refusal detail):
+		// same 409 contract, no Retry-After to surface.
+		status, code = http.StatusConflict, "model_ip_limited"
+		message = err.Error()
+		retryAfter = 0
 	case errors.As(err, &wr):
 		status, code = http.StatusServiceUnavailable, "waiting_room_queued"
 		message, retryAfter = wr.Error(), wr.RetryAfter
