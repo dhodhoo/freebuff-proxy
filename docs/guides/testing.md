@@ -30,7 +30,7 @@ What you want to see:
 - `-version` prints a version string. `dev` means a build without release
   metadata, which is normal for `go run` or a hand-built binary. Release
   archives are built with the version baked in, so a downloaded release
-  always prints its tag (e.g. `v0.9.8`); if a release binary says `dev`,
+  always prints its tag (e.g. `v0.10.0`); if a release binary says `dev`,
   something is off with the build.
 - `-doctor` prints a line per check, `[ok]` or `[FAIL]`, then exits. It
   probes every configured token with a zero-cost GET request (no session
@@ -380,4 +380,4 @@ you curl, or the client sends a shape the endpoint does not accept.
 
 This guide covers the whole surface in the current release. If a command
 here 404s or errors, you are likely on an older binary; upgrade and
-re-run, because the routes and flags listed are the ones `v0.9.8` ships.
+re-run, because the routes and flags listed are the ones `v0.10.0` ships.

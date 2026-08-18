@@ -121,7 +121,7 @@ Go to 9router **Chat** tab, select provider `freebuff` and model `freebuff/deeps
 
 | Symptom | Root Cause | Solution |
 | :--- | :--- | :--- |
-| **Every request returns 404** | Old proxy binary without `/v1/responses` or `/v1/messages`, or an unsupported endpoint such as `/v1/embeddings` (400 `unsupported_endpoint`). | Upgrade to the latest release. Chat Completions, Responses, and Messages all work on v0.9.8+. |
+| **Every request returns 404** | Old proxy binary without `/v1/responses` or `/v1/messages`, or an unsupported endpoint such as `/v1/embeddings` (400 `unsupported_endpoint`). | Upgrade to the latest release. Chat Completions, Responses, and Messages all work on v0.10.0+. |
 | **Connection Refused on Base URL** | Proxy is not running or bound only to loopback inside Docker. | Run `curl http://127.0.0.1:3457/healthz`. In Docker, ensure `LISTEN_ADDR=:3457`. |
 | **"URL not allowed" during Check** | 9router SSRF guard blocks private IPs when accessed from remote browser. | Ignore the check and click **Create** anyway, then add the API Key in the next modal. |
 | **502 `upstream_auth_rejected`** | Token in `.env` or the 9router connection is expired or invalid. | Regenerate a token via `.\scripts\gen-token.cmd` (or `./scripts/gen-token.sh`). |
