@@ -57,6 +57,15 @@ HANDOFF.md
 docs/*
 !docs/guides/
 
+# ── dev study docs (local only — reverse-engineering notes, NOT public) ──
+docs/guides/freebuff-cli-internals.md
+docs/guides/anti-ban-gap-analysis.md
+
+# ── proxy session persistence (SHA-256 token keys + instance state) ──
+.freebuff-session-state.json
+.freebuff-session-state.json.*
+*.session-state.json
+
 # local agent tool state (skills.sh installs, session artifacts)
 .agents/
 .claude/
