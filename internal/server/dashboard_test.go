@@ -1036,8 +1036,12 @@ func TestDashboardDiagPortHandling(t *testing.T) {
 	if strings.Contains(body, "DNS lookup failed") {
 		t.Errorf("diag DNS row failed for a host with an explicit port:\n%s", body)
 	}
-	if strings.Contains(body, ":443") {
-		t.Errorf("diag appended :443 to a host that already carries a port:\n%s", body)
+	// The dial target must be the ported mock host as-is — never
+	// "host:PORT:443". (A bare ":443" substring check would be unsound: the
+	// mock's ephemeral port can itself contain ":443", e.g. 44375.)
+	mockHost := strings.TrimPrefix(mock.URL(), "http://")
+	if !strings.Contains(body, "TCP reachable "+mockHost) {
+		t.Errorf("diag did not dial the ported mock host as-is (want %q):\n%s", "TCP reachable "+mockHost, body)
 	}
 }
 
