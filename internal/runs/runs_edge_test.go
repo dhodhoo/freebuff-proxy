@@ -46,7 +46,7 @@ func TestFinishRunFailureRetriesOnMaintain(t *testing.T) {
 	})
 	// The first FINISH fails upstream; the run must stay around for a
 	// Maintain retry, not be dropped.
-	mock.FinishFailures = 1
+	mock.SetFinishFailures(1)
 	mgr.FinishRun(context.Background(), run)
 
 	if got := mock.FinishesStartedSnapshot(); got != 2 {
@@ -104,7 +104,7 @@ func TestFinishIfReadyFailureKeepsDraining(t *testing.T) {
 	eventually(t, "first child run FINISH recorded", func() bool {
 		return len(mock.FinishedRunsSnapshot()) >= 1
 	})
-	mock.FinishFailures = 1
+	mock.SetFinishFailures(1)
 	mgr.Maintain(context.Background())
 
 	// The rotated run's async FINISH failed: wait for the attempt to hit

@@ -86,7 +86,7 @@ func TestFinishQueueBoundsInlineFallback(t *testing.T) {
 	// worker keeps processing the queued ones.
 	mock := testutil.NewMock()
 	defer mock.Close()
-	mock.FinishDelay = 300 * time.Millisecond
+	mock.SetFinishDelay(300 * time.Millisecond)
 	mock.RunIDs = []string{"run-0001", "run-0002", "run-0003", "run-0004", "run-0005"}
 	mgr, _ := newTestManagerOpts(t, mock, Options{
 		RotationInterval:    5 * time.Millisecond,
@@ -153,7 +153,7 @@ func TestDrainQueueCapEviction(t *testing.T) {
 	// list, and the cap must force-drop the oldest entries.
 	mock := testutil.NewMock()
 	defer mock.Close()
-	mock.FinishDelay = 500 * time.Millisecond
+	mock.SetFinishDelay(500 * time.Millisecond)
 	mock.RunIDs = []string{"run-0001", "run-0002", "run-0003", "run-0004", "run-0005", "run-0006", "run-0007"}
 	mgr, _ := newTestManagerOpts(t, mock, Options{
 		RotationInterval:    5 * time.Millisecond,
@@ -188,7 +188,7 @@ func TestDrainTTLEviction(t *testing.T) {
 	// TTL and the next draining-list pass force-drops it.
 	mock := testutil.NewMock()
 	defer mock.Close()
-	mock.FinishFailures = 1 // first FINISH fails → run stays draining
+	mock.SetFinishFailures(1) // first FINISH fails → run stays draining
 	mgr, _ := newTestManagerOpts(t, mock, Options{
 		RotationInterval: 5 * time.Millisecond,
 		DrainTTL:         50 * time.Millisecond,
@@ -493,7 +493,7 @@ func nonChildFinished(mock *testutil.MockUpstream) []testutil.FinishedRun {
 func TestReleaseAbandonedFinishFailureRedrains(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
-	mock.FinishFailures = 1
+	mock.SetFinishFailures(1)
 	mgr, _ := newTestManager(t, mock, time.Hour)
 
 	run, err := mgr.Acquire(context.Background(), agentA)

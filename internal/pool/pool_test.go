@@ -1704,7 +1704,7 @@ func TestBridgeEvictionFinishOutsideLock(t *testing.T) {
 	// Slow FINISH responses hold the eviction's upstream call in flight long
 	// enough to probe the lock: with the old code BridgeCount would block
 	// for the full delay; with the fix it returns in microseconds.
-	mock.FinishDelay = 300 * time.Millisecond
+	mock.SetFinishDelay(300 * time.Millisecond)
 	p := newBridgePool(t, mock)
 
 	// Fill the cache to the cap.
@@ -1938,7 +1938,7 @@ func TestIdleFinishAllRunsHonorsMaintainCtx(t *testing.T) {
 	p.lastActiveMu.Unlock()
 
 	// Hold every FINISH upstream: only ctx cancellation can end it.
-	mock.FinishDelay = time.Hour
+	mock.SetFinishDelay(time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -1980,7 +1980,7 @@ func TestBridgeMaintainEvictHonorsCtx(t *testing.T) {
 	}
 	entry.lastUsed = time.Now().Add(-bridgeIdleEvict - time.Minute)
 
-	mock.FinishDelay = time.Hour
+	mock.SetFinishDelay(time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

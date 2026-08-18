@@ -635,6 +635,24 @@ func (m *MockUpstream) FinishesStartedSnapshot() int {
 	return m.FinishesStarted
 }
 
+// SetFinishDelay sets FinishDelay under the mock's lock. Tests must use it
+// instead of a plain field write: the agent-runs handler reads FinishDelay
+// under the lock while a FINISH may already be in flight, so an unlocked
+// write races under -race.
+func (m *MockUpstream) SetFinishDelay(d time.Duration) {
+	m.mu.Lock()
+	m.FinishDelay = d
+	m.mu.Unlock()
+}
+
+// SetFinishFailures sets FinishFailures under the mock's lock (see
+// SetFinishDelay).
+func (m *MockUpstream) SetFinishFailures(n int) {
+	m.mu.Lock()
+	m.FinishFailures = n
+	m.mu.Unlock()
+}
+
 // SessionCreatesSnapshot returns a locked copy of the session-create
 // counter (see StartedRunsSnapshot). Tests poll it while an admission is in
 // flight without racing the mock server goroutine.
