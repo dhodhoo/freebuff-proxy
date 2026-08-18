@@ -242,19 +242,23 @@ func TestWriteErrorNewMappings(t *testing.T) {
 		}
 	})
 
-	t.Run("session superseded 409", func(t *testing.T) {
-		// #119: 409 session_superseded — terminal, no auto-rejoin.
+	t.Run("session superseded 503", func(t *testing.T) {
+		// #119: 503 session_superseded — returns 503 + Retry-After so 9router
+		// retries immediately instead of locking the model for 30s.
 		const upstreamBody = `{"error":"session_superseded","message":"another CLI took over"}`
 		err := &upstream.SessionSupersededError{Status: http.StatusConflict, Body: upstreamBody}
-		status, _, body := errorResponse(t, err)
-		if status != http.StatusConflict {
-			t.Errorf("status = %d, want 409", status)
+		status, hdr, body := errorResponse(t, err)
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", status)
 		}
 		if body.Error.Code != "session_superseded" {
 			t.Errorf("code = %q, want session_superseded", body.Error.Code)
 		}
 		if body.Error.Message != upstreamBody {
 			t.Errorf("message = %q, want upstream body verbatim", body.Error.Message)
+		}
+		if got := hdr.Get("Retry-After"); got != "1" {
+			t.Errorf("Retry-After = %q, want 1", got)
 		}
 	})
 

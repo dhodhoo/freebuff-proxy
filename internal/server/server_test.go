@@ -546,12 +546,52 @@ func TestChatSessionInvalidBoundedRetry(t *testing.T) {
 	}
 }
 
-// TestChatSessionSupersededTerminal pins #119: 409 session_superseded (another
-// instance took over the account, endsTheSession:true) is TERMINAL — the
-// cached session is dropped so the NEXT request re-joins fresh, but the
-// request NEVER auto-reacquires (auto-takeover risks ping-pong). One chat
-// attempt, one session create, 409 session_superseded surfaced.
-func TestChatSessionSupersededTerminal(t *testing.T) {
+// TestChatSessionSupersededRetries pins #119: 409 session_superseded (another
+// instance took over the account, endsTheSession:true) retries once — the
+// cached session is dropped and a fresh session is acquired for the retry.
+// This avoids the 30s model lock 9router applies on a 503 response. Two chat
+// attempts, two session creates, success on the retry.
+func TestChatSessionSupersededRetries(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	// First chat attempt returns session_superseded, second succeeds.
+	callCount := 0
+	originalHandler := mock.ChatHandler
+	mock.ChatHandler = func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// First call: session_superseded
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"session_superseded"}}`))
+			return
+		}
+		// Second call: success
+		if originalHandler != nil {
+			originalHandler(w, r)
+		} else {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + chunk("cmpl-test", 1234567890, `"choices":[{"delta":{"content":"ok"},"index":0}]`) + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}
+	ts, _ := newTestServer(t, nil, mock)
+
+	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, data)
+	}
+	if got := len(mock.RecordedChatHeaders); got != 2 {
+		t.Errorf("upstream chat attempts = %d, want exactly 2 (retry on superseded)", got)
+	}
+	if got := mock.SessionCreates; got != 2 {
+		t.Errorf("session creates = %d, want exactly 2 (invalidated + re-acquired)", got)
+	}
+}
+
+// TestChatSessionSupersededBoundedRetry pins #119: when the retry ALSO fails
+// on session_superseded, the attempt budget caps at 2 attempts and surfaces
+// 503 session_superseded with Retry-After: 1.
+func TestChatSessionSupersededBoundedRetry(t *testing.T) {
 	mock := testutil.NewMock()
 	defer mock.Close()
 	mock.ChatStatus = http.StatusBadRequest
@@ -559,32 +599,17 @@ func TestChatSessionSupersededTerminal(t *testing.T) {
 	ts, _ := newTestServer(t, nil, mock)
 
 	resp, data := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, data)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", resp.StatusCode, data)
 	}
 	if !strings.Contains(string(data), "session_superseded") {
 		t.Errorf("body missing session_superseded: %s", data)
 	}
-	if got := len(mock.RecordedChatHeaders); got != 1 {
-		t.Errorf("upstream chat attempts = %d, want exactly 1 (no auto-reacquire on superseded)", got)
-	}
-	if got := mock.SessionCreates; got != 1 {
-		t.Errorf("upstream session creates = %d, want exactly 1 (no in-request rejoin)", got)
-	}
-
-	// The cached session was dropped: the NEXT request re-joins fresh (the
-	// CLI's "stop and rejoin later" semantic) — a second session create +
-	// chat happen, and the mock's persistent superseded chat surfaces again
-	// as 409.
-	resp2, data2 := doJSON(t, http.MethodPost, ts.URL+"/v1/chat/completions", chatBody(modelA), nil)
-	if resp2.StatusCode != http.StatusConflict {
-		t.Fatalf("second request status = %d, want 409 (superseded again): %s", resp2.StatusCode, data2)
+	if got := len(mock.RecordedChatHeaders); got != 2 {
+		t.Errorf("upstream chat attempts = %d, want exactly 2 (bounded retry on superseded)", got)
 	}
 	if got := mock.SessionCreates; got != 2 {
-		t.Errorf("session creates after next request = %d, want 2 (fresh re-join)", got)
-	}
-	if got := len(mock.RecordedChatHeaders); got != 2 {
-		t.Errorf("upstream chat attempts after next request = %d, want 2", got)
+		t.Errorf("session creates = %d, want exactly 2 (invalidated + re-acquired once)", got)
 	}
 }
 

@@ -2605,16 +2605,19 @@ func (s *Server) chatAttempt(
 				return nil, nil, err
 			}
 		case errors.Is(err, upstream.ErrSessionSuperseded):
-			// #119: 409 session_superseded is TERMINAL — another instance
-			// took over the account. Drop the cached row so the NEXT
-			// request (operator/next-call) re-joins fresh, but NEVER
-			// auto-reacquire within this request: auto-takeover risks
-			// ping-pong with the other instance (reference/freebuff
-			// send-message.ts handleFreebuffGateError, use-freebuff-session.ts
-			// nextDelayMs returns null for superseded).
+			// #119: 409 session_superseded — another instance took over
+			// the account. Drop the cached session and re-admit ONCE
+			// for this request (mirror the ErrSessionInvalid budget:
+			// attempts > 1 surfaces the error). The session is already
+			// invalidated so the next request re-joins fresh; auto-
+			// retry here avoids the 30s model lock9router would apply
+			// on a503 response. Never loops — a single reacquire, then
+			// surface.
 			release()
 			invalidateSession(lease)
-			return nil, nil, err
+			if attempts > 1 {
+				return nil, nil, err
+			}
 		case errors.Is(err, upstream.ErrRunInvalid):
 			release()
 			invalidateRun(lease, lease.AgentID)
@@ -3484,15 +3487,16 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error, m
 			retryAfter = 0
 		}
 	case errors.As(err, &sse):
-		// #119: 409 session_superseded — another instance took over the
-		// account. Terminal for this request: 409 + the upstream body, no
-		// auto-rejoin (the cached row was dropped in chatAttempt so the
-		// next request re-joins fresh).
-		status, code = http.StatusConflict, "session_superseded"
+		// #119: 503 session_superseded — another instance took over the
+		// account. Return 503 + Retry-After (not 409) so 9router retries
+		// immediately instead of locking the model for 30s. The session is
+		// already invalidated in chatAttempt so the next request re-joins fresh.
+		status, code = http.StatusServiceUnavailable, "session_superseded"
 		message = sse.Body
 		if message == "" {
 			message = "session superseded"
 		}
+		retryAfter = 1 // retry in 1s
 	case errors.As(err, &cde):
 		// #105 (server half): the client's capacity-deferred retry budget
 		// (TRANSIENT_RETRIES) is exhausted, so the free tier's transient
