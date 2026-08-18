@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ import (
 var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "COST_MODE", "ACTING_USER_ID", "USER_ID",
-	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL",
+	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL", "LOG_FORMAT", "LOG_ACCESS", "LOG_RING_SIZE",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
 	"MODELS_HIDE_UNAVAILABLE", "CORS_ALLOWED_ORIGIN", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
 	"AUTO_DISCOVER_TOKEN", "TRANSIENT_RETRIES", "ADMIN_TOKEN",
@@ -219,6 +220,83 @@ func TestTransientRetries(t *testing.T) {
 		t.Fatalf("Load (negative): err = %v, want error mentioning TRANSIENT_RETRIES", err)
 	}
 	t.Setenv("TRANSIENT_RETRIES", "")
+}
+
+// TestLogRingSize pins the T19 LOG_RING_SIZE knob: default 500 when unset,
+// an empty value keeps the default, explicit values must stay within
+// 50..5000 (below the floor / above the cap fail validation), and the JSON
+// and .env sources both apply.
+func TestLogRingSize(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	// default: 500 when unset
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if cfg.LogRingSize != 500 {
+		t.Errorf("LogRingSize default = %d, want 500", cfg.LogRingSize)
+	}
+
+	// explicit empty value keeps the default
+	t.Setenv("LOG_RING_SIZE", "")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (empty): %v", err)
+	} else if cfg.LogRingSize != 500 {
+		t.Errorf("LogRingSize (empty) = %d, want 500", cfg.LogRingSize)
+	}
+
+	// env source: a valid value loads
+	t.Setenv("LOG_RING_SIZE", "2000")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env 2000): %v", err)
+	} else if cfg.LogRingSize != 2000 {
+		t.Errorf("LogRingSize (env) = %d, want 2000", cfg.LogRingSize)
+	}
+
+	// boundary values are accepted
+	for _, v := range []string{"50", "5000"} {
+		t.Setenv("LOG_RING_SIZE", v)
+		n, _ := strconv.Atoi(v)
+		if cfg, err := Load(""); err != nil {
+			t.Fatalf("Load (LOG_RING_SIZE=%s): %v", v, err)
+		} else if cfg.LogRingSize != n {
+			t.Errorf("LogRingSize (LOG_RING_SIZE=%s) = %d, want %d", v, cfg.LogRingSize, n)
+		}
+	}
+
+	// below the floor fails validation
+	t.Setenv("LOG_RING_SIZE", "49")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_RING_SIZE") {
+		t.Fatalf("Load (49): err = %v, want validation error mentioning LOG_RING_SIZE", err)
+	}
+
+	// above the cap fails validation
+	t.Setenv("LOG_RING_SIZE", "5001")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_RING_SIZE") {
+		t.Fatalf("Load (5001): err = %v, want validation error mentioning LOG_RING_SIZE", err)
+	}
+	t.Setenv("LOG_RING_SIZE", "")
+
+	// JSON file source
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"LOG_RING_SIZE": 750}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (file): %v", err)
+	} else if cfg.LogRingSize != 750 {
+		t.Errorf("LogRingSize (file) = %d, want 750", cfg.LogRingSize)
+	}
+
+	// .env source (applyDotenv)
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nLOG_RING_SIZE=900\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (.env): %v", err)
+	} else if cfg.LogRingSize != 900 {
+		t.Errorf("LogRingSize (.env) = %d, want 900", cfg.LogRingSize)
+	}
 }
 
 func TestSafeMode(t *testing.T) {
@@ -1011,10 +1089,21 @@ func TestLogLevel(t *testing.T) {
 		t.Errorf("LogLevel = %q, want debug", cfg.LogLevel)
 	}
 
+	// trace is accepted (case-insensitive), matching telemetry.ParseLevel
+	t.Setenv("LOG_LEVEL", "trace")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env trace): %v", err)
+	} else if cfg.LogLevel != "trace" {
+		t.Errorf("LogLevel = %q, want trace", cfg.LogLevel)
+	}
+
 	// invalid level fails validation
 	t.Setenv("LOG_LEVEL", "bogus")
 	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_LEVEL") {
 		t.Fatalf("Load (invalid level): err = %v, want error mentioning LOG_LEVEL", err)
+	}
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "debug, info, warn, error, trace") {
+		t.Fatalf("Load (invalid level): err = %v, want error listing trace", err)
 	}
 
 	// .env source
@@ -1026,6 +1115,112 @@ func TestLogLevel(t *testing.T) {
 		t.Fatalf("Load (.env): %v", err)
 	} else if cfg.LogLevel != "warn" {
 		t.Errorf("LogLevel = %q, want warn (from .env)", cfg.LogLevel)
+	}
+}
+
+func TestLogFormat(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	// default: "text" when unset (the historic output shape)
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text by default", cfg.LogFormat)
+	}
+
+	// env source
+	t.Setenv("LOG_FORMAT", "json")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env json): %v", err)
+	} else if cfg.LogFormat != "json" {
+		t.Errorf("LogFormat = %q, want json", cfg.LogFormat)
+	}
+
+	// explicit empty resets to the default
+	t.Setenv("LOG_FORMAT", "")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (empty format): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text for empty value", cfg.LogFormat)
+	}
+
+	// invalid format fails validation
+	t.Setenv("LOG_FORMAT", "xml")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "LOG_FORMAT") {
+		t.Fatalf("Load (invalid format): err = %v, want error mentioning LOG_FORMAT", err)
+	}
+
+	// JSON file source (weakest): env wins over it
+	t.Setenv("LOG_FORMAT", "text")
+	json := `{"AUTH_TOKENS":["tok"],"LOG_FORMAT":"json"}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(json), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (json file): %v", err)
+	} else if cfg.LogFormat != "text" {
+		t.Errorf("LogFormat = %q, want text (env beats JSON file)", cfg.LogFormat)
+	}
+	t.Setenv("LOG_FORMAT", "")
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("Load (json file, no env): %v", err)
+	} else if cfg.LogFormat != "json" {
+		t.Errorf("LogFormat = %q, want json from JSON file", cfg.LogFormat)
+	}
+}
+
+// TestLogAccess pins T17: LOG_ACCESS defaults to true, an empty .env line
+// keeps it enabled (the access gate must never flip off from an unset or
+// blank value), and only an explicit false disables the access lines.
+func TestLogAccess(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false by default, want true")
+	}
+
+	// env source: explicit false disables.
+	t.Setenv("LOG_ACCESS", "false")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env false): %v", err)
+	} else if cfg.LogAccess {
+		t.Error("LogAccess = true for LOG_ACCESS=false, want false")
+	}
+
+	// Explicit true re-enables.
+	t.Setenv("LOG_ACCESS", "true")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env true): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false for LOG_ACCESS=true, want true")
+	}
+
+	// An empty .env line must not disable access logging: the empty value
+	// leaves the default (true) untouched.
+	t.Setenv("LOG_ACCESS", "")
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nLOG_ACCESS=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (empty .env line): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false for an empty LOG_ACCESS=.env line, want true")
+	}
+
+	// The .env source: LOG_ACCESS=false in .env disables (env wins).
+	t.Setenv("LOG_ACCESS", "")
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nLOG_ACCESS=false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (.env false): %v", err)
+	} else if cfg.LogAccess {
+		t.Error("LogAccess = true for .env LOG_ACCESS=false, want false")
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ const throttleWindow = 5 * time.Minute
 type Sender struct {
 	url    string
 	client *http.Client
+	logger *slog.Logger // send-failure WARN sink (nil = slog.Default())
 
 	mu        sync.Mutex
 	lastSent  map[string]time.Time // event type → last accepted POST time
@@ -43,7 +45,17 @@ func New(url string, client *http.Client) *Sender {
 	if client == nil {
 		client = &http.Client{Timeout: defaultTimeout}
 	}
-	return &Sender{url: url, client: client, lastSent: make(map[string]time.Time), startedAt: time.Now()}
+	return &Sender{url: url, client: client, logger: slog.Default(), lastSent: make(map[string]time.Time), startedAt: time.Now()}
+}
+
+// SetLogger replaces the sender's log sink (nil restores slog.Default).
+// Used by tests and by hosts that want the send-failure WARN on a custom
+// logger.
+func (s *Sender) SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = slog.Default()
+	}
+	s.logger = l
 }
 
 // Event is one webhook payload (issue #48). Fields mirror the alert
@@ -61,8 +73,9 @@ type Event struct {
 // Send fires a best-effort webhook POST for the event, throttled per event
 // type (at most one per throttleWindow). It never blocks: the POST runs on
 // a background goroutine with its own timeout. A nil receiver or an empty
-// configured URL is a no-op. Failures are silent — the alert is best-effort
-// by design (issue #48: "fire-and-forget goroutine with its own timeout").
+// configured URL is a no-op. Delivery failures are logged as a WARN (T18) —
+// the alert itself stays best-effort by design (issue #48:
+// "fire-and-forget goroutine with its own timeout").
 func (s *Sender) Send(event Event) {
 	if s == nil || s.url == "" {
 		return
@@ -91,25 +104,35 @@ func (s *Sender) throttle(eventType string) bool {
 
 // post performs one webhook POST with the sender's client timeout. The
 // payload is the JSON event; the response is drained and closed, and a
-// non-2xx status is treated as a failed delivery (still silent).
+// non-2xx status is treated as a failed delivery. Delivery failures are
+// logged as a WARN with the err and the target URL (T18) — the alert
+// itself stays best-effort and never blocks the request path.
 func (s *Sender) post(event Event) {
 	payload, err := json.Marshal(event)
 	if err != nil {
+		s.logger.Warn("webhook send failed", "err", err, "target", s.url)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, bytes.NewReader(payload))
 	if err != nil {
+		s.logger.Warn("webhook send failed", "err", err, "target", s.url)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "freebuff-proxy-webhook/1.0")
 	resp, err := s.client.Do(req)
 	if err != nil {
+		s.logger.Warn("webhook send failed", "err", err, "target", s.url)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		_, _ = drain(resp)
+		s.logger.Warn("webhook send failed", "err", fmt.Errorf("webhook returned status %d", resp.StatusCode), "target", s.url)
+		return
+	}
 	_, _ = drain(resp)
 }
 

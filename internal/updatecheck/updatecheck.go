@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -36,6 +37,7 @@ const fetchTimeout = 3 * time.Second
 type Checker struct {
 	repo   string
 	client *http.Client
+	logger *slog.Logger // decision Debug sink (nil = slog.Default())
 
 	mu       sync.Mutex
 	latest   string
@@ -49,7 +51,16 @@ func New(repo string, client *http.Client) *Checker {
 	if client == nil {
 		client = &http.Client{Timeout: fetchTimeout}
 	}
-	return &Checker{repo: repo, client: client}
+	return &Checker{repo: repo, client: client, logger: slog.Default()}
+}
+
+// SetLogger replaces the checker's log sink (nil restores slog.Default).
+// Used by tests and by hosts that want the decision Debug on a custom logger.
+func (c *Checker) SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = slog.Default()
+	}
+	c.logger = l
 }
 
 // Latest returns the latest release tag (e.g. "v0.9.3") from the in-memory
@@ -57,12 +68,16 @@ func New(repo string, client *http.Client) *Checker {
 // older than CacheTTL. A fetch failure returns the previously cached tag
 // (or "") with the error and still records the attempt, so subsequent
 // calls back off for CacheTTL instead of re-fetching. The cache is
-// refreshed single-flight so concurrent renders share one GET.
+// refreshed single-flight so concurrent renders share one GET. Each lookup
+// emits a Debug line with the decision (cached|fetched|failed) and the
+// lookup duration (T18).
 func (c *Checker) Latest(ctx context.Context) (string, error) {
+	start := time.Now()
 	c.mu.Lock()
 	if time.Since(c.fetched) < CacheTTL {
 		tag := c.latest
 		c.mu.Unlock()
+		c.logger.Debug("update check decision", "decision", "cached", "ms", time.Since(start).Milliseconds())
 		return tag, nil
 	}
 	if c.fetching {
@@ -76,6 +91,7 @@ func (c *Checker) Latest(ctx context.Context) (string, error) {
 				c.mu.Lock()
 				tag := c.latest
 				c.mu.Unlock()
+				c.logger.Debug("update check decision", "decision", "cached", "ms", time.Since(start).Milliseconds())
 				return tag, ctx.Err()
 			case <-time.After(50 * time.Millisecond):
 			}
@@ -83,6 +99,7 @@ func (c *Checker) Latest(ctx context.Context) (string, error) {
 		}
 		tag := c.latest
 		c.mu.Unlock()
+		c.logger.Debug("update check decision", "decision", "cached", "ms", time.Since(start).Milliseconds())
 		return tag, nil
 	}
 	c.fetching = true
@@ -104,6 +121,11 @@ func (c *Checker) Latest(ctx context.Context) (string, error) {
 	}
 	got := c.latest
 	c.mu.Unlock()
+	decision := "fetched"
+	if err != nil || tag == "" {
+		decision = "failed"
+	}
+	c.logger.Debug("update check decision", "decision", decision, "ms", time.Since(start).Milliseconds())
 	return got, err
 }
 

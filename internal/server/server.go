@@ -40,6 +40,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/convert"
@@ -71,6 +72,10 @@ type Server struct {
 	reg     *registry.Registry
 	logger  *slog.Logger
 	started time.Time
+
+	// logs is the optional dashboard log viewer ring (nil = disabled); its
+	// Counts feed freebuff_proxy_log_events_total on /metrics.
+	logs *logring.Handler
 
 	// dash is the embedded admin UI (htmx + vendored assets).
 	dash *dashboard.Dashboard
@@ -151,13 +156,13 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath, loginFlows: make(map[string]*loginFlow)}
+	s := &Server{pool: p, reg: reg, logger: logger, started: time.Now(), configPath: configPath, loginFlows: make(map[string]*loginFlow), logs: logs}
 	s.cfg.Store(cfg)
 	// The token estimator shares one o200k_base codec process-wide, so
 	// count_tokens requests never rebuild the vocabulary.
 	est, err := tokenestimate.New()
 	if err != nil {
-		logger.Error("token estimator unavailable; /v1/messages/count_tokens will fail", "err", err)
+		logger.Warn("token estimator unavailable; /v1/messages/count_tokens will fail", "err", err)
 	}
 	s.tokenEstimator = est
 	for _, opt := range opts {
@@ -232,16 +237,83 @@ func (s *Server) Handler() http.Handler {
 	cors := s.corsMiddleware(mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		// D1: mint the request's correlation id exactly once here, then
+		// carry it in the request context so every downstream log line
+		// (chat routing/done/trace, request failed, upstream do/retry)
+		// shares it. Handlers reached without this wrapper (direct calls
+		// in tests) mint a fallback id in chatCore.
+		reqID := newReqID()
+		r = r.WithContext(context.WithValue(r.Context(), reqIDKey{}, reqID))
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		cors.ServeHTTP(sw, r)
-		s.logger.Info("access",
+		attrs := []any{
+			"req_id", reqID,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", sw.status,
 			"ms", time.Since(start).Milliseconds(),
 			"remote", remoteHost(r),
-		)
+		}
+		// The client's X-Request-Id is preserved as a separate
+		// client_request_id field (never trusted as the correlation key).
+		if crid := clientRequestID(r); crid != "" {
+			attrs = append(attrs, "client_request_id", crid)
+		}
+		// T17: LOG_ACCESS=false disables access lines entirely. Quiet
+		// endpoints (/healthz, /metrics, OPTIONS preflights) are
+		// rate-limited to one access line per path per accessQuietWindow so
+		// a poller or browser preflight does not flood the log; every other
+		// path keeps one line per request. req_id/client_request_id survive
+		// in both cases.
+		if !s.cfg.Load().LogAccess {
+			return
+		}
+		if quietAccessPath(r.Method, r.URL.Path) && !accessLogDue(r.URL.Path, start) {
+			return
+		}
+		s.logger.Info("access", attrs...)
 	})
+}
+
+// quietAccessPath reports whether path is a poll/fire-and-forget endpoint
+// whose access lines are rate-limited (T17): /healthz, /metrics, and CORS
+// OPTIONS preflights. Every other path logs one access line per request.
+func quietAccessPath(method, path string) bool {
+	return path == "/healthz" || path == "/metrics" || method == http.MethodOptions
+}
+
+// accessQuietWindow is the quiet-endpoint access gate window: at most one
+// access line per path per window (T17). A var so tests can shrink it.
+var accessQuietWindow = 60 * time.Second
+
+// accessLogGate is the per-process quiet-path access gate: map[path]lastLog
+// plus a mutex (T17). The path set is bounded by the route table, so no
+// cleanup is needed.
+var accessLogGate = struct {
+	mu       sync.Mutex
+	lastSeen map[string]time.Time
+}{lastSeen: make(map[string]time.Time)}
+
+// accessLogDue reports whether an access line may fire for path now,
+// recording the current attempt. The first request for a path and any
+// request at least accessQuietWindow after the last line fire; requests
+// inside the window are suppressed.
+func accessLogDue(path string, now time.Time) bool {
+	accessLogGate.mu.Lock()
+	defer accessLogGate.mu.Unlock()
+	last, ok := accessLogGate.lastSeen[path]
+	if !ok || now.Sub(last) >= accessQuietWindow {
+		accessLogGate.lastSeen[path] = now
+		return true
+	}
+	return false
+}
+
+// resetAccessLogGate clears the quiet-path access gate (test hook).
+func resetAccessLogGate() {
+	accessLogGate.mu.Lock()
+	defer accessLogGate.mu.Unlock()
+	clear(accessLogGate.lastSeen)
 }
 
 // corsOrigin returns the configured Access-Control-Allow-Origin, treating an
@@ -575,6 +647,18 @@ func (a *adminAuth) clearFails(ip string) {
 	delete(a.fails, ip)
 }
 
+// loginFailState snapshots the failure entry for ip: the current attempt
+// count and whether ip is locked out (T15 audit trail).
+func (a *adminAuth) loginFailState(ip string) (attempts int, locked bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, ok := a.fails[ip]
+	if !ok {
+		return 0, false
+	}
+	return e.count, !e.until.IsZero() && time.Now().Before(e.until)
+}
+
 // dashboardAuth guards the browser UI. With ADMIN_TOKEN unset the dashboard
 // is open (legacy behavior, matching /admin/reload; main.go warns at startup).
 // Otherwise the request must carry a valid fb_admin cookie; missing/invalid
@@ -691,6 +775,10 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	ip := remoteHost(r)
 	if r.Method == http.MethodPost {
 		if !s.adminAuth.allow(ip) {
+			// T15: audit the lockout rejection — attempts is the lockout
+			// bound that was crossed; the submitted credential is never
+			// logged.
+			s.logger.Warn("admin login failed", "remote", ip, "attempts", maxLoginFails, "reason", "locked_out")
 			s.dash.RenderLogin(w, r, "Too many failed attempts — try again in a minute.")
 			return
 		}
@@ -706,6 +794,13 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.adminAuth.recordFail(ip)
+		attempts, locked := s.adminAuth.loginFailState(ip)
+		if locked {
+			attempts = maxLoginFails
+		}
+		// T15: audit a failed login — remote, running attempt count, and
+		// reason only; the credential itself is never logged.
+		s.logger.Warn("admin login failed", "remote", ip, "attempts", attempts, "reason", "invalid_token")
 		s.dash.RenderLogin(w, r, "Invalid admin token.")
 		return
 	}
@@ -875,6 +970,7 @@ func (s *Server) handleTokenTestAll(w http.ResponseWriter, r *http.Request) {
 // documented "unsupported_endpoint" code (distinct from the mux's bare 404,
 // which gives an embeddings client no actionable signal).
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	s.logger.Warn("unsupported endpoint requested", "path", r.URL.Path, "remote", remoteHost(r), "status", http.StatusBadRequest)
 	s.writeJSONError(w, http.StatusBadRequest,
 		"this proxy serves chat completions only; embeddings are not supported. Use POST /v1/chat/completions with one of: "+strings.Join(s.reg.Models(), ", "),
 		"unsupported_endpoint", "unsupported_endpoint", 0)
@@ -1349,11 +1445,11 @@ func (s *Server) handleTokenAdd(w http.ResponseWriter, r *http.Request) {
 	tokens := append(append([]string{}, cfg.AuthTokens...), req.Token)
 	if err := s.syncTokensAfterMutation(tokens); err != nil {
 		_ = s.pool.RemoveLastToken()
-		s.logger.Warn("dashboard token add rolled back", "err", err)
+		s.logger.Warn("dashboard token add rolled back", "remote", remoteHost(r), "err", err)
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
 	}
-	s.logger.Info("dashboard token added", "index", idx)
+	s.logger.Info("dashboard token added", "remote", remoteHost(r), "index", idx)
 	s.dash.RenderConfigResult(w, r, true, "Token added at index "+strconv.Itoa(idx)+" and persisted to .env.")
 }
 
@@ -1391,14 +1487,14 @@ func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
 		// handleTokenAdd's rollback).
 		if removed != "" {
 			if _, addErr := s.pool.AddToken(removed); addErr != nil {
-				s.logger.Warn("dashboard token remove rollback re-add failed", "err", addErr)
+				s.logger.Warn("dashboard token remove rollback re-add failed", "remote", remoteHost(r), "err", addErr)
 			}
 		}
-		s.logger.Warn("dashboard token remove rolled back", "err", err)
+		s.logger.Warn("dashboard token remove rolled back", "remote", remoteHost(r), "err", err)
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
 	}
-	s.logger.Info("dashboard token removed")
+	s.logger.Info("dashboard token removed", "remote", remoteHost(r))
 	s.dash.RenderConfigResult(w, r, true, "Last token removed and persisted to .env.")
 }
 
@@ -1717,12 +1813,93 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		s.dash.RenderConfigResult(w, r, false, "Configuration rejected: "+err.Error())
 		return
 	}
+	oldCfg := s.cfg.Load()
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
 	s.logger.Info("dashboard config saved and reloaded",
+		"remote", remoteHost(r), "changed_keys", changedConfigKeys(oldCfg, &newCfg),
 		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	s.dash.RenderConfigResult(w, r, true, "Saved and reloaded — effective configuration updated.")
+}
+
+// effectiveConfigKV renders cfg as a key→normalized-value map of the
+// effective config surface (mirrors the dashboard config editor's effective
+// table, T15). Secret-bearing values are reduced to counts or set/unset
+// markers, so the map is safe to diff for the changed_keys audit log: only
+// key NAMES are ever logged, never values.
+func effectiveConfigKV(cfg *config.Config) map[string]string {
+	return map[string]string{
+		"LISTEN_ADDR":                           cfg.ListenAddr,
+		"UPSTREAM_BASE_URL":                     cfg.UpstreamBaseURL,
+		"AUTH_TOKENS":                           strconv.Itoa(len(cfg.AuthTokens)),
+		"API_KEYS":                              strconv.Itoa(len(cfg.APIKeys)),
+		"ADMIN_TOKEN":                           boolWord(cfg.AdminToken != ""),
+		"ROTATION_INTERVAL":                     cfg.RotationInterval.String(),
+		"REQUEST_TIMEOUT":                       cfg.RequestTimeout.String(),
+		"SESSION_CALL_TIMEOUT":                  cfg.SessionCallTimeout.String(),
+		"COST_MODE":                             cfg.CostMode,
+		"TLS_FINGERPRINT":                       cfg.TLSFingerprint,
+		"REGISTRY_REFRESH":                      cfg.RegistryRefresh.String(),
+		"DEBUG_DUMP":                            strconv.FormatBool(cfg.DebugDump),
+		"LOG_FILE":                              cfg.LogFile,
+		"LOG_LEVEL":                             cfg.LogLevel,
+		"LOG_FORMAT":                            cfg.LogFormat,
+		"LOG_ACCESS":                            strconv.FormatBool(cfg.LogAccess),
+		"LOG_RING_SIZE":                         strconv.Itoa(cfg.LogRingSize),
+		"MAX_MESSAGES_PER_DAY":                  strconv.Itoa(cfg.MaxMessagesPerDay),
+		"MAX_SPEND_PER_DAY":                     strconv.FormatInt(cfg.MaxSpendPerDay, 10),
+		"IDLE_ROTATION_TIMEOUT":                 cfg.IdleRotationTimeout.String(),
+		"SAFE_MODE":                             strconv.FormatBool(cfg.SafeMode),
+		"HYBRID_MODE":                           strconv.FormatBool(cfg.HybridMode),
+		"MODELS_HIDE_UNAVAILABLE":               strconv.FormatBool(cfg.ModelsHideUnavailable),
+		"CORS_ALLOWED_ORIGIN":                   cfg.CORSAllowedOrigin,
+		"REQUEST_JITTER":                        cfg.RequestJitter.String(),
+		"CLI_VERSION":                           cfg.CLIVersion,
+		"MODEL_ALIASES":                         strconv.Itoa(len(cfg.ModelAliases)),
+		"TRANSIENT_RETRIES":                     strconv.Itoa(cfg.TransientRetries),
+		"SESSION_PERSIST":                       strconv.FormatBool(cfg.SessionPersist),
+		"SESSION_STATE_FILE":                    cfg.SessionStateFile,
+		"HTTP2_UPSTREAM":                        strconv.FormatBool(cfg.HTTP2Upstream),
+		"SESSION_CREATE_MAX_PARALLEL_GLOBAL":    strconv.Itoa(cfg.SessionCreateMaxParallelGlobal),
+		"SESSION_CREATE_MAX_PARALLEL_PER_MODEL": strconv.Itoa(cfg.SessionCreateMaxParallelPerModel),
+		"RUN_FINISH_QUEUE_SIZE":                 strconv.Itoa(cfg.RunFinishQueueSize),
+		"RUN_FINISH_INLINE_TIMEOUT":             cfg.RunFinishInlineTimeout.String(),
+		"RUNS_DRAIN_QUEUE_CAP":                  strconv.Itoa(cfg.RunsDrainQueueCap),
+		"RUNS_DRAIN_TTL":                        cfg.RunsDrainTTL.String(),
+		"SESSION_RE_ADMIT_LEAD":                 cfg.SessionReAdmitLead.String(),
+		"SESSION_PROBE_CACHE_TTL":               cfg.SessionProbeCacheTTL.String(),
+		"WEBHOOK_URL":                           boolWord(cfg.WebhookURL != ""),
+		"FALLBACK_AFTER_MS":                     cfg.FallbackAfter.String(),
+		"FALLBACK_MODEL":                        strconv.Itoa(len(cfg.FallbackModels)),
+		"ADOPT_CLI_SESSION":                     strconv.FormatBool(cfg.AdoptCLISession),
+		"WAITING_ROOM_CHAIN":                    strconv.FormatBool(cfg.WaitingRoomChain),
+	}
+}
+
+// boolWord renders a boolean flag as "set"/"unset" for the redacted
+// effective-config table (never the raw value).
+func boolWord(v bool) string {
+	if v {
+		return "set"
+	}
+	return "unset"
+}
+
+// changedConfigKeys returns the sorted names of effective config keys whose
+// normalized value differs between oldCfg and newCfg (T15 audit trail). The
+// values are compared only; never logged.
+func changedConfigKeys(oldCfg, newCfg *config.Config) []string {
+	oldKV := effectiveConfigKV(oldCfg)
+	newKV := effectiveConfigKV(newCfg)
+	var changed []string
+	for k, v := range newKV {
+		if oldKV[k] != v {
+			changed = append(changed, k)
+		}
+	}
+	sort.Strings(changed)
+	return changed
 }
 
 // writeFileAtomic writes data to path via a temp file + rename: readers never
@@ -1786,6 +1963,53 @@ func bearerToken(r *http.Request) string {
 		return tok
 	}
 	return ""
+}
+
+// --- correlation ids ---
+
+// reqIDKey carries the per-request correlation id (req_id) through the
+// request context. The key type is unexported so only this package can
+// read/write it; the upstream client threads the same id a second way (via
+// ChatOptions.RequestID) for its do()/retry log lines.
+type reqIDKey struct{}
+
+// reqIDFrom returns the request's correlation id, or "" when the request
+// did not pass through the access wrapper (direct handler calls in tests).
+func reqIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(reqIDKey{}).(string)
+	return id
+}
+
+// newReqID mints a UUIDv4 correlation id from crypto/rand (RFC 4122 §4.4:
+// 122 random bits, version 4, variant 1). A rand failure is unrecoverable
+// in practice; fall back to a time-seeded hex id rather than failing the
+// request.
+func newReqID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// clientRequestID sanitizes the client's X-Request-Id header for logging:
+// trimmed, printable ASCII only (0x20-0x7e), max 64 runes. Returns "" when
+// the header is absent or fails the checks — the field is then omitted from
+// log lines (the proxy never trusts a client-supplied id as its correlation
+// key, D1).
+func clientRequestID(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+	if v == "" || utf8.RuneCountInString(v) > 64 {
+		return ""
+	}
+	for _, b := range []byte(v) {
+		if b < 0x20 || b > 0x7e {
+			return ""
+		}
+	}
+	return v
 }
 
 // --- chat ---
@@ -1856,7 +2080,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 // retry-once recovery, then relay the forced stream to the client through
 // relay. kind names the endpoint in request/done log lines.
 func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, stream bool, normalized []byte, reasoningEffort, kind string, relay relayFunc) {
-	ctx, phases := phasetiming.WithContext(r.Context())
+	// D1: the access wrapper minted the request's correlation id; direct
+	// handler calls (tests) mint here so it is never empty. The value is
+	// threaded into the request context AND into ChatOptions.RequestID so
+	// the upstream client's do()/retry lines share it.
+	reqID := reqIDFrom(r.Context())
+	if reqID == "" {
+		reqID = newReqID()
+	}
+	st := &chatTraceState{reqID: reqID, clientRequestID: clientRequestID(r)}
+	ctx, phases := phasetiming.WithContext(context.WithValue(r.Context(), reqIDKey{}, reqID))
 	start := time.Now()
 
 	agentID, _ := s.reg.AgentForModel(model)
@@ -1912,8 +2145,8 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 			if lie != nil {
 				refuseErr = &upstream.LimitedIpError{Model: lie.Model, Body: lie.Body, RetryAfter: time.Until(until)}
 			}
-			s.traceChat(nil, model, time.Since(start).Milliseconds(), "error", "model_ip_limited", phases.All())
-			s.writeError(w, r, refuseErr)
+			s.traceChat(nil, model, time.Since(start).Milliseconds(), "error", "model_ip_limited", phases.All(), st)
+			s.writeError(w, r, refuseErr, model, nil)
 			return
 		}
 	}
@@ -1936,7 +2169,7 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 				"invalid_request_error", "missing_bearer_token", 0)
 			return
 		}
-		up, lease, err = s.chatAttempt(ctx, model, normalized,
+		up, lease, err = s.chatAttempt(ctx, model, normalized, st,
 			acquireTimed(func(ctx context.Context, model string) (*pool.Lease, error) {
 				return s.pool.AcquireBridge(ctx, tok, model)
 			}),
@@ -1986,7 +2219,7 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 				return l, err
 			}
 		}
-		up, lease, err = s.chatAttempt(ctx, model, normalized,
+		up, lease, err = s.chatAttempt(ctx, model, normalized, st,
 			acquire,
 			s.pool.Chat,
 			func(l *pool.Lease) { s.pool.InvalidateSession(l.Token, l.SessionInstanceID) },
@@ -2002,12 +2235,12 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	}
 	if err != nil {
 		phases.Since(phasetiming.TotalMS, start)
-		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err), phases.All())
+		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err), phases.All(), st)
 		// Issue #114: a chat that died on a terminal upstream error must
 		// not leave its run FINISHing as completed — report it honestly
 		// (nil-safe: an acquire failure leaves no lease).
 		s.pool.MarkRunFailed(lease)
-		s.writeError(w, r, err)
+		s.writeError(w, r, err, model, lease)
 		return
 	}
 	defer func() { _ = up.Close() }()
@@ -2031,6 +2264,7 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	defer release()
 
 	routingAttrs := []any{
+		"req_id", reqID,
 		"token", tokenLabel(lease),
 		"model", model,
 		"agent", lease.AgentID,
@@ -2064,18 +2298,41 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	s.pool.RecordSpend(lease, stats.usageTokens)
 	phases.Since(phasetiming.TotalMS, start)
 	ms := time.Since(start).Milliseconds()
-	s.logger.Info(kind+" done", chatDoneAttrs(model, lease.AgentID, stream, ms, stats.chunks, stats.bytes, reasoningEffort)...)
-	s.traceChat(lease, model, ms, "ok", "", phases.All())
+	s.logger.Info(kind+" done", chatDoneAttrs(reqID, model, lease.AgentID, stream, ms, stats.chunks, stats.bytes, reasoningEffort)...)
+	s.traceChat(lease, model, ms, "ok", "", phases.All(), st)
 }
 
 // traceChat records a structured "chat trace" entry for the dashboard
 // traces page (the page filters the shared log ring by msg == "chat trace").
 // phases carries the per-request latency phases (#89); the map is ordered
-// deterministically for stable log output.
-func (s *Server) traceChat(lease *pool.Lease, model string, ms int64, status, errClass string, phases map[string]int64) {
+// deterministically for stable log output. st carries the retry-once
+// attempt history (nil-safe: a refusal before any chat attempt passes a
+// zero state).
+func (s *Server) traceChat(lease *pool.Lease, model string, ms int64, status, errClass string, phases map[string]int64, st *chatTraceState) {
 	attrs := []any{"model", model, "status", status, "ms", ms}
+	if st != nil {
+		if st.reqID != "" {
+			attrs = append(attrs, "req_id", st.reqID)
+		}
+		if st.clientRequestID != "" {
+			attrs = append(attrs, "client_request_id", st.clientRequestID)
+		}
+		if st.attempts > 0 {
+			attrs = append(attrs, "attempts", st.attempts)
+		}
+		if seen := st.statusesSeen(); seen != "" {
+			attrs = append(attrs, "statuses_seen", seen)
+		}
+		if st.retried {
+			attrs = append(attrs, "retried", true, "backoff_ms", st.backoffMs)
+		}
+	}
 	if lease != nil {
-		attrs = append(attrs, "token", tokenLabel(lease), "agent", lease.AgentID)
+		attrs = append(attrs,
+			"token", tokenLabel(lease),
+			"agent", lease.AgentID,
+			"trace_session_id", lease.Run.TraceSessionID,
+		)
 	}
 	if errClass != "" {
 		attrs = append(attrs, "error", errClass)
@@ -2120,8 +2377,9 @@ func chatErrClass(err error) string {
 
 // chatDoneAttrs builds the structured log attributes for a completed chat,
 // including reasoning effort when the client requested it.
-func chatDoneAttrs(model, agent string, stream bool, ms int64, chunks, bytes int, reasoningEffort string) []any {
+func chatDoneAttrs(reqID, model, agent string, stream bool, ms int64, chunks, bytes int, reasoningEffort string) []any {
 	attrs := []any{
+		"req_id", reqID,
 		"model", model,
 		"agent", agent,
 		"stream", stream,
@@ -2135,6 +2393,66 @@ func chatDoneAttrs(model, agent string, stream bool, ms int64, chunks, bytes int
 		attrs = append(attrs, "reasoning_effort", reasoningEffort)
 	}
 	return attrs
+}
+
+// chatTraceState accumulates the per-request attempt history for the chat
+// trace line: how many upstream chat attempts fired, the HTTP statuses
+// observed per attempt (success = 200), whether the retry-once recovery
+// re-acquired a lease, and the measured re-acquire wait before the retry.
+// Created in chatCore (which owns the req_id), filled by chatAttempt's
+// retry loop.
+type chatTraceState struct {
+	reqID           string
+	clientRequestID string
+	attempts        int
+	statuses        []int
+	retried         bool
+	backoffMs       int64
+}
+
+// statusesSeen renders the observed attempt statuses comma-joined
+// ("409,200"), or "" when no attempt status was observed.
+func (st *chatTraceState) statusesSeen() string {
+	if len(st.statuses) == 0 {
+		return ""
+	}
+	parts := make([]string, len(st.statuses))
+	for i, s := range st.statuses {
+		parts[i] = strconv.Itoa(s)
+	}
+	return strings.Join(parts, ",")
+}
+
+// attemptStatus extracts the upstream HTTP status carried by a chat error,
+// or 0 when the error carries none (wrapped sentinels such as
+// ErrSessionInvalid/ErrRunInvalid, and transport-level failures). A 0 is
+// skipped in statuses_seen — only observed statuses are listed.
+func attemptStatus(err error) int {
+	switch e := err.(type) {
+	case *upstream.UpstreamError:
+		return e.Status
+	case *upstream.CreditsError:
+		return e.Status
+	case *upstream.CapacityDeferredError:
+		return e.Status
+	case *upstream.SessionSupersededError:
+		return e.Status
+	case *upstream.SessionLimitError:
+		return e.Status
+	case *upstream.WaitingRoomRequiredError:
+		// The canonical 428 waiting_room_required (#94); the marker can
+		// ride 428/429 alike, 428 is the documented gate. No named
+		// net/http constant exists for 428, so spell it out.
+		return 428
+	case *upstream.RateLimitError:
+		// RateLimitError.Status is the upstream "429" string; parse when
+		// numeric, else the 429 bucket is implicit.
+		if n, perr := strconv.Atoi(e.Status); perr == nil {
+			return n
+		}
+		return http.StatusTooManyRequests
+	}
+	return 0
 }
 
 // chatAttempt runs the retry-once recovery loop for one chat request: chat
@@ -2151,6 +2469,7 @@ func (s *Server) chatAttempt(
 	ctx context.Context,
 	model string,
 	normalized []byte,
+	st *chatTraceState,
 	acquire func(context.Context, string) (*pool.Lease, error),
 	chat func(context.Context, *pool.Lease, upstream.ChatOptions, []byte) (io.ReadCloser, error),
 	invalidateSession func(*pool.Lease),
@@ -2187,6 +2506,9 @@ func (s *Server) chatAttempt(
 		RunID:             lease.Run.RunID,
 		SessionInstanceID: lease.SessionInstanceID,
 		TraceSessionID:    lease.Run.TraceSessionID,
+		// D1: the request's correlation id, threaded to the upstream
+		// client so its do()/retry log lines share the server's req_id.
+		RequestID: st.reqID,
 		// Issue #113: stamp the run's 1-based per-chat step counter so
 		// codebuff_metadata["llm_step_number"] matches the CLI (each chat
 		// call is one agent step; run-agent-step.ts increments per step).
@@ -2206,9 +2528,19 @@ func (s *Server) chatAttempt(
 
 	var up io.ReadCloser
 	attempts := 0
+	// failTime pins when the failed chat attempt returned; the measured
+	// re-acquire wait below becomes the trace's backoff_ms.
+	var failTime time.Time
+	// transientErr remembers the default-branch chat error so the retry
+	// announcement can log it AFTER the re-acquire (with a real backoff_ms).
+	var transientErr error
 	for {
+		chatStart := time.Now()
 		up, err = chat(ctx, lease, opts, normalized)
+		attempts++
+		st.attempts = attempts
 		if err == nil {
+			st.statuses = append(st.statuses, http.StatusOK)
 			// Issue #74 P2: a successful chat is egress-level proof the
 			// model is servable again — drop any (egress, model) unfit mark.
 			// Only marks created before THIS lease's acquisition (a retry
@@ -2219,10 +2551,21 @@ func (s *Server) chatAttempt(
 			if !lease.AcquiredAt.IsZero() {
 				s.pool.ClearModelUnfitBefore(effectiveModel, lease.AcquiredAt)
 			}
+			if attempts > 1 {
+				// T13: the retry-once recovery landed — one Debug line that
+				// greps the whole retry chain by req_id (ms = the retry
+				// chat call's duration).
+				s.logger.Debug("chat retry succeeded",
+					"attempts", attempts, "req_id", st.reqID,
+					"ms", time.Since(chatStart).Milliseconds())
+			}
 			released = true // Disarm deferred release: ownership transferred to caller
 			return up, lease, nil
 		}
-		attempts++
+		if s := attemptStatus(err); s != 0 {
+			st.statuses = append(st.statuses, s)
+		}
+		failTime = time.Now()
 		switch {
 		case errors.Is(err, upstream.ErrModelIPLimited):
 			// Issue #74 P2: the egress IP is limited for the requested
@@ -2338,16 +2681,35 @@ func (s *Server) chatAttempt(
 			if errors.As(err, &ue) && ue.Retryable {
 				return nil, nil, err
 			}
-			if attempts > 1 {
+			// T8: a retry cannot succeed on a canceled context (the log
+			// watch showed `transient chat error, retrying once
+			// err="context canceled"`) — surface the original error instead
+			// of re-acquiring into a dead ctx.
+			if attempts > 1 || ctx.Err() != nil {
 				return nil, nil, err
 			}
-			s.logger.Debug("transient chat error, retrying once", "err", err)
+			transientErr = err
 		}
 		lease, err = acquire(ctx, effectiveModel)
 		if err != nil {
 			return nil, nil, err
 		}
 		released = false
+		st.retried = true
+		// The effective backoff before the retry: the re-acquire wait after
+		// the failed attempt (a waiting-room/session gate can stall it).
+		st.backoffMs = time.Since(failTime).Milliseconds()
+		if transientErr != nil {
+			// T13: logged here (not at the failure) so backoff_ms reflects
+			// the real re-acquire wait before the retry attempt.
+			s.logger.Debug("transient chat error, retrying once",
+				"err", transientErr,
+				"reason", chatErrClass(transientErr),
+				"backoff_ms", st.backoffMs,
+				"attempt", attempts,
+				"req_id", st.reqID)
+			transientErr = nil
+		}
 		// A fresh lease may bind a different model (fallback path): refresh
 		// the effective model + body so opts.Model, the body and the
 		// lease's session/run stay consistent.
@@ -2604,6 +2966,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := s.started.Unix()
 	snaps := s.pool.Snapshot()
 	models := s.reg.Models()
+	if len(models) == 0 {
+		// T16: an empty registry is an operational anomaly (the fallback
+		// table should always populate at boot) — surface it when a client
+		// actually asks, not at startup.
+		s.logger.Warn("model list requested with empty registry", "path", r.URL.Path, "remote", remoteHost(r), "model_count", 0)
+	}
 	hideUnavailable := s.cfg.Load().ModelsHideUnavailable
 	data := make([]map[string]any, 0, len(models))
 	for _, id := range models {
@@ -2860,21 +3228,53 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	sb.WriteString("\n")
 
+	sb.WriteString("# HELP freebuff_proxy_rate_limit_events_total Upstream rate-limit classifications per token and code\n")
+	sb.WriteString("# TYPE freebuff_proxy_rate_limit_events_total counter\n")
+	for _, snap := range snaps {
+		for code, n := range snap.RateLimitEvents {
+			if n > 0 {
+				fmt.Fprintf(&sb, "freebuff_proxy_rate_limit_events_total{token=\"%d\",code=\"%s\"} %d\n",
+					snap.Token+1, escapeLabelValue(code), n)
+			}
+		}
+	}
+	sb.WriteString("\n")
+
+	if s.logs != nil {
+		// T20: handled-record counters from the dashboard log ring. The key
+		// is logring's "level|msg" (level lowercased). msg is a free-form
+		// operator message, so the label is escaped like every upstream-
+		// derived label.
+		sb.WriteString("# HELP freebuff_proxy_log_events_total Log records handled per level and message\n")
+		sb.WriteString("# TYPE freebuff_proxy_log_events_total counter\n")
+		for key, n := range s.logs.Counts() {
+			level, msg, ok := strings.Cut(key, "|")
+			if !ok {
+				continue
+			}
+			fmt.Fprintf(&sb, "freebuff_proxy_log_events_total{level=\"%s\",msg=\"%s\"} %d\n",
+				escapeLabelValue(level), escapeLabelValue(msg), n)
+		}
+		sb.WriteString("\n")
+	}
+
 	_, _ = w.Write([]byte(sb.String()))
 }
 
 // handleReload handles POST /admin/reload for hot configuration reloads (#26).
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
-	s.logger.Info("admin reload requested")
+	s.logger.Info("admin reload requested", "remote", remoteHost(r), "path", r.URL.Path)
 	newCfg, err := config.Load(s.configPath)
 	if err != nil {
+		s.logger.Warn("admin reload failed", "remote", remoteHost(r), "path", r.URL.Path, "err", err)
 		s.writeJSONError(w, http.StatusInternalServerError, "failed to reload config: "+err.Error(), "internal_error", "reload_failed", 0)
 		return
 	}
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
-	s.logger.Info("config reloaded successfully", "auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
+	s.logger.Info("config reloaded successfully", "remote", remoteHost(r), "path", r.URL.Path,
+		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":      "ok",
@@ -2941,10 +3341,42 @@ func defaultHintForCode(code, message string) string {
 	}
 }
 
+// rateLimitWarnDedupe gates identical (token, code, window) `request failed`
+// WARNs (D6): the first + every 50th occurrence fire; the per-key counter
+// always increments so a silent burst stays countable, and the client
+// response is always written. Package-level = per-process, shared by every
+// server instance.
+var rateLimitWarnDedupe = struct {
+	mu sync.Mutex
+	m  map[string]int64
+}{}
+
+// resetRateLimitWarnDedupe clears the dedupe ledger (test hook).
+func resetRateLimitWarnDedupe() {
+	rateLimitWarnDedupe.mu.Lock()
+	defer rateLimitWarnDedupe.mu.Unlock()
+	rateLimitWarnDedupe.m = make(map[string]int64)
+}
+
+// rateLimitWarnShouldLog reports whether the (token, code, window) WARN
+// should fire for this occurrence, always incrementing the occurrence count.
+func rateLimitWarnShouldLog(key string) bool {
+	rateLimitWarnDedupe.mu.Lock()
+	defer rateLimitWarnDedupe.mu.Unlock()
+	if rateLimitWarnDedupe.m == nil {
+		rateLimitWarnDedupe.m = make(map[string]int64)
+	}
+	rateLimitWarnDedupe.m[key]++
+	n := rateLimitWarnDedupe.m[key]
+	return n == 1 || n%50 == 0
+}
+
 // writeError maps any error from the pool/upstream to the PRD §6 matrix and
 // logs it once. Canceled client contexts are logged at debug and dropped (no
-// response written).
-func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
+// response written). model and lease come from the call site: model is the
+// request's effective model, lease the acquired token lease (nil when the
+// error fired before acquisition — e.g. an unfit-egress refusal).
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error, model string, lease *pool.Lease) {
 	if errors.Is(err, context.Canceled) {
 		s.logger.Debug("request canceled by client", "err", err)
 		return
@@ -2958,6 +3390,8 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	code := "upstream_unavailable"
 	message := err.Error()
 	var retryAfter time.Duration
+	var resetAt time.Time
+	window := "" // T7 ledger window; set for rate-limit errors (dedupe key)
 
 	var wr *session.WaitingRoomError
 	var uwr *upstream.WaitingRoomError
@@ -2976,6 +3410,7 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.As(err, &be):
 		status, code = http.StatusForbidden, "account_banned"
 		message, retryAfter = be.Error(), time.Until(be.ResumesAt)
+		resetAt = be.ResumesAt
 		if retryAfter < 0 {
 			retryAfter = 0
 		}
@@ -2993,6 +3428,7 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 			code = "peak_hours"
 		}
 		message, retryAfter = rle.Error(), rle.RetryAfter
+		resetAt, window = rle.ResetAt, rle.Window
 		if !rle.ResetAt.IsZero() && rle.ResetAt.After(time.Now()) {
 			retryAfter = time.Until(rle.ResetAt)
 		}
@@ -3119,6 +3555,35 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 		message = "upstream request timed out: " + err.Error()
 	}
 
-	s.logger.Warn("request failed", "status", status, "code", code, "err", err)
+	attrs := []any{"status", status, "code", code, "err", err}
+	if r != nil {
+		if reqID := reqIDFrom(r.Context()); reqID != "" {
+			attrs = append(attrs, "req_id", reqID)
+		}
+	}
+	if retryAfter > 0 {
+		attrs = append(attrs, "retry_after", int(retryAfter.Seconds()))
+	}
+	if !resetAt.IsZero() {
+		attrs = append(attrs, "reset_at", resetAt.UTC().Format(time.RFC3339))
+	}
+	if lease != nil {
+		attrs = append(attrs, "token", tokenLabel(lease))
+	}
+	if model != "" {
+		attrs = append(attrs, "model", model)
+	}
+
+	if code == "rate_limited" {
+		// D6 dedupe: identical (token, code, window) WARNs fire on the 1st +
+		// every 50th; the counter always increments and the response is
+		// always written.
+		key := tokenLabel(lease) + "|" + code + "|" + window
+		if !rateLimitWarnShouldLog(key) {
+			s.writeJSONError(w, status, message, "upstream_error", code, retryAfter)
+			return
+		}
+	}
+	s.logger.Warn("request failed", attrs...)
 	s.writeJSONError(w, status, message, "upstream_error", code, retryAfter)
 }

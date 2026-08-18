@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2175,6 +2176,14 @@ func TestClassifyErrorMatrix(t *testing.T) {
 				hdr:       http.Header{"Retry-After": {"120"}},
 				wantRetry: 120 * time.Second,
 			},
+			{
+				name: "production limited free access message",
+				body: `{"error":"session_model_mismatch","message":"Limited free access is only available with DeepSeek V4 Flash or MiMo 2.5."}`,
+			},
+			{
+				name: "status variant with limited free access",
+				body: `{"status":"session_model_mismatch","message":"Limited free access is only available with DeepSeek V4 Flash."}`,
+			},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -3565,6 +3574,58 @@ func TestDeviceOSWireContract(t *testing.T) {
 	}
 }
 
+// TestReqIDContextHelpers pins the D1 ctx plumbing: withReqID stores the id
+// and ReqID reads it through descendant contexts (the timeout wraps in
+// ChatCompletions/do derive from the wrapped ctx).
+func TestReqIDContextHelpers(t *testing.T) {
+	if got := ReqID(context.Background()); got != "" {
+		t.Errorf("ReqID(background) = %q, want empty", got)
+	}
+	ctx := withReqID(context.Background(), "req-123")
+	if got := ReqID(ctx); got != "req-123" {
+		t.Errorf("ReqID = %q, want req-123", got)
+	}
+	child, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if got := ReqID(child); got != "req-123" {
+		t.Errorf("ReqID(child) = %q, want req-123 (value must survive descendant wraps)", got)
+	}
+}
+
+// TestDumpWriteFailureLogsWarn verifies T18: when DEBUG_DUMP is enabled but
+// the dump write fails (a regular file occupies the dump/ path), the failure
+// is logged as a WARN with path and err instead of being swallowed.
+func TestDumpWriteFailureLogsWarn(t *testing.T) {
+	orig := slog.Default()
+	var sink bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	t.Chdir(t.TempDir())
+	// A regular FILE named "dump": MkdirAll fails and WriteFile hits
+	// ENOTDIR/EEXIST — deterministic failure injection.
+	if err := os.WriteFile("dump", []byte("occupied"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	client, err := New("tok", testConfig("", func(c *config.Config) { c.DebugDump = true }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://www.codebuff.com/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.dump("chat", req, http.StatusOK, "response body")
+
+	logs := sink.String()
+	if !strings.Contains(logs, "debug dump write failed") {
+		t.Fatalf("dump WARN missing: %s", logs)
+	}
+	if !strings.Contains(logs, "path=") || !strings.Contains(logs, "err=") {
+		t.Errorf("dump WARN missing path/err attrs: %s", logs)
+	}
+}
+
 // TestClassifyLoadSheddingAndPeakHours pins issue #133: 429 bodies with the
 // load-saturation and peak-hours markers classify as bounded cooldowns with
 // distinct statuses — never the Pacific-midnight lock parseRateLimit would
@@ -3601,8 +3662,7 @@ func TestClassifyLoadSheddingAndPeakHours(t *testing.T) {
 
 	// The daily-cap path is untouched: a plain rate_limited 429 without the
 	// markers still goes through parseRateLimit's midnight default.
-	err := classifyError(http.StatusTooManyRequests, `{"status":"rate_limited","message":"daily quota"}`+`
-`, http.Header{})
+	err := classifyError(http.StatusTooManyRequests, `{"status":"rate_limited","message":"daily quota"}`, http.Header{})
 	var rle *RateLimitError
 	if !errors.As(err, &rle) {
 		t.Fatalf("plain 429 = %T %v, want *RateLimitError", err, err)

@@ -193,6 +193,74 @@ func TestLogsPageWithoutRing(t *testing.T) {
 	}
 }
 
+// TestLogsPageFilters pins the T19 filter row: ?level and ?msg (substring,
+// case-insensitive) render only matching rows, the empty state switches to
+// the filtered copy when a filter matches nothing, and the filter controls
+// are present for the hx-get wiring.
+func TestLogsPageFilters(t *testing.T) {
+	ts := newDashboardForPages(t, true) // seeds one INFO "hello ring" record
+
+	get := func(path string) string {
+		t.Helper()
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return string(mustReadAll(t, resp))
+	}
+
+	// The filter row renders: level select + msg input.
+	page := get("/logs")
+	for _, want := range []string{`name="level"`, `id="logs-msg"`, "all levels", "hx-get=\"/admin/logs\""} {
+		if !strings.Contains(page, want) {
+			t.Errorf("logs page missing filter control %q", want)
+		}
+	}
+
+	// level=warn excludes the INFO record and shows the filtered empty state.
+	page = get("/logs?level=warn")
+	if strings.Contains(page, "hello ring") {
+		t.Error("level=warn filter rendered an info record")
+	}
+	if !strings.Contains(page, "No matching log records") {
+		t.Error("level=warn filter should show the filtered empty state")
+	}
+
+	// level=info keeps the INFO record.
+	page = get("/logs?level=info")
+	if !strings.Contains(page, "hello ring") {
+		t.Error("level=info filter dropped the info record")
+	}
+
+	// msg is a case-insensitive substring.
+	for _, q := range []string{"?msg=ring", "?msg=RING", "?msg=hello"} {
+		page = get("/logs" + q)
+		if !strings.Contains(page, "hello ring") {
+			t.Errorf("msg filter %q dropped the matching record", q)
+		}
+	}
+
+	// A msg matching nothing flips to the filtered empty state.
+	page = get("/logs?msg=zzz-none")
+	if strings.Contains(page, "hello ring") {
+		t.Error("msg=zzz-none filter rendered a non-matching record")
+	}
+	if !strings.Contains(page, "No matching log records") {
+		t.Error("msg=zzz-none filter should show the filtered empty state")
+	}
+
+	// Combined level+msg filter.
+	page = get("/logs?level=info&msg=ring")
+	if !strings.Contains(page, "hello ring") {
+		t.Error("combined info+ring filter dropped the matching record")
+	}
+	page = get("/logs?level=warn&msg=ring")
+	if strings.Contains(page, "hello ring") {
+		t.Error("combined warn+ring filter rendered a non-matching record")
+	}
+}
+
 func TestMetricsPageRendersSparklines(t *testing.T) {
 	cfg := &config.Config{
 		UpstreamBaseURL: "https://www.codebuff.com",

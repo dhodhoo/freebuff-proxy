@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -149,6 +150,7 @@ type Registry struct {
 	mu     sync.RWMutex
 	cfg    atomic.Pointer[config.Config] // swapped atomically on reload (SetConfig)
 	client *http.Client                  // fetch client; redirects followed, fetchTimeout applied
+	logger *slog.Logger                  // success-refresh INFO sink (nil = slog.Default())
 
 	sources       []string // override of the default 5 source URLs (tests)
 	lastAttempted []string // URLs tried during the most recent Refresh, in order
@@ -166,11 +168,20 @@ func New(cfg *config.Config, client *http.Client) *Registry {
 	if client == nil {
 		client = &http.Client{Timeout: fetchTimeout}
 	}
-	r := &Registry{client: client}
+	r := &Registry{client: client, logger: slog.Default()}
 	if cfg != nil {
 		r.cfg.Store(cfg)
 	}
 	return r
+}
+
+// SetLogger replaces the registry's log sink (nil restores slog.Default).
+// Used by tests and by hosts that want the refresh INFO on a custom logger.
+func (r *Registry) SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = slog.Default()
+	}
+	r.logger = l
 }
 
 // SetConfig atomically replaces the config the registry reads, so alias
@@ -199,6 +210,7 @@ func (r *Registry) SetSources(urls []string) {
 // kept and the error returned. Every URL actually attempted is recorded for
 // LastAttemptedSources (-doctor output).
 func (r *Registry) Refresh(ctx context.Context) error {
+	start := time.Now()
 	candidates := r.sourceCandidates()
 
 	texts := make([]string, len(candidates))
@@ -244,7 +256,11 @@ func (r *Registry) Refresh(ctx context.Context) error {
 	r.agentModels = agentModels
 	r.modelToAgent = modelToAgent
 	r.allModels = allModels
+	agents, models := len(agentModels), len(allModels)
 	r.mu.Unlock()
+	// T18: the success path was silent (the failure path logs in main.go) —
+	// surface the refresh outcome with agents/models counts and duration.
+	r.logger.Info("registry refreshed", "agents", agents, "models", models, "ms", time.Since(start).Milliseconds())
 	return nil
 }
 

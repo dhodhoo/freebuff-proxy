@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 )
@@ -251,5 +252,74 @@ func TestHandleErrorStillRetains(t *testing.T) {
 	recent := h.Recent(1)
 	if len(recent) != 1 || recent[0].Message != "doomed" {
 		t.Errorf("ring entry missing after forward error: %+v", recent)
+	}
+}
+
+// TestCounts verifies the T20 counters: every handled record tallies by
+// "level|msg" with the level lowercased, clones (WithAttrs/WithGroup) share
+// the same counts, and the snapshot returned by Counts is independent of the
+// live ring (mutating it never skews later counts).
+func TestCounts(t *testing.T) {
+	h := NewHandler(discarding{}, 10)
+	logger := slog.New(h)
+	logger.Info("request handled", "path", "/healthz")
+	logger.Info("request handled", "path", "/metrics")
+	logger.Warn("pool exhausted")
+	logger.Error("upstream failed")
+	// Clones share the ring and therefore the counts.
+	logger.With("scope", "pool").Info("request handled")
+	logger.WithGroup("svc").Debug("trace line")
+
+	counts := h.Counts()
+	want := map[string]int64{
+		"info|request handled":  3,
+		"warn|pool exhausted":   1,
+		"error|upstream failed": 1,
+		"debug|trace line":      1,
+	}
+	if len(counts) != len(want) {
+		t.Fatalf("Counts() has %d keys %v, want %d (%v)", len(counts), counts, len(want), want)
+	}
+	for k, v := range want {
+		if counts[k] != v {
+			t.Errorf("Counts()[%q] = %d, want %d", k, counts[k], v)
+		}
+	}
+
+	// Snapshot independence: mutating the returned map must not affect the
+	// live ring, and a later Handle bumps only the live counter.
+	counts["info|request handled"] = 999
+	logger.Info("request handled")
+	if got := h.Counts()["info|request handled"]; got != 4 {
+		t.Errorf("Counts() after mutation+Handle = %d, want 4", got)
+	}
+}
+
+// TestCountsConcurrent drives Handle from many goroutines and verifies no
+// count is lost (the race detector owns the memory-safety side; this pins
+// the arithmetic).
+func TestCountsConcurrent(t *testing.T) {
+	h := NewHandler(discarding{}, 100)
+	logger := slog.New(h)
+	const goroutines = 16
+	const per = 50
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range per {
+				logger.Info("worker done")
+				logger.Warn("retry")
+			}
+		}()
+	}
+	wg.Wait()
+	counts := h.Counts()
+	if got := counts["info|worker done"]; got != goroutines*per {
+		t.Errorf("Counts()[info|worker done] = %d, want %d", got, goroutines*per)
+	}
+	if got := counts["warn|retry"]; got != goroutines*per {
+		t.Errorf("Counts()[warn|retry] = %d, want %d", got, goroutines*per)
 	}
 }

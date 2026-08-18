@@ -6,7 +6,9 @@ package stealth
 import (
 	cryptoRand "crypto/rand"
 	"encoding/binary"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -129,6 +131,29 @@ var (
 // DefaultProfile returns Chrome 126 as the default modern profile.
 func DefaultProfile() *Profile { return ProfileChrome126 }
 
+// logger is the package's Debug sink for profile-selection lines (T18),
+// settable via SetLogger so tests can capture them. atomic so a test
+// SetLogger can never race with a concurrent dial reading it; the zero
+// value falls back to the process logger.
+var logger atomic.Pointer[slog.Logger]
+
+// SetLogger replaces the package's log sink (nil restores slog.Default).
+// Used by tests to capture the profile-selection Debug line.
+func SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = slog.Default()
+	}
+	logger.Store(l)
+}
+
+// log returns the package log sink, defaulting to the process logger.
+func log() *slog.Logger {
+	if l := logger.Load(); l != nil {
+		return l
+	}
+	return slog.Default()
+}
+
 // Lookup returns the profile matching the given name (case-insensitive)
 // and true, or nil, false for unknown names.
 func Lookup(name string) (*Profile, bool) {
@@ -159,6 +184,8 @@ func Lookup(name string) (*Profile, bool) {
 // GetProfileForConnection returns a concrete profile for one connection.
 // For static profiles it returns p unchanged. For ProfileRandom or ProfileAuto,
 // it resolves a fresh profile and User-Agent using crypto/rand (#3, #21).
+// Every resolution logs a Debug line naming the selected profile (T18), so
+// an operator can correlate each connection to its TLS fingerprint.
 func GetProfileForConnection(p *Profile) *Profile {
 	if p == nil {
 		p = DefaultProfile()
@@ -171,14 +198,18 @@ func GetProfileForConnection(p *Profile) *Profile {
 			ProfileEdge126,
 		}
 		idx := cryptoRandInt(len(presets))
-		return presets[idx]
+		selected := presets[idx]
+		log().Debug("stealth profile selected", "profile", string(selected.ID))
+		return selected
 	}
 	if p.ID == ProfileIDRandom {
 		prof := *p
 		prof.UserAgent = RandomUserAgent()
 		prof.SecChUA, prof.SecChUAPlatform = clientHintsForUA(prof.UserAgent)
+		log().Debug("stealth profile selected", "profile", string(prof.ID))
 		return &prof
 	}
+	log().Debug("stealth profile selected", "profile", string(p.ID))
 	return p
 }
 

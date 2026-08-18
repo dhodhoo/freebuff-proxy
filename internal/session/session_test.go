@@ -1,11 +1,14 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1487,6 +1490,311 @@ func TestSnapshotActiveUsersForIP(t *testing.T) {
 	}
 	if snap.Status != "active" {
 		t.Errorf("Status = %q, want active", snap.Status)
+	}
+}
+
+// — T9/T10/T11: session lifecycle telemetry (wave 2). —
+
+// captureLogs swaps slog's default handler for a buffer-backed text handler
+// at Debug level and returns the restore function. Session tests run
+// sequentially (no t.Parallel), so swapping the process default is safe.
+func captureLogs(buf *bytes.Buffer) func() {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return func() { slog.SetDefault(prev) }
+}
+
+// TestTerminalEventReasons pins T9: every terminal session event carries a
+// reason from the vocabulary (ended|superseded|shutdown|model_lock|expired|
+// 409|poll|store), and session invalidated gains the triggering HTTP status
+// when known.
+func TestTerminalEventReasons(t *testing.T) {
+	t.Run("invalidated carries caller reason and status", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		mgr.InvalidateWithReason("expired", 400)
+		got := buf.String()
+		if !strings.Contains(got, `msg="session invalidated"`) ||
+			!strings.Contains(got, "reason=expired") ||
+			!strings.Contains(got, "status=400") {
+			t.Errorf("invalidated log missing reason/status:\n%s", got)
+		}
+	})
+
+	t.Run("bare invalidate defaults to 409 reason", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		mgr.Invalidate()
+		got := buf.String()
+		if !strings.Contains(got, `msg="session invalidated"`) || !strings.Contains(got, "reason=409") {
+			t.Errorf("bare Invalidate log missing default reason=409:\n%s", got)
+		}
+	})
+
+	t.Run("ended carries reason ended", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		if err := mgr.EndSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, `msg="session ended"`) || !strings.Contains(got, "reason=ended") {
+			t.Errorf("ended log missing reason=ended:\n%s", got)
+		}
+	})
+
+	t.Run("shutdown carries reason shutdown", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		store := NewStore(filepath.Join(t.TempDir(), "state.json"))
+		mgr := newTestManagerWithStore(t, mock, store)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		if err := mgr.Shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, `msg="session ended on shutdown"`) || !strings.Contains(got, "reason=shutdown") {
+			t.Errorf("shutdown log missing reason=shutdown:\n%s", got)
+		}
+	})
+
+	t.Run("dropped during poll carries poll reason and status", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTooEarly) // 428 waiting_room_required
+			_, _ = io.WriteString(w, `{"error":"waiting_room_required"}`)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		_ = mgr.Poll(context.Background())
+		got := buf.String()
+		if !strings.Contains(got, `msg="session dropped during poll"`) ||
+			!strings.Contains(got, "reason=poll") ||
+			!strings.Contains(got, "status=waiting_room_required") {
+			t.Errorf("poll drop log missing reason=poll/status:\n%s", got)
+		}
+	})
+
+	t.Run("ended during poll maps superseded reason", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mgr := newTestManager(t, mock)
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"superseded","instanceId":"inst-abc-123"}`)
+		}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		if err := mgr.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, `msg="session ended during poll"`) ||
+			!strings.Contains(got, "reason=superseded") ||
+			!strings.Contains(got, "status=superseded") {
+			t.Errorf("poll end log missing reason=superseded/status:\n%s", got)
+		}
+	})
+
+	t.Run("recreated maps upstream status to table reason", func(t *testing.T) {
+		mock := testutil.NewMock()
+		defer mock.Close()
+		mock.SessionSequence = []string{"none", "active"}
+		mgr := newTestManager(t, mock)
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, `msg="session recreated"`) ||
+			!strings.Contains(got, "reason=ended") ||
+			!strings.Contains(got, "status=none") {
+			t.Errorf("recreated log missing table reason/status:\n%s", got)
+		}
+	})
+}
+
+// TestReAdmitStormDetector pins T10: more than 3 invalidations within 60s
+// emit exactly ONE "session re-admit storm" summary with the count,
+// duration_ms, superseded, and burned_slots fields; isolated invalidations
+// stay quiet; the detector re-arms only after a full quiet window.
+func TestReAdmitStormDetector(t *testing.T) {
+	base := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+
+	t.Run("isolated and three-in-window stay quiet", func(t *testing.T) {
+		now := base
+		m := &Manager{now: func() time.Time { return now }}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(30 * time.Second)
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(29 * time.Second)
+		m.InvalidateWithReason("expired", 400) // 3 within 59s: not >3
+		if got := buf.String(); strings.Contains(got, "session re-admit storm") {
+			t.Fatalf("isolated/3-in-window invalidations emitted a storm summary:\n%s", got)
+		}
+	})
+
+	t.Run("burst fires one summary then suppresses until quiet", func(t *testing.T) {
+		now := base
+		m := &Manager{now: func() time.Time { return now }}
+		var buf bytes.Buffer
+		restore := captureLogs(&buf)
+		defer restore()
+
+		m.InvalidateWithReason("superseded", 409) // t+0s
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("superseded", 409) // t+1s
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400) // t+2s
+		now = now.Add(time.Second)
+		m.recordReAdmitTrigger()               // pre-emptive re-admit in the window
+		m.InvalidateWithReason("expired", 400) // t+3s: 4th in window → storm
+
+		got := buf.String()
+		if n := strings.Count(got, "session re-admit storm"); n != 1 {
+			t.Fatalf("storm summaries = %d, want 1:\n%s", n, got)
+		}
+		for _, want := range []string{"count=4", "duration_ms=3000", "superseded=2", "burned_slots=1"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("storm summary missing %s:\n%s", want, got)
+			}
+		}
+
+		// A 5th invalidation right after the burst is suppressed.
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400)
+		if n := strings.Count(buf.String(), "session re-admit storm"); n != 1 {
+			t.Fatalf("storm summaries after 5th invalidation = %d, want still 1 (suppressed):\n%s", n, buf.String())
+		}
+
+		// After a full quiet window the detector re-arms: a new burst of 4
+		// fires a second summary.
+		now = now.Add(70 * time.Second) // 70s past the last summary
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400)
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400) // 4th in window, quiet passed
+		if n := strings.Count(buf.String(), "session re-admit storm"); n != 2 {
+			t.Fatalf("storm summaries after re-arm burst = %d, want 2:\n%s", n, buf.String())
+		}
+	})
+}
+
+// TestReAdmitStormTracksPreemptiveTriggers wires the burned_slots count to
+// the real pre-emptive re-admit path (issue #99): a triggered re-admit
+// whose session is then invalidated in a storm counts as a burned slot.
+func TestReAdmitStormTracksPreemptiveTriggers(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	var creates atomic.Int32
+	mock.SessionHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusOK, map[string]any{"status": "active", "instanceId": "inst-1", "expiresAt": time.Now().Add(30 * time.Minute).Format(time.RFC3339)})
+			return
+		}
+		n := creates.Add(1)
+		id := "inst-1"
+		if n >= 2 {
+			id = "inst-2"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "active", "instanceId": id, "expiresAt": time.Now().Add(10 * time.Second).Format(time.RFC3339)})
+	}
+	m := newTestSession(t, mock)
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return now }
+	m.SetReAdmitLead(time.Minute)
+
+	if _, err := m.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Second call: cached active with ~5s left (10s expiry, 60s lead) —
+	// triggers the pre-emptive re-admit and rides the old session.
+	if _, err := m.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	restore := captureLogs(&buf)
+	defer restore()
+	for i := 0; i < 4; i++ {
+		now = now.Add(time.Second)
+		m.InvalidateWithReason("expired", 400)
+	}
+	got := buf.String()
+	if n := strings.Count(got, "session re-admit storm"); n != 1 {
+		t.Fatalf("storm summaries = %d, want 1:\n%s", n, got)
+	}
+	if !strings.Contains(got, "burned_slots=1") {
+		t.Errorf("burned_slots missing/inaccurate, want 1 pre-emptive trigger in window:\n%s", got)
+	}
+}
+
+// TestHeartbeatPollFields pins T11: the liveness poll's Debug line carries
+// instance/ms/status so ops can see each heartbeat beat and its latency.
+func TestHeartbeatPollFields(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	restore := captureLogs(&buf)
+	defer restore()
+	if err := mgr.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, `msg="session: heartbeat poll"`) ||
+		!strings.Contains(got, "instance_id=") ||
+		!strings.Contains(got, "ms=") ||
+		!strings.Contains(got, "status=active") {
+		t.Errorf("heartbeat poll log missing instance/ms/status:\n%s", got)
 	}
 }
 

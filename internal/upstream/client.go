@@ -41,6 +41,7 @@ import (
 
 	"freebuff-proxy/internal/config"
 	"freebuff-proxy/internal/stealth"
+	"freebuff-proxy/internal/telemetry"
 )
 
 // Typed error sentinels. Callers use errors.Is against these; the concrete
@@ -216,7 +217,12 @@ type RateLimitError struct {
 	Limit       float64
 	RecentCount float64
 	ResetAt     time.Time
-	Body        string // truncated upstream body
+	// Window is the T7 ledger window for this refusal (body "1 minute"/
+	// "30 minutes" text, else "reset" when ResetAt is set, else
+	// "retry-after" when RetryAfter is set, else "none") — reused by the
+	// server's `request failed` WARN dedupe.
+	Window string
+	Body   string // truncated upstream body
 }
 
 func (e *RateLimitError) Error() string {
@@ -511,6 +517,11 @@ type ChatOptions struct {
 	Model             string
 	RunID             string
 	SessionInstanceID string // "" when the session is disabled
+	// RequestID is the server's per-request correlation id (D1): the
+	// access wrapper mints it once and threads it here so the client's
+	// do()/retry log lines (upstream ok/error/transient/retry) share the
+	// server's req_id. Never sent upstream.
+	RequestID string
 	// TraceSessionID is the per-run trace id minted once by the run manager
 	// (crypto/rand UUID) and reused across the run's requests, mirroring the
 	// CLI (run.ts: previousRun?.traceSessionId ?? randomUUID). Injected as
@@ -571,6 +582,14 @@ type Client struct {
 	// Counters surfaced via the pool snapshot for /metrics.
 	transientRetries     atomic.Int64 // transient transport failures retried
 	fingerprintRotations atomic.Int64 // pinned fingerprint swaps ahead of a retry
+
+	// rateLimitEvents is the T7 rate-limit ledger: upstream rate-limit
+	// classifications counted by body code (rate_limited, spend_limited,
+	// ip_capped, insufficient_quota, limit_burst_rate,
+	// free_mode_rate_limited, ...). rateLimitMu guards the map; values are
+	// atomics so snapshot reads never race a concurrent classification.
+	rateLimitMu     sync.Mutex
+	rateLimitEvents map[string]*atomic.Int64
 
 	// waitingRoomRequired records that the last upstream refusal was a 428
 	// waiting_room_required (issue #94): the pre-session ad-chain + streak
@@ -668,6 +687,7 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 		transientRetriesLimit: cfg.TransientRetries,
 		http2Upstream:         cfg.HTTP2Upstream,
 		risk:                  stealth.DefaultRiskEngine,
+		rateLimitEvents:       make(map[string]*atomic.Int64),
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -779,12 +799,36 @@ func NewWithIndex(token string, tokenIndex int, cfg *config.Config) (*Client, er
 	return c, nil
 }
 
+// reqIDKey carries the request correlation id (opts.RequestID) through the
+// request context for the do()/retry log lines. The key type is unexported;
+// the server threads the same id via ChatOptions.RequestID (its own
+// unexported server-side key is separate).
+type reqIDKey struct{}
+
+// withReqID returns a context carrying the request correlation id.
+func withReqID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, reqIDKey{}, id)
+}
+
+// ReqID returns the request correlation id carried in ctx, or "" when the
+// call was not made through ChatCompletions with opts.RequestID set (e.g.
+// session/run management calls).
+func ReqID(ctx context.Context) string {
+	id, _ := ctx.Value(reqIDKey{}).(string)
+	return id
+}
+
 // ChatCompletions POSTs an OpenAI-shaped request to the upstream chat
 // endpoint, injecting the CLI envelope, and returns the raw SSE body reader
 // on 2xx. On error status it drains (up to 500 chars), classifies, and
 // returns a typed error. The returned reader must be closed; closing it
 // releases the connection.
 func (c *Client) ChatCompletions(ctx context.Context, opts ChatOptions, body []byte) (io.ReadCloser, error) {
+	// D1: thread the server's correlation id into the request context so
+	// every do()/retry log line for this chat shares the server's req_id.
+	if opts.RequestID != "" {
+		ctx = withReqID(ctx, opts.RequestID)
+	}
 	if c.requestJitter > 0 {
 		var b [8]byte
 		_, _ = cryptoRand.Read(b[:])
@@ -1432,8 +1476,32 @@ func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, c
 				}
 				return nil, nil, fmt.Errorf("upstream: %s %s: %w", req.Method, req.URL.Path, werr)
 			}
+			if resp.StatusCode >= 400 {
+				// T5 wire transparency: error responses are read (2KB cap),
+				// logged as `upstream response` (redacted, ≤500 runes), and
+				// re-wrapped so the caller's classification parses the same
+				// body. Never logged as `upstream ok` — a transport-level
+				// 200 and an upstream 429 are different classes of event.
+				bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+				_ = resp.Body.Close()
+				bodyText := telemetry.RedactSecrets(string(bodyBytes))
+				class := errClassName(classifyError(resp.StatusCode, bodyText, resp.Header))
+				attrs := []any{
+					"method", req.Method, "path", req.URL.Path,
+					"status", resp.StatusCode, "ms", time.Since(start).Milliseconds(),
+					"class", class,
+					"body", truncateRunes(bodyText, 500),
+				}
+				if reqID := ReqID(ctx); reqID != "" {
+					attrs = append(attrs, "req_id", reqID)
+				}
+				slog.Debug("upstream response", attrs...)
+				resp.Body = io.NopCloser(strings.NewReader(bodyText))
+				return resp, cancel, nil
+			}
 			slog.Debug("upstream ok", "method", req.Method, "path", req.URL.Path,
-				"status", resp.StatusCode, "ms", time.Since(start).Milliseconds())
+				"status", resp.StatusCode, "ms", time.Since(start).Milliseconds(),
+				"req_id", ReqID(ctx))
 			return resp, cancel, nil
 		}
 
@@ -1446,7 +1514,8 @@ func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, c
 			body, bodyErr := replayBody()
 			if bodyErr != nil {
 				slog.Debug("upstream retry aborted: body replay failed",
-					"token", c.tokenIndex+1, "attempt", attempt, "err", bodyErr)
+					"token", c.tokenIndex+1, "attempt", attempt, "err", bodyErr,
+					"req_id", ReqID(ctx))
 			} else {
 				// Count the retry only once the replay succeeded: the counter
 				// reflects retries that actually fired, not aborted ones.
@@ -1455,7 +1524,7 @@ func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, c
 				req.Close = true // fresh connection for the retry
 				slog.Debug("upstream transient failure, retrying",
 					"token", c.tokenIndex+1, "attempt", attempt, "reason", err.Error(),
-					"path", req.URL.Path)
+					"path", req.URL.Path, "req_id", ReqID(ctx))
 				timer := time.NewTimer(c.retryDelay())
 				select {
 				case <-timer.C:
@@ -1472,7 +1541,7 @@ func (c *Client) do(req *http.Request, timeout time.Duration) (*http.Response, c
 		}
 
 		slog.Debug("upstream error", "method", req.Method, "path", req.URL.Path,
-			"ms", time.Since(start).Milliseconds(), "err", err)
+			"ms", time.Since(start).Milliseconds(), "err", err, "req_id", ReqID(ctx))
 		if cancel != nil {
 			cancel()
 		}
@@ -1524,6 +1593,35 @@ func (c *Client) TransientRetries() int64 { return c.transientRetries.Load() }
 // retries this client served (same-session retries under the
 // TRANSIENT_RETRIES budget, issue #75).
 func (c *Client) CapacityDeferredRetries() int64 { return c.capacityDeferredRetries.Load() }
+
+// countRateLimitEvent increments the per-code rate-limit ledger (T7). The
+// map entry is created lazily so clients built without the constructor
+// (tests, bridge entries) still record safely.
+func (c *Client) countRateLimitEvent(code string) {
+	c.rateLimitMu.Lock()
+	ctr := c.rateLimitEvents[code]
+	if ctr == nil {
+		ctr = &atomic.Int64{}
+		if c.rateLimitEvents == nil {
+			c.rateLimitEvents = make(map[string]*atomic.Int64)
+		}
+		c.rateLimitEvents[code] = ctr
+	}
+	c.rateLimitMu.Unlock()
+	ctr.Add(1)
+}
+
+// RateLimitEvents returns a copy of this client's per-code rate-limit
+// classification counters (pool snapshot /metrics aggregation).
+func (c *Client) RateLimitEvents() map[string]int64 {
+	c.rateLimitMu.Lock()
+	defer c.rateLimitMu.Unlock()
+	out := make(map[string]int64, len(c.rateLimitEvents))
+	for code, ctr := range c.rateLimitEvents {
+		out[code] = ctr.Load()
+	}
+	return out
+}
 
 // PendingWaitingRoomChain reports whether the client last classified a 428
 // waiting_room_required (issue #94) and the pre-session chain has not been
@@ -2050,6 +2148,16 @@ func (c *Client) classify(status int, body string, hdr http.Header) error {
 	if errors.Is(err, ErrWaitingRoomRequired) {
 		c.waitingRoomRequired.Store(true)
 	}
+	// T7 ledger: count every rate-limit-family classification by its
+	// upstream body code and surface one Debug line carrying the FULL
+	// (redacted) body, so the distinct refusal codes (free_mode_rate_limited,
+	// insufficient_quota, limit_burst_rate, ip_capped, spend_limited,
+	// rate_limited, ...) are distinguishable in logs before the #133
+	// behavior fix lands.
+	if code, window := rateLimitInfo(body, err); code != "" {
+		c.countRateLimitEvent(code)
+		logRateLimitClassified(status, body, code, window, err)
+	}
 	return err
 }
 
@@ -2124,15 +2232,14 @@ func classifyError(status int, body string, hdr http.Header) error {
 		// Client.classify wrapper records the flag so the pool can fire the
 		// gated WAITING_ROOM_CHAIN before the next create.
 		return &WaitingRoomRequiredError{RetryAfter: retryAfter, Detail: truncate(body, 200)}
-	case containsAny(lower, "session_model_mismatch") && containsAny(lower, "limited") && containsAny(lower, "on this"):
-		// The egress IP cannot serve the requested model. The session row is
-		// fine — it stays bound to its admitted model — so this is NOT
-		// session-invalid: invalidating would re-admit and burn a daily
-		// session slot. The server marks the refusal and the pool registry
-		// cools the (egress, model) pairing instead. The verified egress
-		// message is "model <id> is limited on this IP", so "on this"
-		// disambiguates from tier/plan wording ("limited to your current
-		// plan") that must fall through to ErrSessionInvalid below.
+	case containsAny(lower, "session_model_mismatch") && containsAny(lower, "limited"):
+		// The egress IP cannot serve the requested model (e.g. "Limited free
+		// access is only available with DeepSeek V4 Flash or MiMo 2.5." or
+		// "model <id> is limited on this IP"). The session row is fine — it
+		// stays bound to its admitted model — so this is NOT session-invalid:
+		// invalidating would re-admit and burn a daily session slot. The server
+		// marks the refusal and the pool registry cools the (egress, model)
+		// pairing instead.
 		return &LimitedIpError{RetryAfter: retryAfter, Body: truncate(body, 200)}
 	case containsAny(lower, "session_superseded"):
 		// #119: 409 session_superseded is a TERMINAL gate rejection
@@ -2176,6 +2283,163 @@ func classifyError(status int, body string, hdr http.Header) error {
 	default:
 		return &UpstreamError{Status: status, Body: truncate(body, 500), RetryAfter: retryAfter}
 	}
+}
+
+// rateLimitInfo derives the T7 ledger code and window for a rate-limit
+// classification. The classification must be in the rate-limit error family
+// (RateLimitError/IpCappedError/CapacityDeferredError) — 403 bans, 401 auth
+// refusals, waiting rooms and other gates never count; code is empty then
+// and nothing is logged.
+func rateLimitInfo(body string, err error) (code, window string) {
+	switch err.(type) {
+	case *RateLimitError, *IpCappedError, *CapacityDeferredError:
+	default:
+		return "", ""
+	}
+	code = rateLimitCode(body, err)
+	if code == "" {
+		return "", ""
+	}
+	return code, rateLimitWindow(body, err)
+}
+
+// rateLimitCode extracts the upstream refusal code from the body's
+// "error"/"type" field (free_mode_rate_limited, insufficient_quota,
+// limit_burst_rate, ip_capped, spend_limited, rate_limited, ...), falling
+// back to the classified error type when the body carries no code key.
+func rateLimitCode(body string, err error) string {
+	if code := bodyCode(body); code != "" {
+		return code
+	}
+	switch e := err.(type) {
+	case *CapacityDeferredError:
+		return "free_mode_capacity_deferred"
+	case *IpCappedError:
+		return "ip_capped"
+	case *RateLimitError:
+		if e.Status != "" {
+			return e.Status // load_shedding | peak_hours
+		}
+		return "rate_limited"
+	}
+	return ""
+}
+
+// bodyCode reads the first non-empty "error":"X" or "type":"X" string from a
+// JSON error body (the ledger's code source).
+func bodyCode(body string) string {
+	var raw struct {
+		Error string `json:"error"`
+		Type  string `json:"type"`
+	}
+	if json.Unmarshal([]byte(body), &raw) != nil {
+		return ""
+	}
+	if raw.Error != "" {
+		return raw.Error
+	}
+	return raw.Type
+}
+
+// rateLimitWindow maps a rate-limit classification to the shared window
+// table: the body's own "1 minute"/"30 minutes" text when present, else
+// "reset" when the error carries a reset timestamp, else "retry-after" when
+// it carries a retry delay, else "none".
+func rateLimitWindow(body string, err error) string {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "1 minute") {
+		return "1 minute"
+	}
+	if strings.Contains(lower, "30 minutes") {
+		return "30 minutes"
+	}
+	switch e := err.(type) {
+	case *RateLimitError:
+		if !e.ResetAt.IsZero() {
+			return "reset"
+		}
+		if e.RetryAfter > 0 {
+			return "retry-after"
+		}
+	case *IpCappedError:
+		if e.RetryAfter > 0 {
+			return "retry-after"
+		}
+	case *CapacityDeferredError:
+		if e.RetryAfter > 0 {
+			return "retry-after"
+		}
+	}
+	return "none"
+}
+
+// rateLimitFields extracts the retry-after delay and reset timestamp a
+// rate-limit-family error carries, for the classification Debug line.
+func rateLimitFields(err error) (time.Duration, time.Time) {
+	switch e := err.(type) {
+	case *RateLimitError:
+		return e.RetryAfter, e.ResetAt
+	case *IpCappedError:
+		return e.RetryAfter, time.Time{}
+	case *CapacityDeferredError:
+		return e.RetryAfter, time.Time{}
+	}
+	return 0, time.Time{}
+}
+
+// logRateLimitClassified emits the T7 ledger Debug line. The body is logged
+// in FULL (the 200-rune truncation applies to the HTTP error response only)
+// and must already be redacted by the caller.
+func logRateLimitClassified(status int, body, code, window string, err error) {
+	attrs := []any{
+		"status", status,
+		"code", code,
+		"window", window,
+		"body", body,
+	}
+	if retryAfter, resetAt := rateLimitFields(err); retryAfter > 0 {
+		attrs = append(attrs, "retry_after", int(retryAfter.Seconds()))
+		if !resetAt.IsZero() {
+			attrs = append(attrs, "reset_at", resetAt.UTC().Format(time.RFC3339))
+		}
+	}
+	slog.Debug("upstream rate limit classified", attrs...)
+}
+
+// errClassName names the classified error type for the `upstream response`
+// debug line (T5). Wrapped sentinel errors (auth/session/run refusals built
+// with fmt.Errorf) fall back to the generic upstream error class.
+func errClassName(err error) string {
+	switch err.(type) {
+	case *RateLimitError:
+		return "RateLimitError"
+	case *IpCappedError:
+		return "IpCappedError"
+	case *BanError:
+		return "BanError"
+	case *CountryBlockedError:
+		return "CountryBlockedError"
+	case *CreditsError:
+		return "CreditsError"
+	case *SessionLimitError:
+		return "SessionLimitError"
+	case *SessionSupersededError:
+		return "SessionSupersededError"
+	case *LimitedIpError:
+		return "LimitedIpError"
+	case *CapacityDeferredError:
+		return "CapacityDeferredError"
+	case *WaitingRoomError:
+		return "WaitingRoomError"
+	case *WaitingRoomRequiredError:
+		return "WaitingRoomRequiredError"
+	case *UpstreamError:
+		return "UpstreamError"
+	}
+	if err == nil {
+		return ""
+	}
+	return "UpstreamError"
 }
 
 // parseCountryBlock builds a CountryBlockedError from a 403 country_blocked
@@ -2376,6 +2640,10 @@ func parseRateLimit(body string, headerRetryAfter time.Duration) error {
 	if rle.RetryAfter <= 0 {
 		rle.RetryAfter = 60 * time.Second
 	}
+	// T7 ledger window, computed after ResetAt/RetryAfter are finalized
+	// (the Pacific-midnight fallback above sets ResetAt, so the window is
+	// "reset" for timestamp-less 429s).
+	rle.Window = rateLimitWindow(body, rle)
 	return rle
 }
 
@@ -2534,7 +2802,11 @@ func (c *Client) dump(kind string, req *http.Request, status int, body string) {
 		}
 	}
 	fmt.Fprintf(&buf, "\n[status %d]\n%s\n", status, truncate(body, 20000))
-	_ = os.WriteFile(path, buf.Bytes(), 0o600)
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		// T18: the write was previously swallowed (`_ = os.WriteFile`) —
+		// surface the failure so a broken dump dir is not silent.
+		slog.Warn("debug dump write failed", "path", path, "err", err)
+	}
 }
 
 func sanitizeName(p string) string {

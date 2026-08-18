@@ -47,6 +47,7 @@ func newTestServerCfg(t *testing.T, apiKeys []string, mut func(*config.Config), 
 		RegistryRefresh:    6 * time.Hour,
 		UpstreamBaseURL:    "https://www.codebuff.com",
 		APIKeys:            apiKeys,
+		LogAccess:          true,
 	}
 	if mut != nil {
 		mut(cfg)

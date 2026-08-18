@@ -255,7 +255,10 @@ All keys can be set via environment variables or the JSON config file passed to 
 | `TLS_FINGERPRINT` | `auto` | `auto`, `chrome120`, `chrome126`, `safari17`, `safari18`, `firefox120`, `firefox128`, `edge126`, `random` |
 | `DEBUG_DUMP` | `false` | Persist redacted traffic dumps to `./dump/` (mode 0600) |
 | `LOG_FILE` | `""` | Append log lines to a file (e.g. `./logs/proxy.log`) |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`, `trace` (trace = wire-level bodies) |
+| `LOG_FORMAT` | `text` | `text` (key=value, colored) or `json` (one JSON object per line) |
+| `LOG_ACCESS` | `true` | Log one `access` line per HTTP request (`false` disables; `/healthz`, `/metrics`, OPTIONS are rate-limited to 1/min regardless) |
+| `LOG_RING_SIZE` | `500` | In-memory log ring for `/admin/logs` (50–5000) |
 | `MAX_MESSAGES_PER_DAY` | `0` | Per-token daily cap on successful chats (`0` = unlimited, default; the upstream `429` lock is the real enforcement) |
 | `IDLE_ROTATION_TIMEOUT` | `0` | Finish runs after this idle period (`0` = disabled; `SAFE_MODE` sets 30m when unset) |
 | `SAFE_MODE` | `true` | Apply anti-ban presets (see below; set `false` to disable) |

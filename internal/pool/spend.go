@@ -333,6 +333,17 @@ func (p *Pool) recordSpend(token int, tokens int64) {
 		return
 	}
 	p.spendPerToken[token].add(tokens, time.Now())
+	p.logSpendBuckets(tokens)
+}
+
+// logSpendBuckets emits one Debug line per period bucket a spend record
+// updated (T18): bucket names the ledger bucket, spend_delta the tokens
+// added, period the wire-style period name. Debug level so the per-chat
+// ledger noise only appears when operators opt in.
+func (p *Pool) logSpendBuckets(tokens int64) {
+	p.logger.Debug("pool: spend bucket updated", "bucket", "day", "spend_delta", tokens, "period", "pacific_day")
+	p.logger.Debug("pool: spend bucket updated", "bucket", "week", "spend_delta", tokens, "period", "pacific_week")
+	p.logger.Debug("pool: spend bucket updated", "bucket", "month", "spend_delta", tokens, "period", "pacific_month")
 }
 
 // recordSpendEntry adds tokens to the lease's backing entry's ledger by
@@ -352,6 +363,7 @@ func (p *Pool) recordSpendEntry(entry *tokenEntry, tokens int64) {
 			return
 		}
 		p.spendPerToken[idx].add(tokens, time.Now())
+		p.logSpendBuckets(tokens)
 		return
 	}
 }
@@ -364,6 +376,7 @@ func (p *Pool) bridgeRecordSpend(entry *bridgeEntry, tokens int64) {
 	p.bridgeMu.Lock()
 	defer p.bridgeMu.Unlock()
 	entry.spend.add(tokens, time.Now())
+	p.logSpendBuckets(tokens)
 }
 
 // spendView is one ledger's snapshot for healthz (issue #87).

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -168,7 +169,7 @@ func errorResponse(t *testing.T, err error) (status int, hdr http.Header, body s
 	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	s.writeError(w, r, err)
+	s.writeError(w, r, err, "", nil)
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("writeError response is not JSON: %v: %s", err, w.Body.Bytes())
 	}
@@ -493,7 +494,7 @@ func TestWriteErrorModelIPLimited(t *testing.T) {
 	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	s.writeError(w, r, err)
+	s.writeError(w, r, err, "", nil)
 	if got := w.Header().Get("Retry-After"); got != "300" {
 		t.Errorf("Retry-After = %q, want 300", got)
 	}
@@ -501,7 +502,7 @@ func TestWriteErrorModelIPLimited(t *testing.T) {
 	// A zero RetryAfter must not emit the header.
 	w2 := httptest.NewRecorder()
 	r2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	s.writeError(w2, r2, &upstream.LimitedIpError{Body: "no window"})
+	s.writeError(w2, r2, &upstream.LimitedIpError{Body: "no window"}, "", nil)
 	if got := w2.Header().Get("Retry-After"); got != "" {
 		t.Errorf("Retry-After with zero RetryAfter = %q, want empty", got)
 	}
@@ -521,9 +522,50 @@ func TestWriteErrorBareModelIPLimitedSentinel(t *testing.T) {
 	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	s.writeError(w, r, upstream.ErrModelIPLimited)
+	s.writeError(w, r, upstream.ErrModelIPLimited, "", nil)
 	if got := w.Header().Get("Retry-After"); got != "" {
 		t.Errorf("Retry-After = %q, want none for bare sentinel", got)
+	}
+}
+
+// TestNewReqIDUUIDv4 pins the correlation-id mint (D1): RFC 4122 §4.4
+// shape — version nibble 4, variant bits 10 — and a fresh value per mint.
+func TestNewReqIDUUIDv4(t *testing.T) {
+	id := newReqID()
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !re.MatchString(id) {
+		t.Errorf("newReqID() = %q, want UUIDv4 shape", id)
+	}
+	if id2 := newReqID(); id2 == id {
+		t.Error("two mints produced the same id")
+	}
+}
+
+// TestClientRequestIDSanitize pins the X-Request-Id sanitizer (D1): trimmed,
+// printable ASCII only, max 64 runes, else dropped ("").
+func TestClientRequestIDSanitize(t *testing.T) {
+	cases := []struct {
+		hdr  string
+		want string
+	}{
+		{"", ""},
+		{"abc", "abc"},
+		{"  abc  ", "abc"}, // trimmed
+		{"a b", "a b"},     // inner spaces kept
+		{strings.Repeat("x", 64), strings.Repeat("x", 64)},
+		{strings.Repeat("x", 65), ""}, // >64 runes dropped
+		{"héllo", ""},                 // non-ASCII dropped
+		{"line\nbreak", ""},           // control character dropped
+		{"tab\there", ""},             // control character dropped
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		if c.hdr != "" {
+			r.Header.Set("X-Request-Id", c.hdr)
+		}
+		if got := clientRequestID(r); got != c.want {
+			t.Errorf("clientRequestID(%q) = %q, want %q", c.hdr, got, c.want)
+		}
 	}
 }
 
@@ -554,7 +596,7 @@ func TestWriteErrorLoadSheddingAndPeakHours(t *testing.T) {
 			s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-			s.writeError(w, r, tt.err)
+			s.writeError(w, r, tt.err, "", nil)
 			got, _ := time.ParseDuration(w.Header().Get("Retry-After") + "s")
 			if got < tt.wantRetryMin || got > tt.wantRetryMax {
 				t.Errorf("Retry-After = %v, want within [%v, %v] (bounded)", got, tt.wantRetryMin, tt.wantRetryMax)

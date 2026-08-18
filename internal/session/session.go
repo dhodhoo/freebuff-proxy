@@ -46,6 +46,27 @@ const (
 	// asyncReAdmitTimeout bounds the background pre-emptive re-admit
 	// (issue #99) so a hung upstream never leaks a goroutine.
 	asyncReAdmitTimeout = time.Minute
+
+	// Terminal-event reasons (T9): the standardized session/invalidation
+	// cause vocabulary shared by every terminal session log line. The
+	// poll/refresh drop paths map upstream statuses through tableReason;
+	// InvalidateWithReason accepts these so callers can name the cause.
+	reasonEnded      = "ended"
+	reasonSuperseded = "superseded"
+	reasonShutdown   = "shutdown"
+	reasonModelLock  = "model_lock"
+	reasonExpired    = "expired"
+	reason409        = "409"
+	reasonPoll       = "poll"
+	reasonStore      = "store"
+
+	// Re-admit storm detector (T10): more than stormThreshold terminal
+	// session events within stormWindow is a session re-admit storm — each
+	// invalidation is followed by a fresh admission that burns a daily
+	// session slot, so the burst is surfaced once (one Info summary) and
+	// re-armed only after a full quiet window passes.
+	stormWindow    = 60 * time.Second
+	stormThreshold = 3
 )
 
 // WaitingRoomError is returned when the session is queued and pollAt has not
@@ -105,6 +126,26 @@ type Manager struct {
 	// the CLI's active instance and refuses to create a competing session
 	// while the CLI process is alive.
 	adopt *CLIAdoption
+
+	// now returns the current time; injectable in tests to drive the
+	// re-admit storm detector deterministically. Defaults to time.Now.
+	now func() time.Time
+
+	// invalidationEvents is the rolling stormWindow of terminal session
+	// events (timestamps + reason) feeding the re-admit storm detector
+	// (T10); reAdmitTriggers records pre-emptive re-admit trigger times so
+	// a storm summary can report how many daily slots the burst burned;
+	// lastStormAt suppresses repeat summaries until a quiet window passes.
+	invalidationEvents []invalidationEvent
+	reAdmitTriggers    []time.Time
+	lastStormAt        time.Time
+}
+
+// invalidationEvent is one terminal session event in the re-admit storm
+// window (T10): when the cached session was dropped and why.
+type invalidationEvent struct {
+	at     time.Time
+	reason string
 }
 
 type cachedState struct {
@@ -143,7 +184,7 @@ func NewManager(client *upstream.Client) *Manager {
 // NewManagerWithStore builds a session manager that also persists its cached
 // state through store (nil disables persistence).
 func NewManagerWithStore(client *upstream.Client, store *Store) *Manager {
-	m := &Manager{client: client, store: store}
+	m := &Manager{client: client, store: store, now: time.Now}
 	if client != nil {
 		m.key = client.TokenKey()
 	}
@@ -401,6 +442,7 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 						m.refreshCh = refreshCh
 						m.mu.Unlock()
 						go m.asyncReAdmit(model)
+						m.recordReAdmitTrigger()
 						slog.Debug("session: pre-emptive re-admit triggered", "instance_id", instance, "model", s.model)
 						return instance, nil
 					}
@@ -543,6 +585,92 @@ func (m *Manager) asyncReAdmit(model string) {
 		return
 	}
 	slog.Debug("session: pre-emptive re-admit done")
+}
+
+// recordReAdmitTrigger remembers a pre-emptive re-admit trigger (issue #99)
+// for the re-admit storm summary's burned_slots count (T10): a trigger whose
+// session is later invalidated burned a daily session slot. Caller must NOT
+// hold m.mu.
+func (m *Manager) recordReAdmitTrigger() {
+	m.mu.Lock()
+	now := m.now()
+	cutoff := now.Add(-stormWindow)
+	m.reAdmitTriggers = append(m.reAdmitTriggers, now)
+	triggers := m.reAdmitTriggers[:0]
+	for _, t := range m.reAdmitTriggers {
+		if t.After(cutoff) {
+			triggers = append(triggers, t)
+		}
+	}
+	m.reAdmitTriggers = triggers
+	m.mu.Unlock()
+}
+
+// recordInvalidation appends a terminal session event to the rolling
+// re-admit storm window (T10) and, when more than stormThreshold
+// invalidations land within stormWindow and the suppression window has
+// passed, emits ONE Info summary (count, duration_ms, superseded,
+// burned_slots). Caller must NOT hold m.mu; the summary is logged outside
+// the lock.
+func (m *Manager) recordInvalidation(reason string) {
+	m.mu.Lock()
+	now := m.now()
+	m.invalidationEvents = append(m.invalidationEvents, invalidationEvent{at: now, reason: reason})
+	cutoff := now.Add(-stormWindow)
+	events := m.invalidationEvents[:0]
+	for _, ev := range m.invalidationEvents {
+		if ev.at.After(cutoff) {
+			events = append(events, ev)
+		}
+	}
+	m.invalidationEvents = events
+	triggers := m.reAdmitTriggers[:0]
+	for _, t := range m.reAdmitTriggers {
+		if t.After(cutoff) {
+			triggers = append(triggers, t)
+		}
+	}
+	m.reAdmitTriggers = triggers
+
+	// Storm only when strictly more than the threshold invalidations sit in
+	// the window, and only once per suppression window (60s of quiet re-arms
+	// the detector).
+	if len(m.invalidationEvents) <= stormThreshold || (!m.lastStormAt.IsZero() && now.Sub(m.lastStormAt) < stormWindow) {
+		m.mu.Unlock()
+		return
+	}
+	m.lastStormAt = now
+	count := len(m.invalidationEvents)
+	duration := m.invalidationEvents[len(m.invalidationEvents)-1].at.Sub(m.invalidationEvents[0].at).Milliseconds()
+	superseded := 0
+	for _, ev := range m.invalidationEvents {
+		if ev.reason == reasonSuperseded {
+			superseded++
+		}
+	}
+	// burned_slots: pre-emptive re-admit triggers within the same window —
+	// each one whose session the storm then invalidated burned a daily slot.
+	// The trigger list is pruned to the window above, so its length is the
+	// count.
+	burned := len(m.reAdmitTriggers)
+	m.mu.Unlock()
+
+	slog.Info("session re-admit storm",
+		"count", count,
+		"duration_ms", duration,
+		"superseded", superseded,
+		"burned_slots", burned)
+}
+
+// tableReason maps an upstream session status to the terminal-event reason
+// vocabulary (T9). Used by the poll/refresh drop paths so the logged reason
+// is always one of the table values; the raw upstream status rides in the
+// log's status field.
+func tableReason(status string) string {
+	if status == "superseded" {
+		return reasonSuperseded
+	}
+	return reasonEnded
 }
 
 // statusError maps an upstream session status to the typed error callers
@@ -723,7 +851,8 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string, preemptive
 			m.mu.Lock()
 			m.commit(nil)
 			m.mu.Unlock()
-			slog.Debug("session recreated", "reason", status, "instance_id", st.InstanceID)
+			m.recordInvalidation(tableReason(status))
+			slog.Debug("session recreated", "reason", tableReason(status), "status", status, "instance_id", st.InstanceID)
 		case "banned", "country_blocked", "rate_limited", "ip_capped", "spend_limited", "session_model_mismatch", "limited_ip":
 			return statusError(status, st)
 		case "model_locked":
@@ -732,8 +861,9 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string, preemptive
 			m.mu.Lock()
 			m.commit(nil)
 			m.mu.Unlock()
+			m.recordInvalidation(reasonModelLock)
 			_ = m.client.EndSession(ctx)
-			slog.Debug("session released on model lock, retrying", "current", st.CurrentModel, "target", targetModel)
+			slog.Debug("session released on model lock, retrying", "reason", reasonModelLock, "current", st.CurrentModel, "target", targetModel)
 		case "model_unavailable":
 			// Requested model is not available; fall back to default model.
 			slog.Warn("session: model unavailable upstream, falling back to default", "requested", targetModel, "fallback", DefaultFallbackModel)
@@ -835,8 +965,20 @@ func (m *Manager) Snapshot() SessionSnapshot {
 }
 
 // Invalidate drops the cached session so the next EnsureSession re-creates
-// it. Used when a chat request reports a session-level error.
+// it. Used when a chat request reports a session-level error. The
+// invalidation is recorded with the canonical 409 reason (the session-invalid
+// chat family); callers that can name a more specific cause use
+// InvalidateWithReason.
 func (m *Manager) Invalidate() {
+	m.InvalidateWithReason(reason409, 0)
+}
+
+// InvalidateWithReason drops the cached session, recording WHY (T9/T10) and
+// feeding the re-admit storm detector. reason is a terminal-event cause from
+// the vocabulary (ended|superseded|shutdown|model_lock|expired|409|poll|
+// store); status is the triggering HTTP status when known (e.g. 409 from the
+// chat/poll error), 0 when unknown — a 0 status is omitted from the log.
+func (m *Manager) InvalidateWithReason(reason string, status int) {
 	m.mu.Lock()
 	instanceID := ""
 	if m.state != nil {
@@ -844,7 +986,12 @@ func (m *Manager) Invalidate() {
 	}
 	m.commit(nil)
 	m.mu.Unlock()
-	slog.Debug("session invalidated", "instance_id", instanceID)
+	m.recordInvalidation(reason)
+	if status > 0 {
+		slog.Debug("session invalidated", "instance_id", instanceID, "reason", reason, "status", status)
+		return
+	}
+	slog.Debug("session invalidated", "instance_id", instanceID, "reason", reason)
 }
 
 // InvalidateInstance drops the cached session only when its instance id
@@ -894,7 +1041,7 @@ func (m *Manager) EndSession(ctx context.Context) error {
 	if instanceID == "" {
 		return nil
 	}
-	slog.Debug("session ended", "instance_id", instanceID)
+	slog.Debug("session ended", "instance_id", instanceID, "reason", reasonEnded)
 	// A superseded DELETE is the same "slot already gone" case as
 	// session-invalid (#119): swallow both so teardown never errors on a
 	// slot another instance took over.
@@ -943,7 +1090,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	// session wire: DELETE = Bearer only, #120 — EndSession never sends the
 	// instance header). The cached state is kept in-memory so the store
 	// entry stays; the process is exiting.
-	slog.Debug("session ended on shutdown", "instance_id", shortInstance(instanceID))
+	slog.Debug("session ended on shutdown", "instance_id", shortInstance(instanceID), "reason", reasonShutdown)
 	if err := m.client.EndSession(ctx); err != nil && !errors.Is(err, upstream.ErrSessionInvalid) && !errors.Is(err, upstream.ErrSessionSuperseded) {
 		return err
 	}
@@ -1044,7 +1191,9 @@ func (m *Manager) Poll(ctx context.Context) error {
 	instanceID := m.state.instanceID
 	m.mu.Unlock()
 
+	start := time.Now()
 	st, err := m.client.GetSessionWithOpts(ctx, instanceID, true)
+	ms := time.Since(start).Milliseconds()
 	if err != nil {
 		// #116: 428 waiting_room_required is session-ENDING
 		// (endsTheSession:true per FREEBUFF_GATE_CODES — the seat is gone;
@@ -1053,12 +1202,17 @@ func (m *Manager) Poll(ctx context.Context) error {
 		// WAITING_ROOM_CHAIN fires before the create). Any other poll error
 		// is left for the pool's failure backoff.
 		if errors.Is(err, upstream.ErrWaitingRoomRequired) {
+			dropped := false
 			m.mu.Lock()
 			if m.state != nil && m.state.instanceID == instanceID {
 				m.commit(nil)
-				slog.Debug("session dropped during poll", "reason", "waiting_room_required", "instance_id", instanceID)
+				dropped = true
 			}
 			m.mu.Unlock()
+			if dropped {
+				m.recordInvalidation(reasonPoll)
+				slog.Warn("session dropped during poll", "reason", reasonPoll, "status", "waiting_room_required", "instance_id", instanceID)
+			}
 		}
 		return err
 	}
@@ -1071,22 +1225,32 @@ func (m *Manager) Poll(ctx context.Context) error {
 		// admission (cooldown) so the token re-admits only after the pool's
 		// ban window, instead of polling a stale slot.
 		if st.Status == "banned" {
+			dropped := false
 			m.mu.Lock()
 			if m.state != nil && m.state.instanceID == instanceID {
 				m.commit(nil)
-				slog.Debug("session dropped during poll", "reason", st.Status, "instance_id", instanceID)
+				dropped = true
 			}
 			m.mu.Unlock()
+			if dropped {
+				m.recordInvalidation(reasonPoll)
+				slog.Warn("session dropped during poll", "reason", reasonPoll, "status", st.Status, "instance_id", instanceID)
+			}
 		}
 		return serr
 	}
 	if st.Status == "superseded" || st.Status == "none" {
+		dropped := false
 		m.mu.Lock()
 		if m.state != nil && m.state.instanceID == instanceID {
 			m.commit(nil)
-			slog.Debug("session ended during poll", "reason", st.Status, "instance_id", instanceID)
+			dropped = true
 		}
 		m.mu.Unlock()
+		if dropped {
+			m.recordInvalidation(tableReason(st.Status))
+			slog.Warn("session ended during poll", "reason", tableReason(st.Status), "status", st.Status, "instance_id", instanceID)
+		}
 		return nil
 	}
 	if st.Status == "ended" {
@@ -1116,13 +1280,22 @@ func (m *Manager) Poll(ctx context.Context) error {
 		}
 		// The row is gone (no instance id) or past grace: drop it so the
 		// next EnsureSession re-creates a fresh session.
+		dropped := false
 		m.mu.Lock()
 		if m.state != nil && m.state.instanceID == instanceID {
 			m.commit(nil)
-			slog.Debug("session ended during poll", "reason", st.Status, "instance_id", instanceID)
+			dropped = true
 		}
 		m.mu.Unlock()
+		if dropped {
+			m.recordInvalidation(tableReason(st.Status))
+			slog.Warn("session ended during poll", "reason", tableReason(st.Status), "status", st.Status, "instance_id", instanceID)
+		}
 		return nil
 	}
+	// Heartbeat liveness confirmed: the compact poll returned a usable
+	// status (active). instance/ms/status standardize the heartbeat poll
+	// line (T11) so ops can see each liveness beat and its latency.
+	slog.Debug("session: heartbeat poll", "instance_id", shortInstance(instanceID), "ms", ms, "status", st.Status)
 	return nil
 }

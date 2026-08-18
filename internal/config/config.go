@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"freebuff-proxy/internal/telemetry"
 )
 
 // Config is the fully-resolved, validated runtime configuration.
@@ -44,12 +46,17 @@ type Config struct {
 	// The only safe value is the token's own account id. (True CLI parity —
 	// auto-deriving each token's own id once via GET /api/v1/me — is
 	// deferred; see the gap analysis item 24.)
-	ActingUserID          string
-	TLSFingerprint        string // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
-	RegistryRefresh       time.Duration
-	DebugDump             bool
-	LogFile               string
-	LogLevel              string            // "" (use -v/default) or debug|info|warn|error
+	ActingUserID    string
+	TLSFingerprint  string // "" (plain Go transport) | chrome120 | chrome126 | safari17 | safari18 | firefox120 | firefox128 | edge126 | random | auto
+	RegistryRefresh time.Duration
+	DebugDump       bool
+	LogFile         string
+	LogLevel        string // "" (use -v/default) or debug|info|warn|error|trace
+	LogFormat       string // "text" (default) or "json"
+	LogAccess       bool   // true = per-request access log lines (LOG_ACCESS; default true, an empty .env line keeps it enabled)
+	// LogRingSize is the bounded in-memory log ring capacity behind the
+	// dashboard log viewer (LOG_RING_SIZE; default 500, validated 50..5000).
+	LogRingSize           int
 	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
 	MaxSpendPerDay        int64             // 0 = unlimited: ADVISORY per-token Pacific-day spend ceiling in ledger units (tokens from upstream usage blocks; issue #122). Never blocks — the upstream $ ceilings ($15 full / $5 limited / $0.50 restricted, compose by minimum, server-enforced) are the real gate. Surfaced as SpendLimit/SpendPct on /healthz so operator comparisons align with the Pacific-midnight reset.
 	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
@@ -184,6 +191,9 @@ type rawConfig struct {
 	DebugDump                        bool   `json:"DEBUG_DUMP"`
 	LogFile                          string `json:"LOG_FILE"`
 	LogLevel                         string `json:"LOG_LEVEL"`
+	LogFormat                        string `json:"LOG_FORMAT"`
+	LogAccess                        bool   `json:"LOG_ACCESS"`
+	LogRingSize                      *int   `json:"LOG_RING_SIZE"`
 	MaxMessagesPerDay                *int   `json:"MAX_MESSAGES_PER_DAY"`
 	MaxSpendPerDay                   *int   `json:"MAX_SPEND_PER_DAY"`
 	IdleRotationTimeout              string `json:"IDLE_ROTATION_TIMEOUT"`
@@ -223,12 +233,14 @@ func defaultRawConfig() rawConfig {
 		RegistryRefresh:                  "6h",
 		CostMode:                         "free", // free-tier mode; omission routes requests as PAID and fresh free accounts get 402 "Out of credits" (upstream check: cost_mode !== 'free' → billing)
 		MaxMessagesPerDay:                nil,
-		MaxSpendPerDay:                   nil,   // 0 = unlimited advisory spend ceiling (never enforced)
-		IdleRotationTimeout:              "",    // "" = disabled (unset → SAFE_MODE preset may fill)
-		SafeMode:                         true,  // anti-ban presets on by default; set SAFE_MODE=false to disable
-		HybridMode:                       false, // relay client tokens AND serve the pool (off by default)
-		CORSAllowedOrigin:                "*",   // browser clients reach /v1/* cross-origin by default
-		RequestJitter:                    "",    // "" = disabled (unset → SAFE_MODE preset may fill)
+		MaxSpendPerDay:                   nil,         // 0 = unlimited advisory spend ceiling (never enforced)
+		IdleRotationTimeout:              "",          // "" = disabled (unset → SAFE_MODE preset may fill)
+		SafeMode:                         true,        // anti-ban presets on by default; set SAFE_MODE=false to disable
+		LogAccess:                        true,        // per-request access lines on by default; LOG_ACCESS=false disables them
+		LogRingSize:                      ptrInt(500), // dashboard log viewer ring capacity (T19)
+		HybridMode:                       false,       // relay client tokens AND serve the pool (off by default)
+		CORSAllowedOrigin:                "*",         // browser clients reach /v1/* cross-origin by default
+		RequestJitter:                    "",          // "" = disabled (unset → SAFE_MODE preset may fill)
 		CLIVersion:                       "0.10.7",
 		TransientRetries:                 nil,   // nil = 1 (one retry after a transient transport failure; 0 disables)
 		SessionPersist:                   false, // opt-in: persist session state across restarts
@@ -377,6 +389,9 @@ func Load(configPath string) (Config, error) {
 	overrideBool(&raw.DebugDump, "DEBUG_DUMP")
 	overrideString(&raw.LogFile, "LOG_FILE")
 	overrideString(&raw.LogLevel, "LOG_LEVEL")
+	overrideString(&raw.LogFormat, "LOG_FORMAT")
+	overrideBool(&raw.LogAccess, "LOG_ACCESS")
+	overrideInt(&raw.LogRingSize, "LOG_RING_SIZE")
 	overrideInt(&raw.MaxMessagesPerDay, "MAX_MESSAGES_PER_DAY")
 	overrideInt(&raw.MaxSpendPerDay, "MAX_SPEND_PER_DAY")
 	overrideString(&raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
@@ -540,6 +555,13 @@ func Load(configPath string) (Config, error) {
 		transientRetries = *raw.TransientRetries
 	}
 
+	// LOG_RING_SIZE: nil (unset/empty) defaults to 500; an explicit value
+	// must stay within 50..5000 (validated in Validate).
+	logRingSize := 500
+	if raw.LogRingSize != nil {
+		logRingSize = *raw.LogRingSize
+	}
+
 	// FALLBACK_AFTER_MS (issue #100): milliseconds, ""/0 = disabled. Any
 	// parse failure fails the load — a typo silently disabling model
 	// fallback would be worse than surfacing it.
@@ -585,6 +607,12 @@ func Load(configPath string) (Config, error) {
 		raw.ActingUserID = raw.LegacyActingUserID
 	}
 
+	// LOG_FORMAT default: empty means the text format (the historic output).
+	logFormat := strings.TrimSpace(raw.LogFormat)
+	if logFormat == "" {
+		logFormat = "text"
+	}
+
 	cfg := Config{
 		ListenAddr:                       strings.TrimSpace(raw.ListenAddr),
 		UpstreamBaseURL:                  upstreamBaseURL,
@@ -602,6 +630,9 @@ func Load(configPath string) (Config, error) {
 		DebugDump:                        raw.DebugDump,
 		LogFile:                          strings.TrimSpace(raw.LogFile),
 		LogLevel:                         strings.TrimSpace(raw.LogLevel),
+		LogFormat:                        logFormat,
+		LogAccess:                        raw.LogAccess,
+		LogRingSize:                      logRingSize,
 		MaxMessagesPerDay:                maxMessagesPerDay,
 		MaxSpendPerDay:                   maxSpendPerDay,
 		IdleRotationTimeout:              idleRotationTimeout,
@@ -756,6 +787,8 @@ func (c Config) Validate() error {
 		return errors.New("MAX_MESSAGES_PER_DAY cannot be negative")
 	case c.MaxSpendPerDay < 0:
 		return errors.New("MAX_SPEND_PER_DAY cannot be negative")
+	case c.LogRingSize != 0 && (c.LogRingSize < 50 || c.LogRingSize > 5000):
+		return errors.New("LOG_RING_SIZE must be between 50 and 5000 (default 500)")
 	}
 
 	if c.WebhookURL != "" {
@@ -804,10 +837,16 @@ func (c Config) Validate() error {
 	}
 
 	if c.LogLevel != "" {
-		var level slog.Level
-		if err := level.UnmarshalText([]byte(c.LogLevel)); err != nil {
-			return fmt.Errorf("LOG_LEVEL %q must be one of: debug, info, warn, error", c.LogLevel)
+		if _, ok := telemetry.ParseLevel(c.LogLevel); !ok {
+			return fmt.Errorf("LOG_LEVEL %q must be one of: debug, info, warn, error, trace", c.LogLevel)
 		}
+	}
+	switch c.LogFormat {
+	case "", "text", "json":
+		// "" never survives From (it defaults to "text"), accepted for
+		// direct Config construction.
+	default:
+		return fmt.Errorf("LOG_FORMAT %q must be one of: text, json", c.LogFormat)
 	}
 
 	u, err := url.Parse(c.UpstreamBaseURL)
@@ -918,6 +957,9 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideBoolFrom(&raw.DebugDump, get, "DEBUG_DUMP")
 	overrideStringFrom(&raw.LogFile, get, "LOG_FILE")
 	overrideStringFrom(&raw.LogLevel, get, "LOG_LEVEL")
+	overrideStringFrom(&raw.LogFormat, get, "LOG_FORMAT")
+	overrideBoolFrom(&raw.LogAccess, get, "LOG_ACCESS")
+	overrideIntFrom(&raw.LogRingSize, get, "LOG_RING_SIZE")
 	overrideIntFrom(&raw.MaxMessagesPerDay, get, "MAX_MESSAGES_PER_DAY")
 	overrideIntFrom(&raw.MaxSpendPerDay, get, "MAX_SPEND_PER_DAY")
 	overrideStringFrom(&raw.IdleRotationTimeout, get, "IDLE_ROTATION_TIMEOUT")

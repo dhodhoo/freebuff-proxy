@@ -99,10 +99,10 @@ func main() {
 
 	// Effective log level: LOG_LEVEL config wins, else -v → debug, else info.
 	level := resolveLogLevel(cfg.LogLevel, *verbose)
-	logger := telemetry.New(level, cfg.LogFile)
+	logger := telemetry.New(level, cfg.LogFile, cfg.LogFormat)
 	// The dashboard log viewer reads from an in-memory ring that mirrors
 	// every record the process logger emits (no log file or docker needed).
-	logringHandler := logring.NewHandler(logger.Handler(), 500)
+	logringHandler := logring.NewHandler(logger.Handler(), cfg.LogRingSize)
 	logger = slog.New(logringHandler)
 	// The pool/upstream/session/runs log through slog.Default(); route it
 	// through our logger so the configured level and log file cover them too.
@@ -281,7 +281,7 @@ func main() {
 		"registry_refresh", cfg.RegistryRefresh.String(),
 		"registry_agents", len(reg.AgentIDs()),
 		"registry_models", reg.ModelCount(),
-		"log_level", level.String(),
+		"log_level", logLevelDisplay(level),
 		"verbose", *verbose,
 	)
 	if cfg.ActingUserID != "" {
@@ -432,6 +432,16 @@ func resolveLogLevel(cfgLogLevel string, verbose bool) slog.Level {
 	return slog.LevelInfo
 }
 
+// logLevelDisplay renders the configured level for the startup summary.
+// LevelTrace prints as TRACE instead of slog's "DEBUG-4" (the level sits
+// below DEBUG, so slog's String() appends the negative offset).
+func logLevelDisplay(level slog.Level) string {
+	if level == telemetry.LevelTrace {
+		return "TRACE"
+	}
+	return level.String()
+}
+
 // ignoredExeAdjacentEnv returns the path of a .env that sits next to the
 // executable while the process reads ./.env from the working directory —
 // the usual reason config "seems to vanish" under a non-interactive
@@ -471,9 +481,9 @@ func refreshLoop(ctx context.Context, logger *slog.Logger, reg *registry.Registr
 }
 
 func logRegistryRefresh(ctx context.Context, logger *slog.Logger, reg *registry.Registry) {
+	// Success is logged inside Registry.Refresh (agents/models/ms); only the
+	// failure path lives here so refresh failures stay visible at the caller.
 	if err := reg.Refresh(ctx); err != nil {
 		logger.Warn("registry refresh failed; keeping previous state", "err", err)
-		return
 	}
-	logger.Info("registry refreshed", "agents", len(reg.AgentIDs()), "models", reg.ModelCount())
 }
