@@ -635,6 +635,15 @@ func (m *MockUpstream) FinishesStartedSnapshot() int {
 	return m.FinishesStarted
 }
 
+// RequestsSnapshot returns a locked copy of the total-request counter (see
+// StartedRunsSnapshot). Tests assert it stays unchanged while a pass must
+// not touch the upstream at all.
+func (m *MockUpstream) RequestsSnapshot() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Requests
+}
+
 // SetFinishDelay sets FinishDelay under the mock's lock. Tests must use it
 // instead of a plain field write: the agent-runs handler reads FinishDelay
 // under the lock while a FINISH may already be in flight, so an unlocked

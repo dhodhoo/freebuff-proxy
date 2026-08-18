@@ -1307,14 +1307,17 @@ func (p *Pool) RecordSpend(lease *Lease, tokens int64) {
 }
 
 // InvalidateSession drops the cached free session of token so the next
-// Acquire re-creates it (session-invalid recovery). Out-of-range tokens are
+// Acquire re-creates it (session-invalid recovery). The invalidation is
+// guarded to the given instance id (issue #132): after a pre-emptive
+// re-admit replaced the cache, a chat that rode the old superseded instance
+// failing must not invalidate the fresh one. Out-of-range tokens are
 // ignored.
-func (p *Pool) InvalidateSession(token int) {
+func (p *Pool) InvalidateSession(token int, instanceID string) {
 	toks := p.toks.Load()
 	if token < 0 || token >= len(*toks) {
 		return
 	}
-	(*toks)[token].session.Invalidate()
+	(*toks)[token].session.InvalidateInstance(instanceID)
 }
 
 // ClearQueuedCaches drops every token's cached QUEUED session (issue #100):
@@ -1445,11 +1448,12 @@ func (p *Pool) CooldownTokenCountryBlocked(token int, cbe *upstream.CountryBlock
 
 // InvalidateBridgeSession drops the cached free session of the bridge
 // entry so the next AcquireBridge re-creates it (session-invalid recovery).
+// Guarded to the lease's instance id (issue #132) — see InvalidateSession.
 func (p *Pool) InvalidateBridgeSession(lease *Lease) {
 	if lease == nil || lease.Bridge == nil {
 		return
 	}
-	lease.Bridge.session.Invalidate()
+	lease.Bridge.session.InvalidateInstance(lease.SessionInstanceID)
 }
 
 // InvalidateBridgeRun drops the current run of the bridge entry for agentID

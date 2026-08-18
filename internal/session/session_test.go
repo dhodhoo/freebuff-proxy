@@ -1304,6 +1304,17 @@ func TestLeaderCancellationDecoupling(t *testing.T) {
 			if count == 1 {
 				close(leaderStartedCh)
 				<-leaderBlockCh
+				// The leader's create must deterministically observe the
+				// cancellation: wait for the request context to be done
+				// before returning, so the mock's response cannot race the
+				// cancel and let the leader "succeed" (a -race timing
+				// flake). A bounded fallback prevents a hang if the cancel
+				// never arrives.
+				select {
+				case <-r.Context().Done():
+					return // canceled: no response, client sees context.Canceled
+				case <-time.After(2 * time.Second):
+				}
 				w.WriteHeader(http.StatusOK)
 				_, _ = io.WriteString(w, `{"status":"active","instanceId":"leader-inst","model":"model/A"}`)
 				return
@@ -1784,5 +1795,89 @@ func TestHeartbeatPollFields(t *testing.T) {
 		!strings.Contains(got, "ms=") ||
 		!strings.Contains(got, "status=active") {
 		t.Errorf("heartbeat poll log missing instance/ms/status:\n%s", got)
+	}
+}
+
+// TestPreemptiveReAdmitOncePerExpiry pins issue #132: a pre-emptive re-admit
+// fires at most ONCE per expiry window. Every request in the lead window
+// must ride the old session instead of re-triggering a fresh upstream
+// create — the observed 22-trigger / 30-create storm around a single
+// expiry.
+func TestPreemptiveReAdmitOncePerExpiry(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+	mgr.SetReAdmitLead(time.Minute)
+
+	// Land a session, then squeeze its expiry into the lead window.
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mgr.mu.Lock()
+	if mgr.state != nil {
+		mgr.state.expiresAt = time.Now().Add(30 * time.Second)
+	}
+	mgr.mu.Unlock()
+
+	// First request in the window triggers the async re-admit (1 create).
+	instance, err := mgr.EnsureSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance != "inst-abc-123" {
+		t.Fatalf("triggered request instance = %q, want the old session being ridden", instance)
+	}
+	// Let the async create land.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && mock.SessionCreatesSnapshot() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := mock.SessionCreatesSnapshot(); got != 2 {
+		t.Fatalf("creates after first trigger = %d, want 2 (initial + one re-admit)", got)
+	}
+
+	// Every further request in the same expiry window must NOT re-trigger.
+	for i := 0; i < 5; i++ {
+		if _, err := mgr.EnsureSession(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := mock.SessionCreatesSnapshot(); got != 2 {
+		t.Errorf("creates after 5 rides = %d, want still 2 (once per expiry window)", got)
+	}
+}
+
+// TestInvalidateInstanceGuarded pins issue #132: invalidating a session by a
+// stale instance id (a chat that rode the old, superseded instance) must not
+// drop a newer cached session.
+func TestInvalidateInstanceGuarded(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	mgr := newTestManager(t, mock)
+	if _, err := mgr.EnsureSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stale instance id leaves the cache alone.
+	mgr.InvalidateInstance("inst-stale-999")
+	mgr.mu.Lock()
+	cur := ""
+	if mgr.state != nil {
+		cur = mgr.state.instanceID
+	}
+	alive := mgr.state != nil
+	mgr.mu.Unlock()
+	if !alive {
+		t.Fatal("cached session invalidated by a stale instance id")
+	}
+
+	// The matching instance id clears it.
+	mgr.InvalidateInstance(cur)
+	mgr.mu.Lock()
+	alive = mgr.state != nil
+	mgr.mu.Unlock()
+	if alive {
+		t.Fatal("cached session not invalidated by its own instance id")
 	}
 }

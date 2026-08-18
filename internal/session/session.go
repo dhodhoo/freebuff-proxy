@@ -107,6 +107,14 @@ type Manager struct {
 	// existing refreshing machinery) and rides the old session; the next
 	// request gets the new instance. 0 disables.
 	reAdmitLead time.Duration
+	// reAdmitExpiry (issue #132) is the expiresAt of the session the last
+	// pre-emptive re-admit was triggered for. A failed re-admit must not be
+	// re-triggered on every subsequent request in the lead window (each
+	// trigger is an upstream session create, and the upstream refuses fresh
+	// instances while the old is still authoritative — a 30-create storm
+	// was observed). The guard resets naturally when a new session (with a
+	// new expiresAt) lands. Guarded by mu.
+	reAdmitExpiry time.Time
 	// probeTTL (issue #60, SESSION_PROBE_CACHE_TTL default 15s) + lastAdmitted:
 	// the last successful upstream session response is reused to skip a
 	// redundant poll GET within the TTL.
@@ -419,7 +427,15 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 					// half-started admission.
 					if s.status == "active" && m.reAdmitLead > 0 &&
 						time.Now().Before(s.expiresAt.Add(-expiryMargin)) &&
-						time.Until(s.expiresAt.Add(-expiryMargin)) <= m.reAdmitLead {
+						time.Until(s.expiresAt.Add(-expiryMargin)) <= m.reAdmitLead &&
+						!m.reAdmitExpiry.Equal(s.expiresAt) {
+						// Issue #132: one attempt per expiry window. The
+						// upstream refuses a fresh create while the old
+						// instance is still authoritative, so a failed
+						// re-admit must ride the old session to expiry
+						// instead of re-triggering on every request (each
+						// trigger burns a session slot).
+						m.reAdmitExpiry = s.expiresAt
 						m.refreshing = true
 						m.refreshErr = nil
 						refreshCh := make(chan struct{})
@@ -508,7 +524,7 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 		m.refreshCh = refreshCh
 		m.mu.Unlock()
 
-		err := m.refresh(ctx, model)
+		err := m.refresh(ctx, model, false)
 		m.mu.Lock()
 		m.refreshing = false
 		if err != nil {
@@ -555,7 +571,7 @@ func (m *Manager) EnsureSessionForModel(ctx context.Context, model string) (stri
 func (m *Manager) asyncReAdmit(model string) {
 	ctx, cancel := context.WithTimeout(context.Background(), asyncReAdmitTimeout)
 	defer cancel()
-	err := m.refresh(ctx, model)
+	err := m.refresh(ctx, model, true)
 	m.mu.Lock()
 	m.refreshing = false
 	if err != nil {
@@ -717,7 +733,10 @@ func statusError(status string, st *upstream.SessionState) error {
 
 // refresh runs the create/poll status loop, updating cached state, until the
 // session is active, disabled, or the iteration budget is exhausted.
-func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
+// preemptive marks an issue #99 async re-admit: a create refusal while the
+// old instance is still authoritative must NOT invalidate the cached session
+// (the caller is riding it) — return instead of committing nil and looping.
+func (m *Manager) refresh(ctx context.Context, requestedModel string, preemptive bool) error {
 	targetModel := requestedModel
 	for i := 0; i < maxRefreshIterations; i++ {
 		if err := ctx.Err(); err != nil {
@@ -821,6 +840,14 @@ func (m *Manager) refresh(ctx context.Context, requestedModel string) error {
 				"position", st.Position, "queue_depth", st.QueueDepth, "poll_at", pollAt.Format(time.RFC3339))
 			return nil
 		case "ended", "superseded", "none":
+			if preemptive {
+				// Issue #132: the upstream refused a fresh admission while
+				// the old instance is still authoritative (the re-admit
+				// overlap). Keep the cached session — the triggering
+				// request is riding it until expiry — and stop; the
+				// once-per-expiry guard prevents a retry storm.
+				return errors.New("session: pre-emptive re-admit refused (old session still active)")
+			}
 			m.mu.Lock()
 			m.commit(nil)
 			m.mu.Unlock()
@@ -965,6 +992,25 @@ func (m *Manager) InvalidateWithReason(reason string, status int) {
 		return
 	}
 	slog.Debug("session invalidated", "instance_id", instanceID, "reason", reason)
+}
+
+// InvalidateInstance drops the cached session only when its instance id
+// matches instanceID (issue #132): after a pre-emptive re-admit lands a new
+// instance, a chat that was still riding the OLD (superseded) instance
+// failing must not invalidate the NEW cached session — that would force the
+// next request to re-create and restart the churn. A mismatch leaves the
+// cache untouched.
+func (m *Manager) InvalidateInstance(instanceID string) {
+	if instanceID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state == nil || m.state.instanceID != instanceID {
+		return
+	}
+	m.commit(nil)
+	slog.Debug("session invalidated", "instance_id", instanceID)
 }
 
 // ClearQueued drops the cached session only when it is in the queued
