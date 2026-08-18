@@ -37,14 +37,17 @@ const maxSchemaDepth = 12
 // maxSchemaDepth (12x memory amplification). Tests may shrink it.
 var maxSchemaNodes = 100_000
 
-// capHint returns a+b clamped to MaxInt. Go's map/slice runtimes panic on a
-// negative or oversized allocation hint (makemap: size out of range /
-// makeslice: cap out of range), so guarding the sum keeps request-driven
-// preallocation safe even for pathological inputs. CodeQL: "size computation
-// for allocation may overflow" (convert.go:432,754,905,1006).
+// capHint returns a+b for use as a make() size hint, or 0 when the sum would
+// overflow int. An unguarded len(a)+len(b) hint can wrap negative and panic
+// the runtime (makeslice: "cap out of range" / "len out of range"; makemap
+// clamps negative hints but a wrapped positive is still wrong). On overflow
+// we drop the hint entirely and let the container grow dynamically - the
+// hint is pure preallocation optimization, never correctness. CodeQL:
+// "size computation for allocation may overflow" (go/allocation-size-overflow,
+// convert.go:432,754,905,1006).
 func capHint(a, b int) int {
 	if a > math.MaxInt-b {
-		return math.MaxInt
+		return 0
 	}
 	return a + b
 }
