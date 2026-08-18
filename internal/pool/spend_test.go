@@ -10,7 +10,10 @@ package pool
 // dates exercise PST.
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -284,5 +287,29 @@ func TestSpendPct(t *testing.T) {
 	}
 	if snaps[0].SpendDay != 300 {
 		t.Errorf("SpendDay = %d, want 300", snaps[0].SpendDay)
+	}
+}
+
+// TestSpendBucketUpdateLogs verifies T18: a spend record emits one Debug
+// line per period bucket with bucket, spend_delta, and the wire-style
+// period name.
+func TestSpendBucketUpdateLogs(t *testing.T) {
+	mock := testutil.NewMock()
+	defer mock.Close()
+	p := newTestPool(t, mock)
+	var sink bytes.Buffer
+	p.logger = slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	p.recordSpend(0, 100)
+
+	logs := sink.String()
+	for _, want := range []string{
+		"pool: spend bucket updated",
+		"bucket=day", "spend_delta=100", "period=pacific_day",
+		"bucket=week", "period=pacific_week",
+		"bucket=month", "period=pacific_month",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("spend bucket Debug missing %q: %s", want, logs)
+		}
 	}
 }

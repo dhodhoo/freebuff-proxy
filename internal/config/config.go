@@ -53,6 +53,7 @@ type Config struct {
 	LogFile               string
 	LogLevel              string            // "" (use -v/default) or debug|info|warn|error|trace
 	LogFormat             string            // "text" (default) or "json"
+	LogAccess             bool              // true = per-request access log lines (LOG_ACCESS; default true, an empty .env line keeps it enabled)
 	MaxMessagesPerDay     int               // 0 = unlimited: per-token cap on successful chats per 24h
 	MaxSpendPerDay        int64             // 0 = unlimited: ADVISORY per-token Pacific-day spend ceiling in ledger units (tokens from upstream usage blocks; issue #122). Never blocks — the upstream $ ceilings ($15 full / $5 limited / $0.50 restricted, compose by minimum, server-enforced) are the real gate. Surfaced as SpendLimit/SpendPct on /healthz so operator comparisons align with the Pacific-midnight reset.
 	IdleRotationTimeout   time.Duration     // 0 = disabled: pause rotation/refresh after this idle period
@@ -188,6 +189,7 @@ type rawConfig struct {
 	LogFile                          string `json:"LOG_FILE"`
 	LogLevel                         string `json:"LOG_LEVEL"`
 	LogFormat                        string `json:"LOG_FORMAT"`
+	LogAccess                        bool   `json:"LOG_ACCESS"`
 	MaxMessagesPerDay                *int   `json:"MAX_MESSAGES_PER_DAY"`
 	MaxSpendPerDay                   *int   `json:"MAX_SPEND_PER_DAY"`
 	IdleRotationTimeout              string `json:"IDLE_ROTATION_TIMEOUT"`
@@ -230,6 +232,7 @@ func defaultRawConfig() rawConfig {
 		MaxSpendPerDay:                   nil,   // 0 = unlimited advisory spend ceiling (never enforced)
 		IdleRotationTimeout:              "",    // "" = disabled (unset → SAFE_MODE preset may fill)
 		SafeMode:                         true,  // anti-ban presets on by default; set SAFE_MODE=false to disable
+		LogAccess:                        true,  // per-request access lines on by default; LOG_ACCESS=false disables them
 		HybridMode:                       false, // relay client tokens AND serve the pool (off by default)
 		CORSAllowedOrigin:                "*",   // browser clients reach /v1/* cross-origin by default
 		RequestJitter:                    "",    // "" = disabled (unset → SAFE_MODE preset may fill)
@@ -382,6 +385,7 @@ func Load(configPath string) (Config, error) {
 	overrideString(&raw.LogFile, "LOG_FILE")
 	overrideString(&raw.LogLevel, "LOG_LEVEL")
 	overrideString(&raw.LogFormat, "LOG_FORMAT")
+	overrideBool(&raw.LogAccess, "LOG_ACCESS")
 	overrideInt(&raw.MaxMessagesPerDay, "MAX_MESSAGES_PER_DAY")
 	overrideInt(&raw.MaxSpendPerDay, "MAX_SPEND_PER_DAY")
 	overrideString(&raw.IdleRotationTimeout, "IDLE_ROTATION_TIMEOUT")
@@ -614,6 +618,7 @@ func Load(configPath string) (Config, error) {
 		LogFile:                          strings.TrimSpace(raw.LogFile),
 		LogLevel:                         strings.TrimSpace(raw.LogLevel),
 		LogFormat:                        logFormat,
+		LogAccess:                        raw.LogAccess,
 		MaxMessagesPerDay:                maxMessagesPerDay,
 		MaxSpendPerDay:                   maxSpendPerDay,
 		IdleRotationTimeout:              idleRotationTimeout,
@@ -937,6 +942,7 @@ func applyDotenv(raw *rawConfig, path string) error {
 	overrideStringFrom(&raw.LogFile, get, "LOG_FILE")
 	overrideStringFrom(&raw.LogLevel, get, "LOG_LEVEL")
 	overrideStringFrom(&raw.LogFormat, get, "LOG_FORMAT")
+	overrideBoolFrom(&raw.LogAccess, get, "LOG_ACCESS")
 	overrideIntFrom(&raw.MaxMessagesPerDay, get, "MAX_MESSAGES_PER_DAY")
 	overrideIntFrom(&raw.MaxSpendPerDay, get, "MAX_SPEND_PER_DAY")
 	overrideStringFrom(&raw.IdleRotationTimeout, get, "IDLE_ROTATION_TIMEOUT")

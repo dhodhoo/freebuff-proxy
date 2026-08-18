@@ -158,7 +158,7 @@ func New(cfg *config.Config, p *pool.Pool, reg *registry.Registry, logger *slog.
 	// count_tokens requests never rebuild the vocabulary.
 	est, err := tokenestimate.New()
 	if err != nil {
-		logger.Error("token estimator unavailable; /v1/messages/count_tokens will fail", "err", err)
+		logger.Warn("token estimator unavailable; /v1/messages/count_tokens will fail", "err", err)
 	}
 	s.tokenEstimator = est
 	for _, opt := range opts {
@@ -255,8 +255,61 @@ func (s *Server) Handler() http.Handler {
 		if crid := clientRequestID(r); crid != "" {
 			attrs = append(attrs, "client_request_id", crid)
 		}
+		// T17: LOG_ACCESS=false disables access lines entirely. Quiet
+		// endpoints (/healthz, /metrics, OPTIONS preflights) are
+		// rate-limited to one access line per path per accessQuietWindow so
+		// a poller or browser preflight does not flood the log; every other
+		// path keeps one line per request. req_id/client_request_id survive
+		// in both cases.
+		if !s.cfg.Load().LogAccess {
+			return
+		}
+		if quietAccessPath(r.Method, r.URL.Path) && !accessLogDue(r.URL.Path, start) {
+			return
+		}
 		s.logger.Info("access", attrs...)
 	})
+}
+
+// quietAccessPath reports whether path is a poll/fire-and-forget endpoint
+// whose access lines are rate-limited (T17): /healthz, /metrics, and CORS
+// OPTIONS preflights. Every other path logs one access line per request.
+func quietAccessPath(method, path string) bool {
+	return path == "/healthz" || path == "/metrics" || method == http.MethodOptions
+}
+
+// accessQuietWindow is the quiet-endpoint access gate window: at most one
+// access line per path per window (T17). A var so tests can shrink it.
+var accessQuietWindow = 60 * time.Second
+
+// accessLogGate is the per-process quiet-path access gate: map[path]lastLog
+// plus a mutex (T17). The path set is bounded by the route table, so no
+// cleanup is needed.
+var accessLogGate = struct {
+	mu       sync.Mutex
+	lastSeen map[string]time.Time
+}{lastSeen: make(map[string]time.Time)}
+
+// accessLogDue reports whether an access line may fire for path now,
+// recording the current attempt. The first request for a path and any
+// request at least accessQuietWindow after the last line fire; requests
+// inside the window are suppressed.
+func accessLogDue(path string, now time.Time) bool {
+	accessLogGate.mu.Lock()
+	defer accessLogGate.mu.Unlock()
+	last, ok := accessLogGate.lastSeen[path]
+	if !ok || now.Sub(last) >= accessQuietWindow {
+		accessLogGate.lastSeen[path] = now
+		return true
+	}
+	return false
+}
+
+// resetAccessLogGate clears the quiet-path access gate (test hook).
+func resetAccessLogGate() {
+	accessLogGate.mu.Lock()
+	defer accessLogGate.mu.Unlock()
+	clear(accessLogGate.lastSeen)
 }
 
 // corsOrigin returns the configured Access-Control-Allow-Origin, treating an
@@ -590,6 +643,18 @@ func (a *adminAuth) clearFails(ip string) {
 	delete(a.fails, ip)
 }
 
+// loginFailState snapshots the failure entry for ip: the current attempt
+// count and whether ip is locked out (T15 audit trail).
+func (a *adminAuth) loginFailState(ip string) (attempts int, locked bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	e, ok := a.fails[ip]
+	if !ok {
+		return 0, false
+	}
+	return e.count, !e.until.IsZero() && time.Now().Before(e.until)
+}
+
 // dashboardAuth guards the browser UI. With ADMIN_TOKEN unset the dashboard
 // is open (legacy behavior, matching /admin/reload; main.go warns at startup).
 // Otherwise the request must carry a valid fb_admin cookie; missing/invalid
@@ -706,6 +771,10 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	ip := remoteHost(r)
 	if r.Method == http.MethodPost {
 		if !s.adminAuth.allow(ip) {
+			// T15: audit the lockout rejection — attempts is the lockout
+			// bound that was crossed; the submitted credential is never
+			// logged.
+			s.logger.Warn("admin login failed", "remote", ip, "attempts", maxLoginFails, "reason", "locked_out")
 			s.dash.RenderLogin(w, r, "Too many failed attempts — try again in a minute.")
 			return
 		}
@@ -721,6 +790,13 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.adminAuth.recordFail(ip)
+		attempts, locked := s.adminAuth.loginFailState(ip)
+		if locked {
+			attempts = maxLoginFails
+		}
+		// T15: audit a failed login — remote, running attempt count, and
+		// reason only; the credential itself is never logged.
+		s.logger.Warn("admin login failed", "remote", ip, "attempts", attempts, "reason", "invalid_token")
 		s.dash.RenderLogin(w, r, "Invalid admin token.")
 		return
 	}
@@ -890,6 +966,7 @@ func (s *Server) handleTokenTestAll(w http.ResponseWriter, r *http.Request) {
 // documented "unsupported_endpoint" code (distinct from the mux's bare 404,
 // which gives an embeddings client no actionable signal).
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	s.logger.Warn("unsupported endpoint requested", "path", r.URL.Path, "remote", remoteHost(r), "status", http.StatusBadRequest)
 	s.writeJSONError(w, http.StatusBadRequest,
 		"this proxy serves chat completions only; embeddings are not supported. Use POST /v1/chat/completions with one of: "+strings.Join(s.reg.Models(), ", "),
 		"unsupported_endpoint", "unsupported_endpoint", 0)
@@ -1364,11 +1441,11 @@ func (s *Server) handleTokenAdd(w http.ResponseWriter, r *http.Request) {
 	tokens := append(append([]string{}, cfg.AuthTokens...), req.Token)
 	if err := s.syncTokensAfterMutation(tokens); err != nil {
 		_ = s.pool.RemoveLastToken()
-		s.logger.Warn("dashboard token add rolled back", "err", err)
+		s.logger.Warn("dashboard token add rolled back", "remote", remoteHost(r), "err", err)
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
 	}
-	s.logger.Info("dashboard token added", "index", idx)
+	s.logger.Info("dashboard token added", "remote", remoteHost(r), "index", idx)
 	s.dash.RenderConfigResult(w, r, true, "Token added at index "+strconv.Itoa(idx)+" and persisted to .env.")
 }
 
@@ -1406,14 +1483,14 @@ func (s *Server) handleTokenRemove(w http.ResponseWriter, r *http.Request) {
 		// handleTokenAdd's rollback).
 		if removed != "" {
 			if _, addErr := s.pool.AddToken(removed); addErr != nil {
-				s.logger.Warn("dashboard token remove rollback re-add failed", "err", addErr)
+				s.logger.Warn("dashboard token remove rollback re-add failed", "remote", remoteHost(r), "err", addErr)
 			}
 		}
-		s.logger.Warn("dashboard token remove rolled back", "err", err)
+		s.logger.Warn("dashboard token remove rolled back", "remote", remoteHost(r), "err", err)
 		s.dash.RenderConfigResult(w, r, false, err.Error())
 		return
 	}
-	s.logger.Info("dashboard token removed")
+	s.logger.Info("dashboard token removed", "remote", remoteHost(r))
 	s.dash.RenderConfigResult(w, r, true, "Last token removed and persisted to .env.")
 }
 
@@ -1732,12 +1809,92 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		s.dash.RenderConfigResult(w, r, false, "Configuration rejected: "+err.Error())
 		return
 	}
+	oldCfg := s.cfg.Load()
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
 	s.logger.Info("dashboard config saved and reloaded",
+		"remote", remoteHost(r), "changed_keys", changedConfigKeys(oldCfg, &newCfg),
 		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	s.dash.RenderConfigResult(w, r, true, "Saved and reloaded — effective configuration updated.")
+}
+
+// effectiveConfigKV renders cfg as a key→normalized-value map of the
+// effective config surface (mirrors the dashboard config editor's effective
+// table, T15). Secret-bearing values are reduced to counts or set/unset
+// markers, so the map is safe to diff for the changed_keys audit log: only
+// key NAMES are ever logged, never values.
+func effectiveConfigKV(cfg *config.Config) map[string]string {
+	return map[string]string{
+		"LISTEN_ADDR":                           cfg.ListenAddr,
+		"UPSTREAM_BASE_URL":                     cfg.UpstreamBaseURL,
+		"AUTH_TOKENS":                           strconv.Itoa(len(cfg.AuthTokens)),
+		"API_KEYS":                              strconv.Itoa(len(cfg.APIKeys)),
+		"ADMIN_TOKEN":                           boolWord(cfg.AdminToken != ""),
+		"ROTATION_INTERVAL":                     cfg.RotationInterval.String(),
+		"REQUEST_TIMEOUT":                       cfg.RequestTimeout.String(),
+		"SESSION_CALL_TIMEOUT":                  cfg.SessionCallTimeout.String(),
+		"COST_MODE":                             cfg.CostMode,
+		"TLS_FINGERPRINT":                       cfg.TLSFingerprint,
+		"REGISTRY_REFRESH":                      cfg.RegistryRefresh.String(),
+		"DEBUG_DUMP":                            strconv.FormatBool(cfg.DebugDump),
+		"LOG_FILE":                              cfg.LogFile,
+		"LOG_LEVEL":                             cfg.LogLevel,
+		"LOG_FORMAT":                            cfg.LogFormat,
+		"LOG_ACCESS":                            strconv.FormatBool(cfg.LogAccess),
+		"MAX_MESSAGES_PER_DAY":                  strconv.Itoa(cfg.MaxMessagesPerDay),
+		"MAX_SPEND_PER_DAY":                     strconv.FormatInt(cfg.MaxSpendPerDay, 10),
+		"IDLE_ROTATION_TIMEOUT":                 cfg.IdleRotationTimeout.String(),
+		"SAFE_MODE":                             strconv.FormatBool(cfg.SafeMode),
+		"HYBRID_MODE":                           strconv.FormatBool(cfg.HybridMode),
+		"MODELS_HIDE_UNAVAILABLE":               strconv.FormatBool(cfg.ModelsHideUnavailable),
+		"CORS_ALLOWED_ORIGIN":                   cfg.CORSAllowedOrigin,
+		"REQUEST_JITTER":                        cfg.RequestJitter.String(),
+		"CLI_VERSION":                           cfg.CLIVersion,
+		"MODEL_ALIASES":                         strconv.Itoa(len(cfg.ModelAliases)),
+		"TRANSIENT_RETRIES":                     strconv.Itoa(cfg.TransientRetries),
+		"SESSION_PERSIST":                       strconv.FormatBool(cfg.SessionPersist),
+		"SESSION_STATE_FILE":                    cfg.SessionStateFile,
+		"HTTP2_UPSTREAM":                        strconv.FormatBool(cfg.HTTP2Upstream),
+		"SESSION_CREATE_MAX_PARALLEL_GLOBAL":    strconv.Itoa(cfg.SessionCreateMaxParallelGlobal),
+		"SESSION_CREATE_MAX_PARALLEL_PER_MODEL": strconv.Itoa(cfg.SessionCreateMaxParallelPerModel),
+		"RUN_FINISH_QUEUE_SIZE":                 strconv.Itoa(cfg.RunFinishQueueSize),
+		"RUN_FINISH_INLINE_TIMEOUT":             cfg.RunFinishInlineTimeout.String(),
+		"RUNS_DRAIN_QUEUE_CAP":                  strconv.Itoa(cfg.RunsDrainQueueCap),
+		"RUNS_DRAIN_TTL":                        cfg.RunsDrainTTL.String(),
+		"SESSION_RE_ADMIT_LEAD":                 cfg.SessionReAdmitLead.String(),
+		"SESSION_PROBE_CACHE_TTL":               cfg.SessionProbeCacheTTL.String(),
+		"WEBHOOK_URL":                           boolWord(cfg.WebhookURL != ""),
+		"FALLBACK_AFTER_MS":                     cfg.FallbackAfter.String(),
+		"FALLBACK_MODEL":                        strconv.Itoa(len(cfg.FallbackModels)),
+		"ADOPT_CLI_SESSION":                     strconv.FormatBool(cfg.AdoptCLISession),
+		"WAITING_ROOM_CHAIN":                    strconv.FormatBool(cfg.WaitingRoomChain),
+	}
+}
+
+// boolWord renders a boolean flag as "set"/"unset" for the redacted
+// effective-config table (never the raw value).
+func boolWord(v bool) string {
+	if v {
+		return "set"
+	}
+	return "unset"
+}
+
+// changedConfigKeys returns the sorted names of effective config keys whose
+// normalized value differs between oldCfg and newCfg (T15 audit trail). The
+// values are compared only; never logged.
+func changedConfigKeys(oldCfg, newCfg *config.Config) []string {
+	oldKV := effectiveConfigKV(oldCfg)
+	newKV := effectiveConfigKV(newCfg)
+	var changed []string
+	for k, v := range newKV {
+		if oldKV[k] != v {
+			changed = append(changed, k)
+		}
+	}
+	sort.Strings(changed)
+	return changed
 }
 
 // writeFileAtomic writes data to path via a temp file + rename: readers never
@@ -2804,6 +2961,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	created := s.started.Unix()
 	snaps := s.pool.Snapshot()
 	models := s.reg.Models()
+	if len(models) == 0 {
+		// T16: an empty registry is an operational anomaly (the fallback
+		// table should always populate at boot) — surface it when a client
+		// actually asks, not at startup.
+		s.logger.Warn("model list requested with empty registry", "path", r.URL.Path, "remote", remoteHost(r), "model_count", 0)
+	}
 	hideUnavailable := s.cfg.Load().ModelsHideUnavailable
 	data := make([]map[string]any, 0, len(models))
 	for _, id := range models {
@@ -3077,16 +3240,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 // handleReload handles POST /admin/reload for hot configuration reloads (#26).
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
-	s.logger.Info("admin reload requested")
+	s.logger.Info("admin reload requested", "remote", remoteHost(r), "path", r.URL.Path)
 	newCfg, err := config.Load(s.configPath)
 	if err != nil {
+		s.logger.Warn("admin reload failed", "remote", remoteHost(r), "path", r.URL.Path, "err", err)
 		s.writeJSONError(w, http.StatusInternalServerError, "failed to reload config: "+err.Error(), "internal_error", "reload_failed", 0)
 		return
 	}
 	s.cfg.Store(&newCfg)
 	s.reg.SetConfig(&newCfg)
 	s.pool.SetConfig(&newCfg)
-	s.logger.Info("config reloaded successfully", "auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
+	s.logger.Info("config reloaded successfully", "remote", remoteHost(r), "path", r.URL.Path,
+		"auth_tokens", len(newCfg.AuthTokens), "safe_mode", newCfg.SafeMode)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":      "ok",

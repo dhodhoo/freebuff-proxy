@@ -17,7 +17,7 @@ import (
 var envKeys = []string{
 	"LISTEN_ADDR", "UPSTREAM_BASE_URL", "AUTH_TOKENS", "ROTATION_INTERVAL",
 	"REQUEST_TIMEOUT", "SESSION_CALL_TIMEOUT", "API_KEYS", "COST_MODE", "ACTING_USER_ID", "USER_ID",
-	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL", "LOG_FORMAT",
+	"TLS_FINGERPRINT", "REGISTRY_REFRESH", "DEBUG_DUMP", "LOG_FILE", "LOG_LEVEL", "LOG_FORMAT", "LOG_ACCESS",
 	"MAX_MESSAGES_PER_DAY", "IDLE_ROTATION_TIMEOUT", "SAFE_MODE", "HYBRID_MODE",
 	"MODELS_HIDE_UNAVAILABLE", "CORS_ALLOWED_ORIGIN", "REQUEST_JITTER", "CLI_VERSION", "MODEL_ALIASES",
 	"AUTO_DISCOVER_TOKEN", "TRANSIENT_RETRIES", "ADMIN_TOKEN",
@@ -1090,6 +1090,59 @@ func TestLogFormat(t *testing.T) {
 		t.Fatalf("Load (json file, no env): %v", err)
 	} else if cfg.LogFormat != "json" {
 		t.Errorf("LogFormat = %q, want json from JSON file", cfg.LogFormat)
+	}
+}
+
+// TestLogAccess pins T17: LOG_ACCESS defaults to true, an empty .env line
+// keeps it enabled (the access gate must never flip off from an unset or
+// blank value), and only an explicit false disables the access lines.
+func TestLogAccess(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AUTH_TOKENS", "tok")
+
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (default): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false by default, want true")
+	}
+
+	// env source: explicit false disables.
+	t.Setenv("LOG_ACCESS", "false")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env false): %v", err)
+	} else if cfg.LogAccess {
+		t.Error("LogAccess = true for LOG_ACCESS=false, want false")
+	}
+
+	// Explicit true re-enables.
+	t.Setenv("LOG_ACCESS", "true")
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (env true): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false for LOG_ACCESS=true, want true")
+	}
+
+	// An empty .env line must not disable access logging: the empty value
+	// leaves the default (true) untouched.
+	t.Setenv("LOG_ACCESS", "")
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nLOG_ACCESS=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (empty .env line): %v", err)
+	} else if !cfg.LogAccess {
+		t.Error("LogAccess = false for an empty LOG_ACCESS=.env line, want true")
+	}
+
+	// The .env source: LOG_ACCESS=false in .env disables (env wins).
+	t.Setenv("LOG_ACCESS", "")
+	if err := os.WriteFile(".env", []byte("AUTH_TOKENS=tok\nLOG_ACCESS=false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(""); err != nil {
+		t.Fatalf("Load (.env false): %v", err)
+	} else if cfg.LogAccess {
+		t.Error("LogAccess = true for .env LOG_ACCESS=false, want false")
 	}
 }
 

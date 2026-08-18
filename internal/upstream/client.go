@@ -2770,7 +2770,11 @@ func (c *Client) dump(kind string, req *http.Request, status int, body string) {
 		}
 	}
 	fmt.Fprintf(&buf, "\n[status %d]\n%s\n", status, truncate(body, 20000))
-	_ = os.WriteFile(path, buf.Bytes(), 0o600)
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		// T18: the write was previously swallowed (`_ = os.WriteFile`) —
+		// surface the failure so a broken dump dir is not silent.
+		slog.Warn("debug dump write failed", "path", path, "err", err)
+	}
 }
 
 func sanitizeName(p string) string {

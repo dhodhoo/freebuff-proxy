@@ -481,9 +481,9 @@ func refreshLoop(ctx context.Context, logger *slog.Logger, reg *registry.Registr
 }
 
 func logRegistryRefresh(ctx context.Context, logger *slog.Logger, reg *registry.Registry) {
+	// Success is logged inside Registry.Refresh (agents/models/ms); only the
+	// failure path lives here so refresh failures stay visible at the caller.
 	if err := reg.Refresh(ctx); err != nil {
 		logger.Warn("registry refresh failed; keeping previous state", "err", err)
-		return
 	}
-	logger.Info("registry refreshed", "agents", len(reg.AgentIDs()), "models", reg.ModelCount())
 }

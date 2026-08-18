@@ -42,6 +42,7 @@ func newTestServerWithLogger(t *testing.T, apiKeys []string, logger *slog.Logger
 		RegistryRefresh:    6 * time.Hour,
 		UpstreamBaseURL:    "https://www.codebuff.com",
 		APIKeys:            apiKeys,
+		LogAccess:          true,
 	}
 	clients := make([]*upstream.Client, 0, len(mocks))
 	sessions := make([]*session.Manager, 0, len(mocks))

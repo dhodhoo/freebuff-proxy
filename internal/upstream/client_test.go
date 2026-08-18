@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -3580,5 +3581,39 @@ func TestReqIDContextHelpers(t *testing.T) {
 	defer cancel()
 	if got := ReqID(child); got != "req-123" {
 		t.Errorf("ReqID(child) = %q, want req-123 (value must survive descendant wraps)", got)
+	}
+}
+
+// TestDumpWriteFailureLogsWarn verifies T18: when DEBUG_DUMP is enabled but
+// the dump write fails (a regular file occupies the dump/ path), the failure
+// is logged as a WARN with path and err instead of being swallowed.
+func TestDumpWriteFailureLogsWarn(t *testing.T) {
+	orig := slog.Default()
+	var sink bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	t.Chdir(t.TempDir())
+	// A regular FILE named "dump": MkdirAll fails and WriteFile hits
+	// ENOTDIR/EEXIST — deterministic failure injection.
+	if err := os.WriteFile("dump", []byte("occupied"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	client, err := New("tok", testConfig("", func(c *config.Config) { c.DebugDump = true }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://www.codebuff.com/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.dump("chat", req, http.StatusOK, "response body")
+
+	logs := sink.String()
+	if !strings.Contains(logs, "debug dump write failed") {
+		t.Fatalf("dump WARN missing: %s", logs)
+	}
+	if !strings.Contains(logs, "path=") || !strings.Contains(logs, "err=") {
+		t.Errorf("dump WARN missing path/err attrs: %s", logs)
 	}
 }

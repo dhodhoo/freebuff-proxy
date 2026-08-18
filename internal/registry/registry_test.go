@@ -1,15 +1,18 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -804,5 +807,30 @@ func TestLastAttemptedSources(t *testing.T) {
 	}
 	if got := r.LastAttemptedSources(); !reflect.DeepEqual(got, []string{fixture}) {
 		t.Errorf("LastAttemptedSources after successful refresh = %v, want [%s]", got, fixture)
+	}
+}
+
+// TestRefreshLogsSuccess verifies T18: a successful refresh logs an INFO
+// with agents/models counts and the duration (the success path was silent;
+// only main.go's failure path logged).
+func TestRefreshLogsSuccess(t *testing.T) {
+	var sink bytes.Buffer
+	r := New(nil, nil)
+	r.SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	r.SetSources([]string{fileSource(t, filepath.Join("testdata", "registry-fixture.ts"))})
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	logs := sink.String()
+	if !strings.Contains(logs, "registry refreshed") {
+		t.Fatalf("refresh success log missing msg: %s", logs)
+	}
+	for _, want := range []string{"agents=", "models=", "ms="} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("refresh success log missing %q: %s", want, logs)
+		}
+	}
+	if !strings.Contains(logs, "models="+strconv.Itoa(r.ModelCount())) {
+		t.Errorf("refresh log models = %s, want %d", logs, r.ModelCount())
 	}
 }

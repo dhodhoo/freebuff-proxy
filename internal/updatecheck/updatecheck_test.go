@@ -1,7 +1,9 @@
 package updatecheck
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -151,3 +153,50 @@ func (t *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 }
 
 var _ = time.Second // keep the time import for future cache-age assertions
+
+// TestLatestLogsDecision verifies T18: each Latest() lookup logs a Debug
+// line with the decision (fetched|cached|failed) and the lookup duration.
+func TestLatestLogsDecision(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"tag_name":"v9.9.9"}`))
+	}))
+	defer srv.Close()
+
+	var sink bytes.Buffer
+	c := New(DefaultRepo, &http.Client{Transport: &rewriteTransport{target: srv.URL}, Timeout: fetchTimeout})
+	c.SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	// First lookup fetches → decision=fetched with ms.
+	if _, err := c.Latest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	logs := sink.String()
+	for _, want := range []string{"update check decision", "decision=fetched", "ms="} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("fetched lookup log missing %q: %s", want, logs)
+		}
+	}
+
+	// Second lookup within CacheTTL → decision=cached, no new fetch.
+	if _, err := c.Latest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(sink.String(), "decision=cached"); got != 1 {
+		t.Errorf("cached decision lines = %d, want 1", got)
+	}
+
+	// A failing source → decision=failed.
+	srvFail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srvFail.Close()
+	var sinkFail bytes.Buffer
+	c2 := New(DefaultRepo, &http.Client{Transport: &rewriteTransport{target: srvFail.URL}, Timeout: fetchTimeout})
+	c2.SetLogger(slog.New(slog.NewTextHandler(&sinkFail, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	if _, err := c2.Latest(context.Background()); err == nil {
+		t.Fatal("Latest against a 500 source succeeded, want error")
+	}
+	if !strings.Contains(sinkFail.String(), "decision=failed") {
+		t.Errorf("failed lookup log missing decision=failed: %s", sinkFail.String())
+	}
+}

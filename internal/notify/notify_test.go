@@ -1,9 +1,13 @@
 package notify
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -114,4 +118,56 @@ func TestSendDisabledNoOps(t *testing.T) {
 	if count.Load() != 0 {
 		t.Fatalf("POSTs = %d, want 0 for disabled sender", count.Load())
 	}
+}
+
+// failRT is a RoundTripper that always fails, for the transport-error path.
+type failRT struct{}
+
+func (failRT) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("webhook unreachable")
+}
+
+// TestSendFailureLogsWarn verifies T18: a failed webhook delivery logs a
+// WARN with the err and the target URL — a non-2xx status and a transport
+// error both fire it.
+func TestSendFailureLogsWarn(t *testing.T) {
+	t.Run("non-2xx status", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+		var sink bytes.Buffer
+		s := New(srv.URL, nil)
+		s.SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		s.Send(Event{Event: "token_banned"})
+
+		deadline := time.Now().Add(3 * time.Second)
+		for !strings.Contains(sink.String(), "webhook send failed") && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		logs := sink.String()
+		for _, want := range []string{"webhook send failed", "webhook returned status 503", "target=" + srv.URL} {
+			if !strings.Contains(logs, want) {
+				t.Errorf("status-failure WARN missing %q: %s", want, logs)
+			}
+		}
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		var sink bytes.Buffer
+		s := New("https://webhook.invalid/hook", &http.Client{Transport: failRT{}})
+		s.SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		s.Send(Event{Event: "pool_exhausted"})
+
+		deadline := time.Now().Add(3 * time.Second)
+		for !strings.Contains(sink.String(), "webhook send failed") && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		logs := sink.String()
+		for _, want := range []string{"webhook send failed", "webhook unreachable", "target=https://webhook.invalid/hook"} {
+			if !strings.Contains(logs, want) {
+				t.Errorf("transport-failure WARN missing %q: %s", want, logs)
+			}
+		}
+	})
 }

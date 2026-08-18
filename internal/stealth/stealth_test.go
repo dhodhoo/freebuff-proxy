@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -726,5 +727,38 @@ func TestDialerALPNNegotiation(t *testing.T) {
 	// nil falls back to the h1 default (pre-#51 behavior).
 	if got := negotiated(nil); got != "http/1.1" {
 		t.Errorf("nil ALPN negotiated %q, want http/1.1 (default)", got)
+	}
+}
+
+// TestProfileSelectionLogs verifies T18: every GetProfileForConnection
+// resolution logs a Debug line naming the selected profile — static,
+// auto-resolved, and random alike.
+func TestProfileSelectionLogs(t *testing.T) {
+	var sink bytes.Buffer
+	SetLogger(slog.New(slog.NewTextHandler(&sink, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { SetLogger(nil) })
+
+	if p := GetProfileForConnection(ProfileChrome120); p != ProfileChrome120 {
+		t.Fatalf("static selection = %v, want ProfileChrome120", p)
+	}
+	if !strings.Contains(sink.String(), "stealth profile selected") || !strings.Contains(sink.String(), "profile=chrome120") {
+		t.Errorf("static profile selection not logged: %s", sink.String())
+	}
+
+	before := sink.Len()
+	sel := GetProfileForConnection(ProfileAuto)
+	if sel == nil || sel.ID == ProfileIDAuto {
+		t.Fatal("auto profile not resolved to a concrete profile")
+	}
+	after := sink.String()[before:]
+	if !strings.Contains(after, "stealth profile selected") || !strings.Contains(after, "profile=") {
+		t.Errorf("auto profile selection not logged: %s", after)
+	}
+
+	before = sink.Len()
+	GetProfileForConnection(ProfileRandom)
+	after = sink.String()[before:]
+	if !strings.Contains(after, "stealth profile selected") || !strings.Contains(after, "profile=random") {
+		t.Errorf("random profile selection not logged: %s", after)
 	}
 }
